@@ -27,6 +27,18 @@ pub struct MouseEvent {
     pub timestamp_us: u64,
 }
 
+/// A keyboard key press / release. Keycodes are platform-native:
+/// CGKeyCode (u16) on macOS, VK_* on Windows. Cross-OS forwarding would
+/// require a keymap translation layer — currently only same-OS usage is
+/// guaranteed to work.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct KeyEvent {
+    pub keycode: u32,
+    pub down: bool,
+    /// macOS: CGEventFlags bitfield (modifier state). Windows: unused (0).
+    pub flags: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ScreenInfo {
     pub width: u32,
@@ -45,6 +57,8 @@ pub enum Message {
     Leave,
     /// Server -> Client: mouse event
     Input(MouseEvent),
+    /// Server -> Client: keyboard event (forwarded only while mouse is on client)
+    KeyInput(KeyEvent),
     /// Bidirectional keepalive
     Heartbeat,
 }

@@ -1,4 +1,4 @@
-use crate::protocol::{MouseButton, MouseEvent, MouseEventType};
+use crate::protocol::{KeyEvent, MouseButton, MouseEvent, MouseEventType};
 use anyhow::Result;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
@@ -9,7 +9,7 @@ use crossbeam_channel::Sender;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::capture::InputCapture;
+use super::capture::{CapturedInput, InputCapture};
 
 pub struct MacOsCapture {
     suppressing: Arc<AtomicBool>,
@@ -24,13 +24,8 @@ impl MacOsCapture {
 }
 
 impl InputCapture for MacOsCapture {
-    fn run(&mut self, sender: Sender<MouseEvent>) -> Result<()> {
+    fn run(&mut self, sender: Sender<CapturedInput>) -> Result<()> {
         let suppressing = self.suppressing.clone();
-
-        // Initialize with current cursor position to avoid initial delta spike
-        let (init_x, init_y) = super::capture::get_cursor_position().unwrap_or((0.0, 0.0));
-        let last_x = std::cell::Cell::new(init_x);
-        let last_y = std::cell::Cell::new(init_y);
 
         let events_of_interest = vec![
             CGEventType::MouseMoved,
@@ -44,6 +39,9 @@ impl InputCapture for MacOsCapture {
             CGEventType::LeftMouseDragged,
             CGEventType::RightMouseDragged,
             CGEventType::OtherMouseDragged,
+            CGEventType::KeyDown,
+            CGEventType::KeyUp,
+            CGEventType::FlagsChanged,
         ];
 
         let tap = CGEventTap::new(
@@ -52,19 +50,45 @@ impl InputCapture for MacOsCapture {
             CGEventTapOptions::Default,
             events_of_interest,
             move |_proxy: CGEventTapProxy, event_type: CGEventType, event: &CGEvent| {
-                let pos = event.location();
-                let prev_x = last_x.get();
-                let prev_y = last_y.get();
-                let dx = pos.x - prev_x;
-                let dy = pos.y - prev_y;
-                last_x.set(pos.x);
-                last_y.set(pos.y);
+                match event_type {
+                    CGEventType::KeyDown
+                    | CGEventType::KeyUp
+                    | CGEventType::FlagsChanged => {
+                        // Keyboard. FlagsChanged is fired for modifier key
+                        // (shift/ctrl/opt/cmd) transitions and has no down/up;
+                        // we treat it as a keydown and rely on the flags
+                        // snapshot to carry the current modifier state.
+                        let keycode = event.get_integer_value_field(
+                            EventField::KEYBOARD_EVENT_KEYCODE,
+                        ) as u32;
+                        let flags = event.get_flags().bits() as u64;
+                        let down = !matches!(event_type, CGEventType::KeyUp);
+                        log::info!(
+                            "key captured: code={} down={} flags=0x{:x}",
+                            keycode, down, flags
+                        );
+                        let key_event = KeyEvent { keycode, down, flags };
+                        let _ = sender.try_send(CapturedInput::Key(key_event));
+                    }
+                    _ => {
+                        // Mouse: read raw HID delta from event fields. This
+                        // is the relative movement as reported by the mouse
+                        // hardware, independent of cursor position clamping
+                        // at screen edges — crucial because when suppression
+                        // is ON, the OS freezes the cursor and
+                        // event.location() stops changing.
+                        let dx = event
+                            .get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X)
+                            as f64;
+                        let dy = event
+                            .get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y)
+                            as f64;
 
-                let event_type_mapped = map_event_type(event_type, event);
-
-                if let Some(evt_type) = event_type_mapped {
-                    let mouse_event = MouseEvent::now(dx, dy, evt_type);
-                    let _ = sender.try_send(mouse_event);
+                        if let Some(evt_type) = map_event_type(event_type, event) {
+                            let mouse_event = MouseEvent::now(dx, dy, evt_type);
+                            let _ = sender.try_send(CapturedInput::Mouse(mouse_event));
+                        }
+                    }
                 }
 
                 if suppressing.load(Ordering::Relaxed) {

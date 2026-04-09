@@ -1,3 +1,4 @@
+mod clipboard;
 mod config;
 mod input;
 mod net;
@@ -39,6 +40,13 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // Promote to foreground app so CGDisplayHideCursor actually takes
+    // effect. Without this, hiding the cursor from a plain CLI binary
+    // silently no-ops because macOS treats it as a background process.
+    // Both server and client need this (client also hides its cursor
+    // when mouse is on server).
+    input::capture::promote_to_foreground_app();
 
     match cli.command {
         Commands::Server { port, edge } => {

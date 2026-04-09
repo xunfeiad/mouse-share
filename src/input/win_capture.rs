@@ -1,17 +1,17 @@
-use crate::protocol::{MouseButton, MouseEvent, MouseEventType};
+use crate::protocol::{KeyEvent, MouseButton, MouseEvent, MouseEventType};
 use anyhow::Result;
 use crossbeam_channel::Sender;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::capture::InputCapture;
+use super::capture::{CapturedInput, InputCapture};
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
-    MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
-    WM_XBUTTONUP,
+    MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 pub struct WinCapture {
@@ -28,32 +28,36 @@ impl WinCapture {
 
 // Thread-local storage for the hook callback context
 thread_local! {
-    static HOOK_SENDER: std::cell::RefCell<Option<Sender<MouseEvent>>> = std::cell::RefCell::new(None);
+    static HOOK_SENDER: std::cell::RefCell<Option<Sender<CapturedInput>>> = std::cell::RefCell::new(None);
     static HOOK_SUPPRESS: std::cell::RefCell<Option<Arc<AtomicBool>>> = std::cell::RefCell::new(None);
     static LAST_POS: std::cell::Cell<(i32, i32)> = std::cell::Cell::new((0, 0));
 }
 
 impl InputCapture for WinCapture {
-    fn run(&mut self, sender: Sender<MouseEvent>) -> Result<()> {
+    fn run(&mut self, sender: Sender<CapturedInput>) -> Result<()> {
         // Store sender and suppress flag in thread-local storage
         HOOK_SENDER.with(|s| *s.borrow_mut() = Some(sender));
         HOOK_SUPPRESS.with(|s| *s.borrow_mut() = Some(self.suppressing.clone()));
 
-        let hook = unsafe {
+        let mouse_hook = unsafe {
             SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)?
         };
+        let kbd_hook = unsafe {
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_hook_proc), None, 0)?
+        };
 
-        log::info!("Windows mouse hook installed, entering message loop");
+        log::info!("Windows mouse + keyboard hooks installed, entering message loop");
 
         // Windows requires a message pump on the hook thread
         let mut msg = MSG::default();
         unsafe {
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                // No dispatch needed, we only care about the hook
+                // No dispatch needed, we only care about the hooks
             }
         }
 
-        unsafe { UnhookWindowsHookEx(hook)? };
+        unsafe { UnhookWindowsHookEx(mouse_hook)? };
+        unsafe { UnhookWindowsHookEx(kbd_hook)? };
         Ok(())
     }
 
@@ -105,7 +109,7 @@ unsafe extern "system" fn mouse_hook_proc(
         let mouse_event = MouseEvent::now(dx, dy, evt);
         HOOK_SENDER.with(|s| {
             if let Some(sender) = s.borrow().as_ref() {
-                let _ = sender.try_send(mouse_event);
+                let _ = sender.try_send(CapturedInput::Mouse(mouse_event));
             }
         });
     }
@@ -119,6 +123,48 @@ unsafe extern "system" fn mouse_hook_proc(
 
     if should_suppress {
         LRESULT(1) // Suppress the event
+    } else {
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+unsafe extern "system" fn kbd_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code < 0 {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+
+    let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+    let w = wparam.0 as u32;
+    let down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
+    let up = w == WM_KEYUP || w == WM_SYSKEYUP;
+
+    if down || up {
+        log::info!("key captured: vk={} down={}", info.vkCode, down);
+        let key_event = KeyEvent {
+            keycode: info.vkCode,
+            down,
+            flags: 0,
+        };
+        HOOK_SENDER.with(|s| {
+            if let Some(sender) = s.borrow().as_ref() {
+                let _ = sender.try_send(CapturedInput::Key(key_event));
+            }
+        });
+    }
+
+    let should_suppress = HOOK_SUPPRESS.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|b| b.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    });
+
+    if should_suppress {
+        LRESULT(1) // Swallow the event from local apps
     } else {
         CallNextHookEx(None, code, wparam, lparam)
     }

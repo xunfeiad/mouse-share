@@ -1,8 +1,8 @@
-use crate::input::simulate;
+use crate::input::{capture, simulate};
 use crate::protocol::{self, Message, MouseEventType};
 use crate::screen::get_screen_info;
 use anyhow::Result;
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 pub struct Client {
@@ -32,13 +32,32 @@ impl Client {
             server_screen.height
         );
 
+        // Start clipboard TCP client in background (port = udp_port + 1)
+        let server_sock: SocketAddr = self.server_addr.parse()?;
+        let clipboard_addr = SocketAddr::new(server_sock.ip(), server_sock.port() + 1);
+        std::thread::Builder::new()
+            .name("clipboard-client".into())
+            .spawn(move || {
+                crate::clipboard::run_client(clipboard_addr);
+            })?;
+
         // Create simulator
         let mut simulator = simulate::create_simulator();
+
+        // Mouse is on the server by default — hide our local cursor so the
+        // user sees only the remote cursor. Explicitly tracked to guarantee
+        // hide/show stay balanced across Enter/Leave transitions (duplicate
+        // messages or unexpected ordering won't drift the refcount).
+        capture::hide_local_cursor();
+        let mut cursor_hidden = true;
 
         // Event loop
         let mut buf = [0u8; 4096];
         let mut active = false;
         let mut last_heartbeat = Instant::now();
+        let mut last_move_log = Instant::now();
+        let mut sim_x: f64 = 0.0;
+        let mut sim_y: f64 = 0.0;
 
         loop {
             // Send heartbeat
@@ -58,6 +77,13 @@ impl Client {
                     match msg {
                         Message::Enter { x, y } => {
                             active = true;
+                            sim_x = x;
+                            sim_y = y;
+                            // Show cursor on entry so the user sees it.
+                            if cursor_hidden {
+                                capture::show_local_cursor();
+                                cursor_hidden = false;
+                            }
                             log::info!("Mouse entered at ({:.0}, {:.0})", x, y);
                             if let Err(e) = simulator.move_to(x, y) {
                                 log::error!("Failed to move cursor: {}", e);
@@ -65,11 +91,34 @@ impl Client {
                         }
                         Message::Leave => {
                             active = false;
+                            // Mouse is going back to the server — hide local cursor.
+                            if !cursor_hidden {
+                                capture::hide_local_cursor();
+                                cursor_hidden = true;
+                            }
                             log::info!("Mouse left client screen");
+                        }
+                        Message::KeyInput(key) if active => {
+                            log::info!(
+                                "received key: code={} down={} flags=0x{:x}",
+                                key.keycode, key.down, key.flags
+                            );
+                            if let Err(e) = simulator.key_event(key.keycode, key.down, key.flags) {
+                                log::error!("Key simulation error: {}", e);
+                            }
                         }
                         Message::Input(event) if active => {
                             let result = match &event.event_type {
                                 MouseEventType::Move => {
+                                    sim_x += event.dx;
+                                    sim_y += event.dy;
+                                    if last_move_log.elapsed() > Duration::from_millis(1000) {
+                                        log::info!(
+                                            "sim cursor=({:.0},{:.0}) dx={:.1} dy={:.1}",
+                                            sim_x, sim_y, event.dx, event.dy
+                                        );
+                                        last_move_log = Instant::now();
+                                    }
                                     simulator.move_relative(event.dx, event.dy)
                                 }
                                 MouseEventType::ButtonDown(btn) => simulator.button_down(*btn),
