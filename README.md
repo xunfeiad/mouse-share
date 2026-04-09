@@ -1,51 +1,53 @@
 # mouse-share
 
-通过 WiFi 局域网在多台电脑之间共享鼠标控制。支持 macOS 和 Windows 跨平台使用。
+[中文版](README.zh-CN.md)
 
-## 工作原理
+Share mouse control between multiple computers over a WiFi LAN. Cross-platform support for macOS and Windows.
+
+## How it works
 
 ```
 ┌─────────────────┐              ┌─────────────────┐
-│  Server (控制端)  │── UDP ──────▶│  Client (被控端)  │
-│  捕获鼠标事件     │   鼠标事件    │  模拟鼠标输入     │
-│  边缘检测切换     │◀── UDP ─────│  心跳保活        │
+│ Server (control)│── UDP ──────▶│ Client (target) │
+│ Capture input   │  input evts  │ Simulate input  │
+│ Edge detection  │◀── UDP ─────│ Heartbeat       │
 └─────────────────┘              └─────────────────┘
 ```
 
-- **Server 端**：运行在主控电脑上，捕获全局鼠标事件。当鼠标移动到屏幕边缘时，自动切换到 Client 端控制。
-- **Client 端**：运行在被控电脑上，接收 Server 发来的鼠标事件并模拟执行。
+- **Server**: runs on the controlling machine, captures global mouse events. When the cursor hits the configured screen edge, control switches to the client.
+- **Client**: runs on the controlled machine, receives events from the server and simulates them locally.
 
-## 快速开始
+## Quick start
 
-### 编译
+### Build
 
 ```bash
-# 需要 Rust 工具链 (https://rustup.rs/)
+# Requires the Rust toolchain (https://rustup.rs/)
 cargo build --release
 ```
 
-编译产物位于 `target/release/mouse-share`。
+The binary is at `target/release/mouse-share`.
 
-### 使用
+### Usage
 
-**在控制端电脑（Server）上运行：**
+**On the controlling machine (Server):**
 
 ```bash
-# 默认端口 4242，客户端在右侧
+# Default port 4242, client placed on the right
 mouse-share server
 
-# 指定端口和客户端方位
+# Custom port and client edge
 mouse-share server --port 5000 --edge left
 ```
 
-**在被控端电脑（Client）上运行：**
+**On the controlled machine (Client):**
 
 ```bash
-# 连接到 Server 的 IP 和端口
+# Connect to the server IP and port
 mouse-share client --server 192.168.1.100:4242
 ```
 
-### 参数说明
+### Arguments
 
 ```
 Usage: mouse-share <COMMAND>
@@ -55,138 +57,138 @@ Commands:
   client  Run as client (controlled side)
 
 Server options:
-  -p, --port <PORT>  监听端口 [默认: 4242]
-  -e, --edge <EDGE>  客户端屏幕方位: left/right/top/bottom [默认: right]
+  -p, --port <PORT>  Listening port [default: 4242]
+  -e, --edge <EDGE>  Client screen edge: left/right/top/bottom [default: right]
 
 Client options:
-  -s, --server <ADDR>  Server 地址，如 192.168.1.100:4242
+  -s, --server <ADDR>  Server address, e.g. 192.168.1.100:4242
 ```
 
-## 平台权限
+## Platform permissions
 
 ### macOS
 
-需要授予「辅助功能」权限：
+Accessibility permission is required:
 
-**系统设置 → 隐私与安全性 → 辅助功能** → 添加终端应用（Terminal / iTerm2 / 你运行程序的终端）
+**System Settings → Privacy & Security → Accessibility** → add the terminal app you run `mouse-share` from (Terminal / iTerm2 / etc.).
 
 ### Windows
 
-以**管理员身份运行**即可（低级鼠标钩子需要管理员权限）。
+**Run as Administrator** — low-level mouse hooks require administrator privileges.
 
-## 架构设计
+## Architecture
 
-### 项目结构
+### Project layout
 
 ```
 src/
-├── main.rs                 # CLI 入口，server/client 分发
-├── protocol.rs             # 网络协议定义（消息类型、序列化）
-├── config.rs               # 屏幕配置、边缘检测
-├── screen.rs               # 跨平台屏幕信息获取
+├── main.rs                 # CLI entry point, server/client dispatch
+├── protocol.rs             # Wire protocol (message types, serialization)
+├── config.rs               # Screen config, edge detection
+├── screen.rs               # Cross-platform screen info
 ├── net/
-│   ├── server.rs           # Server 端：事件转发、边缘检测
-│   └── client.rs           # Client 端：事件接收、模拟执行
+│   ├── server.rs           # Server: event forwarding, edge detection
+│   └── client.rs           # Client: event receive + simulate
 └── input/
-    ├── capture.rs           # InputCapture trait 定义
-    ├── simulate.rs          # InputSimulator trait 定义
-    ├── macos_capture.rs     # macOS: CGEventTap 捕获
-    ├── macos_simulate.rs    # macOS: CGEvent 模拟
-    ├── win_capture.rs       # Windows: SetWindowsHookEx 捕获
-    └── win_simulate.rs      # Windows: SendInput 模拟
+    ├── capture.rs           # InputCapture trait
+    ├── simulate.rs          # InputSimulator trait
+    ├── macos_capture.rs     # macOS: CGEventTap capture
+    ├── macos_simulate.rs    # macOS: CGEvent simulation
+    ├── win_capture.rs       # Windows: SetWindowsHookEx capture
+    └── win_simulate.rs      # Windows: SendInput simulation
 ```
 
-### 核心模块
+### Core modules
 
-#### 协议层 (`protocol.rs`)
+#### Protocol layer (`protocol.rs`)
 
-使用 `serde` + `bincode` 二进制序列化，单个鼠标事件约 40 字节。
+`serde` + `bincode` binary serialization. A single mouse event is around 40 bytes on the wire.
 
 ```rust
 enum Message {
-    Hello(ScreenInfo),          // Client → Server: 注册
-    HelloAck(ScreenInfo),       // Server → Client: 确认
-    Enter { x: f64, y: f64 },  // 鼠标进入 Client 屏幕
-    Leave,                      // 鼠标离开 Client 屏幕
-    Input(MouseEvent),          // 鼠标事件数据
-    Heartbeat,                  // 心跳保活
+    Hello(ScreenInfo),          // Client → Server: register
+    HelloAck(ScreenInfo),       // Server → Client: ack
+    Enter { x: f64, y: f64 },  // Cursor entered client screen
+    Leave,                      // Cursor left client screen
+    Input(MouseEvent),          // Mouse event payload
+    Heartbeat,                  // Keepalive
 }
 ```
 
-#### 输入捕获 (`input/capture.rs`)
+#### Input capture (`input/capture.rs`)
 
-通过 trait 抽象跨平台差异：
+Cross-platform differences are hidden behind a trait:
 
-| 平台 | 实现方式 | 事件抑制 |
-|------|---------|---------|
-| macOS | `CGEventTap` (HID level) | 回调返回 `None` |
-| Windows | `SetWindowsHookEx(WH_MOUSE_LL)` | 返回 `LRESULT(1)` |
+| Platform | Implementation | Event suppression |
+|----------|----------------|-------------------|
+| macOS | `CGEventTap` (HID level) | Return `None` from callback |
+| Windows | `SetWindowsHookEx(WH_MOUSE_LL)` | Return `LRESULT(1)` |
 
-#### 输入模拟 (`input/simulate.rs`)
+#### Input simulation (`input/simulate.rs`)
 
-| 平台 | 实现方式 |
-|------|---------|
+| Platform | Implementation |
+|----------|----------------|
 | macOS | `CGEvent::new_mouse_event` + `CGEvent::post` |
-| Windows | `SendInput` + `MOUSEINPUT` (绝对坐标 0-65535) |
+| Windows | `SendInput` + `MOUSEINPUT` (normalized absolute coordinates 0–65535) |
 
-### 网络设计
+### Network design
 
-- **传输层**：UDP — 鼠标事件高频(60-120Hz)、每个事件独立、丢包可接受（下一帧覆盖）
-- **连接管理**：Hello/HelloAck 握手，Client 自动重试 10 次
-- **保活**：双向 Heartbeat（1秒间隔）
-- **安全看门狗**：Server 端 5 秒无事件自动释放鼠标抑制，防止鼠标卡死
+- **Transport**: UDP — mouse events are high frequency (60–120 Hz), each event is self-contained, and loss is acceptable (the next frame overwrites the state).
+- **Connection management**: Hello/HelloAck handshake, the client retries up to 10 times on startup.
+- **Keepalive**: bidirectional heartbeat (1 s interval).
+- **Safety watchdog**: the server releases input suppression after 5 s of no activity so the mouse can never get permanently stuck.
 
-### 屏幕切换逻辑
+### Screen switching logic
 
-1. Server 持续监测鼠标位置
-2. 鼠标到达配置的边缘（如右边缘）→ 开启事件抑制 → 发送 `Enter` 到 Client
-3. Server 跟踪虚拟光标在 Client 屏幕上的位置
-4. 虚拟光标到达 Client 的返回边缘 → 关闭抑制 → 发送 `Leave`
+1. Server continuously tracks the real cursor position.
+2. Cursor reaches the configured edge (e.g. right edge) → enable suppression → send `Enter` to the client.
+3. Server tracks the virtual cursor position on the client screen.
+4. Virtual cursor reaches the return edge on the client → disable suppression → send `Leave`.
 
-## 跨平台编译
+## Cross compilation
 
-### macOS 上编译 Windows 版本
+### Build a Windows binary from macOS
 
 ```bash
-# 安装 Windows 交叉编译工具链
+# Add the Windows target
 rustup target add x86_64-pc-windows-msvc
-# 需要通过 cargo-xwin 或在 Windows 上直接编译
+# Use cargo-xwin, or build directly on a Windows machine
 ```
 
-### Windows 上编译
+### Build on Windows
 
 ```bash
 cargo build --release
 ```
 
-## 调试
+## Debugging
 
-启用详细日志：
+Enable verbose logs:
 
 ```bash
 RUST_LOG=debug mouse-share server
 RUST_LOG=debug mouse-share client --server 192.168.1.100:4242
 ```
 
-## 已知限制
+## Known limitations
 
-- 当前仅支持单 Client 连接
-- 不支持键盘共享（仅鼠标）
-- 不支持剪贴板同步
-- UDP 无加密，仅适用于可信局域网
-- 不支持 Linux
+- Only one client connection is supported.
+- No keyboard sharing (mouse only).
+- No clipboard sync.
+- UDP is unencrypted — only use it on a trusted LAN.
+- Linux is not supported.
 
-## 技术依赖
+## Dependencies
 
-| 依赖 | 用途 |
-|------|------|
-| `clap` | CLI 参数解析 |
-| `serde` + `bincode` | 二进制序列化 |
-| `crossbeam-channel` | 无锁线程间通信 |
-| `core-graphics` | macOS 输入捕获/模拟 |
+| Crate | Purpose |
+|-------|---------|
+| `clap` | CLI argument parsing |
+| `serde` + `bincode` | Binary serialization |
+| `crossbeam-channel` | Lock-free inter-thread channels |
+| `core-graphics` | macOS input capture / simulation |
 | `windows` | Windows Win32 API |
-| `anyhow` | 错误处理 |
-| `log` + `env_logger` | 日志 |
+| `anyhow` | Error handling |
+| `log` + `env_logger` | Logging |
 
 ## License
 
