@@ -1,0 +1,27 @@
+[package]
+name = "mouse-share"
+version = "0.1.0"
+edition = "2021"
+description = "Share mouse across computers on the same WiFi network"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+crossbeam-channel = "0.5"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+socket2 = "0.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+] }

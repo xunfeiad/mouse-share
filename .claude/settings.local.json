@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rustc --version)",
+      "Bash(cargo --version)",
+      "WebSearch",
+      "Bash(cargo init:*)",
+      "Bash(cargo build:*)",
+      "Read(//Users/xunfei/.cargo/registry/src/mirrors.aliyun.com-0671735e7cc7f5e7/core-graphics-0.24.0/src/**)"
+    ]
+  }
+}
