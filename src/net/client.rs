@@ -24,6 +24,12 @@ impl Client {
 
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+        // Enlarge the kernel receive buffer. With the default macOS UDP
+        // buffer (~40 KiB) a burst from a 1000 Hz gaming mouse can briefly
+        // overflow, causing events to be dropped and the cursor to jitter.
+        // 1 MiB is trivial memory and eliminates the drops.
+        let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(1 << 20);
+        let _ = socket2::SockRef::from(&socket).set_send_buffer_size(1 << 20);
         log::info!("Connecting to server at {}", self.server_addr);
 
         // Get local screen info
@@ -93,88 +99,188 @@ impl Client {
                 last_heartbeat = Instant::now();
             }
 
-            match socket.recv_from(&mut buf) {
-                Ok((len, _)) => {
-                    let msg = match protocol::deserialize(&buf[..len]) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
+            // Accumulate Move deltas across every packet we can drain in
+            // this iteration, then emit exactly one simulator.move_relative
+            // at the end. Non-Move events (button/scroll/key) are flushed
+            // inline in order so click/drag timing is preserved.
+            //
+            // Why: each simulator.move_relative on macOS costs a
+            // CGWarpMouseCursorPosition + CGEvent::post (~hundreds of µs).
+            // A 1000 Hz gaming mouse can enqueue dozens of Move packets
+            // during one 50 ms recv timeout — processing them one-by-one
+            // lets the backlog grow faster than we drain it, which is the
+            // visible "client is laggy" symptom. Summing the deltas and
+            // issuing one move per drain cycle bounds per-frame work.
+            let mut pending_dx: f64 = 0.0;
+            let mut pending_dy: f64 = 0.0;
+            let mut have_move = false;
+            let mut first_pass = true;
 
-                    match msg {
-                        Message::Enter { x, y } => {
-                            active = true;
-                            state.mouse_on_peer.store(true, Ordering::SeqCst);
-                            sim_x = x;
-                            sim_y = y;
-                            // Show cursor on entry so the user sees it.
-                            if cursor_hidden {
-                                capture::show_local_cursor();
-                                cursor_hidden = false;
+            loop {
+                // First pass uses the blocking read with the 50 ms timeout
+                // so we don't spin the CPU when idle. Subsequent passes
+                // flip the socket non-blocking to drain whatever is
+                // already queued, then restore blocking mode. SO_RCVTIMEO
+                // is preserved across the toggle on macOS/Linux so we
+                // don't need to reinstall the read timeout.
+                if !first_pass {
+                    let _ = socket.set_nonblocking(true);
+                }
+                let recv_result = socket.recv_from(&mut buf);
+                if !first_pass {
+                    let _ = socket.set_nonblocking(false);
+                }
+                first_pass = false;
+
+                match recv_result {
+                    Ok((len, _)) => {
+                        let msg = match protocol::deserialize(&buf[..len]) {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+
+                        match msg {
+                            Message::Enter { x, y } => {
+                                // Flush any accumulated moves before a
+                                // teleport — otherwise the relative deltas
+                                // would be applied after the absolute jump.
+                                if have_move {
+                                    let _ = simulator.move_relative(pending_dx, pending_dy);
+                                    pending_dx = 0.0;
+                                    pending_dy = 0.0;
+                                    have_move = false;
+                                }
+                                active = true;
+                                state.mouse_on_peer.store(true, Ordering::SeqCst);
+                                sim_x = x;
+                                sim_y = y;
+                                if cursor_hidden {
+                                    capture::show_local_cursor();
+                                    cursor_hidden = false;
+                                }
+                                log::info!("Mouse entered at ({:.0}, {:.0})", x, y);
+                                if let Err(e) = simulator.move_to(x, y) {
+                                    log::error!("Failed to move cursor: {}", e);
+                                }
                             }
-                            log::info!("Mouse entered at ({:.0}, {:.0})", x, y);
-                            if let Err(e) = simulator.move_to(x, y) {
-                                log::error!("Failed to move cursor: {}", e);
+                            Message::Leave => {
+                                // Flush pending moves so the final cursor
+                                // position is correct before we hide it.
+                                if have_move {
+                                    let _ = simulator.move_relative(pending_dx, pending_dy);
+                                    pending_dx = 0.0;
+                                    pending_dy = 0.0;
+                                    have_move = false;
+                                }
+                                active = false;
+                                state.mouse_on_peer.store(false, Ordering::SeqCst);
+                                if !cursor_hidden {
+                                    capture::hide_local_cursor();
+                                    cursor_hidden = true;
+                                }
+                                log::info!("Mouse left client screen");
                             }
-                        }
-                        Message::Leave => {
-                            active = false;
-                            state.mouse_on_peer.store(false, Ordering::SeqCst);
-                            // Mouse is going back to the server — hide local cursor.
-                            if !cursor_hidden {
-                                capture::hide_local_cursor();
-                                cursor_hidden = true;
+                            Message::KeyInput(key) if active => {
+                                log::info!(
+                                    "received key: code={} down={} flags=0x{:x}",
+                                    key.keycode, key.down, key.flags
+                                );
+                                if let Err(e) =
+                                    simulator.key_event(key.keycode, key.down, key.flags)
+                                {
+                                    log::error!("Key simulation error: {}", e);
+                                }
+                                state.events_total.fetch_add(1, Ordering::Relaxed);
+                                state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                             }
-                            log::info!("Mouse left client screen");
-                        }
-                        Message::KeyInput(key) if active => {
-                            log::info!(
-                                "received key: code={} down={} flags=0x{:x}",
-                                key.keycode, key.down, key.flags
-                            );
-                            if let Err(e) = simulator.key_event(key.keycode, key.down, key.flags) {
-                                log::error!("Key simulation error: {}", e);
-                            }
-                            state.events_total.fetch_add(1, Ordering::Relaxed);
-                            state.last_event_ms.store(now_ms(), Ordering::SeqCst);
-                        }
-                        Message::Input(event) if active => {
-                            state.events_total.fetch_add(1, Ordering::Relaxed);
-                            state.last_event_ms.store(now_ms(), Ordering::SeqCst);
-                            let result = match &event.event_type {
-                                MouseEventType::Move => {
-                                    sim_x += event.dx;
-                                    sim_y += event.dy;
-                                    if last_move_log.elapsed() > Duration::from_millis(1000) {
-                                        log::info!(
-                                            "sim cursor=({:.0},{:.0}) dx={:.1} dy={:.1}",
-                                            sim_x, sim_y, event.dx, event.dy
-                                        );
-                                        last_move_log = Instant::now();
+                            Message::Input(event) if active => {
+                                state.events_total.fetch_add(1, Ordering::Relaxed);
+                                state.last_event_ms.store(now_ms(), Ordering::SeqCst);
+                                match &event.event_type {
+                                    MouseEventType::Move => {
+                                        sim_x += event.dx;
+                                        sim_y += event.dy;
+                                        pending_dx += event.dx;
+                                        pending_dy += event.dy;
+                                        have_move = true;
                                     }
-                                    simulator.move_relative(event.dx, event.dy)
+                                    // Clicks/scrolls must stay ordered
+                                    // with respect to moves — flush any
+                                    // accumulated delta before applying.
+                                    MouseEventType::ButtonDown(btn) => {
+                                        if have_move {
+                                            let _ = simulator
+                                                .move_relative(pending_dx, pending_dy);
+                                            pending_dx = 0.0;
+                                            pending_dy = 0.0;
+                                            have_move = false;
+                                        }
+                                        if let Err(e) = simulator.button_down(*btn) {
+                                            log::error!("Simulation error: {}", e);
+                                        }
+                                    }
+                                    MouseEventType::ButtonUp(btn) => {
+                                        if have_move {
+                                            let _ = simulator
+                                                .move_relative(pending_dx, pending_dy);
+                                            pending_dx = 0.0;
+                                            pending_dy = 0.0;
+                                            have_move = false;
+                                        }
+                                        if let Err(e) = simulator.button_up(*btn) {
+                                            log::error!("Simulation error: {}", e);
+                                        }
+                                    }
+                                    MouseEventType::Scroll { dx, dy } => {
+                                        // Scroll applies at the current
+                                        // cursor position — flush pending
+                                        // moves first so the scroll lands
+                                        // on the right target.
+                                        if have_move {
+                                            let _ = simulator
+                                                .move_relative(pending_dx, pending_dy);
+                                            pending_dx = 0.0;
+                                            pending_dy = 0.0;
+                                            have_move = false;
+                                        }
+                                        if let Err(e) = simulator.scroll(*dx, *dy) {
+                                            log::error!("Simulation error: {}", e);
+                                        }
+                                    }
                                 }
-                                MouseEventType::ButtonDown(btn) => simulator.button_down(*btn),
-                                MouseEventType::ButtonUp(btn) => simulator.button_up(*btn),
-                                MouseEventType::Scroll { dx, dy } => {
-                                    simulator.scroll(*dx, *dy)
-                                }
-                            };
-                            if let Err(e) = result {
-                                log::error!("Simulation error: {}", e);
                             }
+                            Message::Heartbeat => {
+                                state.last_heartbeat_ms.store(now_ms(), Ordering::SeqCst);
+                            }
+                            _ => {}
                         }
-                        Message::Heartbeat => {
-                            state.last_heartbeat_ms.store(now_ms(), Ordering::SeqCst);
-                        }
-                        _ => {}
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        // Nothing more queued — stop draining.
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!("Network error: {}", e);
+                        state.set_error(format!("{}", e));
+                        break;
                     }
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => {
-                    log::error!("Network error: {}", e);
-                    state.set_error(format!("{}", e));
+            }
+
+            // Flush the accumulated move as a single simulator call.
+            if have_move {
+                if last_move_log.elapsed() > Duration::from_millis(1000) {
+                    log::info!(
+                        "sim cursor=({:.0},{:.0}) flush dx={:.1} dy={:.1}",
+                        sim_x, sim_y, pending_dx, pending_dy
+                    );
+                    last_move_log = Instant::now();
+                }
+                if let Err(e) = simulator.move_relative(pending_dx, pending_dy) {
+                    log::error!("Simulation error: {}", e);
                 }
             }
         };

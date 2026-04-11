@@ -39,6 +39,12 @@ impl Server {
             }
         };
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+        // Enlarge kernel send buffer. Mouse event bursts at 500–1000 Hz
+        // can briefly exceed the default buffer on macOS/Windows, causing
+        // send_to() to drop or block. 1 MiB is plenty for small UDP packets
+        // and still trivial compared to process memory.
+        let _ = socket2::SockRef::from(&socket).set_send_buffer_size(1 << 20);
+        let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(1 << 20);
         log::info!("Server listening on 0.0.0.0:{}", self.port);
 
         // Start clipboard TCP server on port+1 in background
@@ -170,6 +176,10 @@ impl Server {
         // stay paired even across weird state transitions (watchdog, disconnect).
         let mut cursor_hidden = false;
         let mut last_heartbeat = Instant::now();
+        // Reusable send buffer for the hot path. Without this, every forwarded
+        // mouse event allocates a fresh `Vec<u8>` from `protocol::serialize`.
+        // At 500–1000 Hz that adds up — serialize_into reuses capacity.
+        let mut send_buf: Vec<u8> = Vec::with_capacity(128);
         // Track virtual cursor position on the client screen
         let mut client_cursor_x: f64 = 0.0;
         let mut client_cursor_y: f64 = 0.0;
@@ -233,8 +243,11 @@ impl Server {
                             "forwarding key: code={} down={}",
                             key_event.keycode, key_event.down
                         );
-                        let msg = protocol::serialize(&Message::KeyInput(key_event))?;
-                        let _ = socket.send_to(&msg, client_addr);
+                        protocol::serialize_into(
+                            &mut send_buf,
+                            &Message::KeyInput(key_event),
+                        )?;
+                        let _ = socket.send_to(&send_buf, client_addr);
                         state.events_total.fetch_add(1, Ordering::Relaxed);
                         state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                     }
@@ -328,8 +341,8 @@ impl Server {
                         client_cursor_x = client_cursor_x.clamp(0.0, cw - 1.0);
                         client_cursor_y = client_cursor_y.clamp(0.0, ch - 1.0);
 
-                        let msg = protocol::serialize(&Message::Input(event))?;
-                        let _ = socket.send_to(&msg, client_addr);
+                        protocol::serialize_into(&mut send_buf, &Message::Input(event))?;
+                        let _ = socket.send_to(&send_buf, client_addr);
                         state.events_total.fetch_add(1, Ordering::Relaxed);
                         state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                     }

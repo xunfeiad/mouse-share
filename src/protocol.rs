@@ -82,6 +82,15 @@ pub fn serialize(msg: &Message) -> anyhow::Result<Vec<u8>> {
     Ok(bincode::serialize(msg)?)
 }
 
+/// Serialize `msg` into `buf`, reusing the buffer's existing capacity.
+/// Used on the server hot path to avoid allocating a fresh `Vec<u8>` per
+/// forwarded mouse event. `buf` is cleared first, then written into.
+pub fn serialize_into(buf: &mut Vec<u8>, msg: &Message) -> anyhow::Result<()> {
+    buf.clear();
+    bincode::serialize_into(&mut *buf, msg)?;
+    Ok(())
+}
+
 pub fn deserialize(data: &[u8]) -> anyhow::Result<Message> {
     Ok(bincode::deserialize(data)?)
 }
