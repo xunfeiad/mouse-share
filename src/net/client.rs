@@ -282,6 +282,32 @@ impl Client {
                 if let Err(e) = simulator.move_relative(pending_dx, pending_dy) {
                     log::error!("Simulation error: {}", e);
                 }
+
+                // Rate-limit cursor warps to ~125 Hz (8 ms per flush).
+                //
+                // Why this matters even though CPU is idle:
+                // `CGWarpMouseCursorPosition` is a non-blocking IPC to
+                // the window server — it returns fast, but the window
+                // server processes cursor moves on its own pipeline
+                // clocked to the display refresh rate (~60–120 Hz).
+                // Sending warps faster than that backlogs the pipeline,
+                // and the visible cursor ends up lagging behind the real
+                // mouse by however much has accumulated — the classic
+                // "feels like low frame rate" symptom the user reported
+                // while CPU was flat.
+                //
+                // Sleeping 8 ms after a flush does two things:
+                //   1. Caps the per-second warp count at ~125, below the
+                //      point where the window server pipeline backs up.
+                //   2. Lets the kernel UDP buffer accumulate more packets
+                //      in the meantime — the next drain cycle then
+                //      coalesces all of them into one larger warp,
+                //      so no motion is dropped, just batched.
+                //
+                // Non-move events (click/scroll/key/Enter/Leave) already
+                // flush pending moves inline and are processed before we
+                // reach this sleep, so click latency is unaffected.
+                std::thread::sleep(Duration::from_millis(8));
             }
         };
 

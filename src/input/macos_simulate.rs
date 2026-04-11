@@ -100,11 +100,26 @@ impl InputSimulator for MacOsSimulator {
     fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
         self.current_x = x;
         self.current_y = y;
-        let point = self.current_point();
-        // Actually move + show the visible cursor first, then post the
-        // MouseMoved event so apps observe the move.
-        warp_cursor(point);
-        self.post_mouse_event(CGEventType::MouseMoved, point, CGMouseButton::Left)
+        // Warp is the authoritative visible-move operation. We deliberately
+        // DO NOT post a synthetic MouseMoved event afterward:
+        //
+        //   * `warp_cursor` alone is what the cursor is actually at — the
+        //     window server's own cursor tracking (used by menu hover,
+        //     NSTrackingArea, hit testing, etc.) picks this up natively.
+        //   * Posting `MouseMoved` adds a second synchronous IPC to the
+        //     window server per call (~hundreds of µs). At the 500–1000 Hz
+        //     drain rate of the client event loop, that's the dominant
+        //     source of visible client-side lag — the loop thread spends
+        //     most of its wall clock time blocked in that IPC, causing
+        //     incoming UDP packets to back up in the kernel buffer.
+        //
+        // Tools like Synergy / Barrier / input-leap use the same
+        // "warp, don't post" pattern for exactly this reason. Apps that
+        // specifically need MouseMoved via CGEventTap (rare — input
+        // recorders, some accessibility tools) will not see our moves,
+        // which is an acceptable tradeoff for smooth cursor tracking.
+        warp_cursor(self.current_point());
+        Ok(())
     }
 
     fn move_relative(&mut self, dx: f64, dy: f64) -> Result<()> {
@@ -113,9 +128,11 @@ impl InputSimulator for MacOsSimulator {
         // Clamp to reasonable screen bounds (max 16K resolution)
         self.current_x = self.current_x.clamp(0.0, 16384.0);
         self.current_y = self.current_y.clamp(0.0, 16384.0);
-        let point = self.current_point();
-        warp_cursor(point);
-        self.post_mouse_event(CGEventType::MouseMoved, point, CGMouseButton::Left)
+        // See `move_to` for why we only warp and don't post — this is
+        // the hottest path on the client and the extra IPC was the main
+        // remaining source of client-side lag.
+        warp_cursor(self.current_point());
+        Ok(())
     }
 
     fn button_down(&mut self, button: MouseButton) -> Result<()> {
