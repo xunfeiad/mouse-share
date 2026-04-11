@@ -2,7 +2,23 @@ use crate::protocol::{KeyEvent, MouseEvent};
 use anyhow::Result;
 use crossbeam_channel::Sender;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Saved cursor position captured by `hide_local_cursor` so
+/// `show_local_cursor` can restore the cursor to where it physically was
+/// before the hide. We warp the cursor to a fixed point on the main
+/// display during the hide (to force every compositor to redraw and
+/// actually honor the refcounted hide — see the multi-display note on
+/// `hide_local_cursor`), which would otherwise leave the cursor at that
+/// fixed point after unhide. Module-level state is fine: hide_local_cursor
+/// / show_local_cursor are always called in balanced pairs from a single
+/// owner (either the server or the client event loop).
+#[cfg(target_os = "macos")]
+static CURSOR_RESTORE_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+static CURSOR_RESTORE_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
 /// Unified captured input — mouse or keyboard. Both share the same channel
 /// so the server event loop can apply the "only forward while mouse is on
@@ -107,21 +123,57 @@ fn platform_get_cursor_position() -> Result<(f64, f64)> {
 ///
 /// Caller is responsible for balancing hide/show calls.
 ///
-/// Multi-display note: hides the cursor on **every active display**, not
-/// just the main one. `CGDisplayHideCursor`'s documentation claims the
-/// display parameter is unused and the call is global, but on real
-/// multi-monitor setups that's only true for the refcount — each
-/// display's compositor is a separate rendering pipeline, and calling
-/// hide_cursor on main() can leave a stale cursor drawn on the secondary
-/// display because its compositor never gets a redraw trigger. Our
-/// CGEventTap suppression layer swallows the HID events that would
-/// otherwise naturally invalidate the cached frame, so the stale cursor
-/// just sits there. Iterating every active display forces every
-/// compositor to process the hide.
+/// Multi-display note: on real multi-monitor setups, `CGDisplayHideCursor`
+/// is refcounted *globally* but its visual effect is per-compositor —
+/// each display runs an independent rendering pipeline that only redraws
+/// when something invalidates its cached frame. Our CGEventTap
+/// suppression swallows the HID events that would normally be that
+/// invalidation, so a display the cursor is *not* currently on keeps
+/// showing its last-drawn frame forever — and a later compositor wake
+/// (a click, a window repaint) will re-draw the cursor *at its cached
+/// position*, defeating the hide.
+///
+/// Fix, in order:
+///
+/// 1. **Record** the current cursor position so `show_local_cursor` can
+///    restore it.
+/// 2. **Warp** the cursor to a fixed point on the main display. This
+///    does two things in one shot:
+///    * the compositor the cursor *left* redraws without a cursor
+///      (stale frame cleared), and
+///    * the main compositor redraws with the cursor at the new position
+///      — which then processes the hide below.
+/// 3. **Hide** on every active display. Iterating isn't strictly needed
+///    for correctness after the warp (the global refcount is what the
+///    compositor reads), but calling per-display is a belt-and-braces
+///    trigger for each compositor's redraw and balances symmetrically
+///    with `show_local_cursor`.
 pub fn hide_local_cursor() {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGDisplay;
+        use core_graphics::geometry::CGPoint;
+
+        // (1) Remember where the cursor physically was so we can put it
+        // back on show. Failure is non-fatal — we just won't restore.
+        if let Ok(pos) = platform_get_cursor_position() {
+            if let Ok(mut guard) = CURSOR_RESTORE_POS.lock() {
+                *guard = Some(pos);
+            }
+        }
+
+        // (2) Warp to (1,1) on main. If the cursor was on a secondary
+        // display this forces the secondary compositor to redraw (the
+        // cursor left it) — which is exactly what clears the stale
+        // cursor frame on that display. If the cursor was already on
+        // main, this is a short hop that wakes the main compositor
+        // before the hide lands.
+        if let Err(e) = CGDisplay::warp_mouse_cursor_position(CGPoint::new(1.0, 1.0)) {
+            log::warn!("pre-hide warp failed: {:?}", e);
+        }
+
+        // (3) Hide on every active display. Each call increments the
+        // global refcount and also nudges the per-display compositor.
         let displays = CGDisplay::active_displays().unwrap_or_default();
         if displays.is_empty() {
             // Fallback: can't enumerate → at least hide on the main
@@ -164,6 +216,8 @@ pub fn show_local_cursor() {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGDisplay;
+        use core_graphics::geometry::CGPoint;
+
         let displays = CGDisplay::active_displays().unwrap_or_default();
         if displays.is_empty() {
             if let Err(e) = CGDisplay::main().show_cursor() {
@@ -176,6 +230,20 @@ pub fn show_local_cursor() {
                 }
             }
         }
+
+        // Restore the cursor to where it physically was before the
+        // matching `hide_local_cursor` call — otherwise the user sees
+        // the cursor jump to (1,1) when control returns to the server,
+        // which is jarring. If we have no saved position (first-ever
+        // show, or hide failed to sample it), leave the cursor
+        // wherever it currently is.
+        let saved = CURSOR_RESTORE_POS.lock().ok().and_then(|mut g| g.take());
+        if let Some((x, y)) = saved {
+            if let Err(e) = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x, y)) {
+                log::warn!("post-show restore warp failed: {:?}", e);
+            }
+        }
+
         // Defensive: restore association in case a previous run left it
         // disabled. Idempotent when already enabled.
         if let Err(e) = CGDisplay::associate_mouse_and_mouse_cursor_position(true) {
