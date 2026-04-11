@@ -106,12 +106,35 @@ fn platform_get_cursor_position() -> Result<(f64, f64)> {
 /// whole session.
 ///
 /// Caller is responsible for balancing hide/show calls.
+///
+/// Multi-display note: hides the cursor on **every active display**, not
+/// just the main one. `CGDisplayHideCursor`'s documentation claims the
+/// display parameter is unused and the call is global, but on real
+/// multi-monitor setups that's only true for the refcount — each
+/// display's compositor is a separate rendering pipeline, and calling
+/// hide_cursor on main() can leave a stale cursor drawn on the secondary
+/// display because its compositor never gets a redraw trigger. Our
+/// CGEventTap suppression layer swallows the HID events that would
+/// otherwise naturally invalidate the cached frame, so the stale cursor
+/// just sits there. Iterating every active display forces every
+/// compositor to process the hide.
 pub fn hide_local_cursor() {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGDisplay;
-        if let Err(e) = CGDisplay::main().hide_cursor() {
-            log::warn!("hide_cursor failed: {:?}", e);
+        let displays = CGDisplay::active_displays().unwrap_or_default();
+        if displays.is_empty() {
+            // Fallback: can't enumerate → at least hide on the main
+            // display so the primary screen is still covered.
+            if let Err(e) = CGDisplay::main().hide_cursor() {
+                log::warn!("hide_cursor failed: {:?}", e);
+            }
+            return;
+        }
+        for id in displays {
+            if let Err(e) = CGDisplay::new(id).hide_cursor() {
+                log::warn!("hide_cursor(display={}) failed: {:?}", id, e);
+            }
         }
     }
     #[cfg(target_os = "windows")]
@@ -125,6 +148,12 @@ pub fn hide_local_cursor() {
 
 /// Show the local system cursor. Balances a previous `hide_local_cursor`.
 ///
+/// Must be called exactly the same number of times per display as
+/// `hide_local_cursor` — we iterate every active display symmetrically so
+/// the per-display hide refcounts stay balanced. Display hotplug between
+/// hide and show is best-effort; `restore_cursor_state_on_startup` exists
+/// as the crash-recovery path.
+///
 /// Also defensively calls `CGAssociateMouseAndMouseCursorPosition(true)`.
 /// Normal operation never disassociates any more (see `hide_local_cursor`),
 /// but earlier builds did — so if the user upgrades after a crash that
@@ -135,8 +164,17 @@ pub fn show_local_cursor() {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGDisplay;
-        if let Err(e) = CGDisplay::main().show_cursor() {
-            log::warn!("show_cursor failed: {:?}", e);
+        let displays = CGDisplay::active_displays().unwrap_or_default();
+        if displays.is_empty() {
+            if let Err(e) = CGDisplay::main().show_cursor() {
+                log::warn!("show_cursor failed: {:?}", e);
+            }
+        } else {
+            for id in displays {
+                if let Err(e) = CGDisplay::new(id).show_cursor() {
+                    log::warn!("show_cursor(display={}) failed: {:?}", id, e);
+                }
+            }
         }
         // Defensive: restore association in case a previous run left it
         // disabled. Idempotent when already enabled.
@@ -157,9 +195,18 @@ pub fn restore_cursor_state_on_startup() {
         // cursor-mouse association was disabled, leaving the user with a
         // frozen cursor. Force it back to enabled here.
         let _ = CGDisplay::associate_mouse_and_mouse_cursor_position(true);
-        // `CGDisplayShowCursor` is refcounted — balance at most one stale
-        // hide. Multiple calls past zero are a no-op.
-        let _ = CGDisplay::main().show_cursor();
+        // Balance at most one stale hide per active display. Previous
+        // builds only hid the main display, newer builds hide every
+        // display — a crash under either will be covered by iterating
+        // here. Calls past refcount=0 are benign no-ops.
+        let displays = CGDisplay::active_displays().unwrap_or_default();
+        if displays.is_empty() {
+            let _ = CGDisplay::main().show_cursor();
+        } else {
+            for id in displays {
+                let _ = CGDisplay::new(id).show_cursor();
+            }
+        }
     }
 }
 
