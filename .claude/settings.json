@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(codesign --force --sign - /Users/xunfei/rust-target/debug/mouse-share)",
+      "Bash(codesign -dv /Users/xunfei/rust-target/debug/mouse-share)",
+      "Read(//Users/xunfei/.cargo/registry/src/**)",
+      "Bash(find ~/.cargo/registry/src -type d -name core-graphics-*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(cargo check:*)",
+      "Bash(rustup target:*)",
+      "WebFetch(domain:docs.rs)"
+    ]
+  }
+}
