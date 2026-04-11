@@ -70,14 +70,40 @@ fn platform_get_cursor_position() -> Result<(f64, f64)> {
     Ok((point.x as f64, point.y as f64))
 }
 
-/// Hide the local system cursor. Used by the server when forwarding input to
-/// a remote client, so the user sees only the remote cursor.
-/// Caller is responsible for balancing hide/show calls (they use a refcount
-/// on macOS — two hides require two shows).
+/// Hide the local system cursor AND freeze it in place. Used by the server
+/// when forwarding input to a remote client, so the user sees only the
+/// remote cursor and the local cursor does not drift under physical
+/// mouse movement.
+///
+/// Why two calls (hide + associate(false)) instead of just hide:
+///
+/// `CGDisplayHideCursor` alone is **not** sufficient as a freeze. It only
+/// hides the cursor *visual*, and the visual can get un-hidden whenever
+/// focus changes to another app or the cursor moves outside our window.
+/// Worse, it does nothing to stop HID events from moving the cursor at
+/// the window-server level — if the event tap's suppress is ever bypassed
+/// (disabled-by-timeout, permissions quirk), the local cursor keeps
+/// tracking the physical mouse even though we think we've "hidden" it.
+///
+/// `CGAssociateMouseAndMouseCursorPosition(false)` decouples the cursor
+/// from HID events entirely — the window server stops moving the cursor
+/// in response to the physical mouse regardless of any tap state. This is
+/// the same pattern Synergy / Barrier / input-leap use for the same
+/// reason. We restore the association in `show_local_cursor`.
+///
+/// Caller is responsible for balancing hide/show calls (the hide refcount
+/// and the associate state are both restored on show).
 pub fn hide_local_cursor() {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGDisplay;
+        // Freeze cursor BEFORE hiding the visual: if we hide first and
+        // the associate call fails, the cursor would still be tracking
+        // the physical mouse underneath a hidden visual — worst of both
+        // worlds for debugging.
+        if let Err(e) = CGDisplay::associate_mouse_and_mouse_cursor_position(false) {
+            log::warn!("CGAssociateMouseAndMouseCursorPosition(false) failed: {:?}", e);
+        }
         if let Err(e) = CGDisplay::main().hide_cursor() {
             log::warn!("hide_cursor failed: {:?}", e);
         }
@@ -91,13 +117,19 @@ pub fn hide_local_cursor() {
     }
 }
 
-/// Show the local system cursor. Balances a previous `hide_local_cursor`.
+/// Show the local system cursor and re-couple it to HID events. Balances a
+/// previous `hide_local_cursor`. Order is the reverse of hide: re-show the
+/// visual first so the user sees *something* immediately, then re-enable
+/// HID tracking.
 pub fn show_local_cursor() {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGDisplay;
         if let Err(e) = CGDisplay::main().show_cursor() {
             log::warn!("show_cursor failed: {:?}", e);
+        }
+        if let Err(e) = CGDisplay::associate_mouse_and_mouse_cursor_position(true) {
+            log::warn!("CGAssociateMouseAndMouseCursorPosition(true) failed: {:?}", e);
         }
     }
 }

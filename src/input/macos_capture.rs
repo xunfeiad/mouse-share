@@ -29,6 +29,15 @@ impl MacOsCapture {
 impl InputCapture for MacOsCapture {
     fn run(&mut self, sender: Sender<CapturedInput>, shutdown: Arc<AtomicBool>) -> Result<()> {
         let suppressing = self.suppressing.clone();
+        // Set by the tap callback when macOS disables the tap (timeout or
+        // user-input stall). The outer run-loop polls this and re-enables.
+        // Without this, a single slow callback permanently kills the tap:
+        // events flow through unsuppressed, the local cursor tracks the
+        // physical mouse even though the server thinks it's forwarding,
+        // and the user sees "cursor still moving on the server even though
+        // mouse is supposed to be on the client".
+        let tap_disabled = Arc::new(AtomicBool::new(false));
+        let tap_disabled_cb = tap_disabled.clone();
 
         let events_of_interest = vec![
             CGEventType::MouseMoved,
@@ -54,6 +63,18 @@ impl InputCapture for MacOsCapture {
             events_of_interest,
             move |_proxy: CGEventTapProxy, event_type: CGEventType, event: &CGEvent| {
                 match event_type {
+                    // macOS sends these special event types through the tap
+                    // callback when it has disabled the tap. Signal the
+                    // outer loop to re-enable, then pass through.
+                    CGEventType::TapDisabledByTimeout
+                    | CGEventType::TapDisabledByUserInput => {
+                        log::warn!(
+                            "macOS event tap disabled ({:?}), scheduling re-enable",
+                            event_type
+                        );
+                        tap_disabled_cb.store(true, Ordering::SeqCst);
+                        return Some(event.clone());
+                    }
                     CGEventType::KeyDown
                     | CGEventType::KeyUp
                     | CGEventType::FlagsChanged => {
@@ -126,6 +147,14 @@ impl InputCapture for MacOsCapture {
             if shutdown.load(Ordering::SeqCst) {
                 log::info!("macOS event tap: shutdown requested, exiting run loop");
                 break;
+            }
+            // Re-enable the tap if macOS disabled it during the last
+            // callback cycle. `tap.enable()` is idempotent so the check
+            // doesn't need to be perfectly precise — worst case we call
+            // it an extra time.
+            if tap_disabled.swap(false, Ordering::SeqCst) {
+                log::info!("Re-enabling macOS event tap after disable");
+                tap.enable();
             }
             let result = CFRunLoop::run_in_mode(
                 unsafe { kCFRunLoopDefaultMode },

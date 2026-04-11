@@ -190,11 +190,9 @@ impl Client {
                                 {
                                     log::error!("Key simulation error: {}", e);
                                 }
-                                state.events_total.fetch_add(1, Ordering::Relaxed);
                                 state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                             }
                             Message::Input(event) if active => {
-                                state.events_total.fetch_add(1, Ordering::Relaxed);
                                 state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                                 match &event.event_type {
                                     MouseEventType::Move => {

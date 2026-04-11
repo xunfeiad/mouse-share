@@ -27,11 +27,7 @@ pub struct SharedState {
     /// (i.e. local input is being suppressed and forwarded).
     pub mouse_on_peer: AtomicBool,
 
-    /// Total mouse + keyboard events exchanged with the peer.
-    pub events_total: AtomicU64,
-
-    /// Unix millis of the last event — used by the UI to display an
-    /// events/sec reading (`events_total` delta over time window).
+    /// Unix millis of the last event — used for watchdog / freshness checks.
     pub last_event_ms: AtomicU64,
 
     /// Unix millis of the last heartbeat received from the peer — UI
@@ -54,7 +50,6 @@ impl SharedState {
             connected: AtomicBool::new(false),
             peer_addr: Mutex::new(None),
             mouse_on_peer: AtomicBool::new(false),
-            events_total: AtomicU64::new(0),
             last_event_ms: AtomicU64::new(0),
             last_heartbeat_ms: AtomicU64::new(0),
             started_ms: AtomicU64::new(0),

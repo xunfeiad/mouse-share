@@ -163,7 +163,6 @@ struct Strings {
 
     // Server / connected
     pill_connected: &'static str,
-    label_events: &'static str,
     label_up: &'static str,
     toggle_clipboard_sync: &'static str,
     toggle_keyboard_fwd: &'static str,
@@ -295,7 +294,6 @@ const EN: Strings = Strings {
     btn_stop_server: "Stop server",
 
     pill_connected: "Connected",
-    label_events: "Events",
     label_up: "Up",
     toggle_clipboard_sync: "Clipboard sync",
     toggle_keyboard_fwd: "Keyboard fwd",
@@ -417,7 +415,6 @@ const ZH: Strings = Strings {
     btn_stop_server: "停止服务",
 
     pill_connected: "已连接",
-    label_events: "事件数",
     label_up: "时长",
     toggle_clipboard_sync: "剪贴板同步",
     toggle_keyboard_fwd: "转发键盘",
@@ -934,14 +931,6 @@ impl App {
         format_duration(secs)
     }
 
-    fn events_display(&self) -> String {
-        let n = self.shared.events_total.load(Ordering::SeqCst);
-        if n >= 1000 {
-            format!("{:.1}k", n as f64 / 1000.0)
-        } else {
-            n.to_string()
-        }
-    }
 }
 
 fn format_duration(secs: u64) -> String {
@@ -1089,9 +1078,28 @@ fn title_bar(ui: &mut Ui, title: &str) {
                 Stroke::new(1.0, theme::TL_STROKE),
             );
         }
-        // Centered title
+
+        // Centered icon + title. Compute the combined width so the pair
+        // stays visually centered in the available space, accounting for
+        // the traffic-light block on the left.
+        let title_font = FontId::new(13.0, egui::FontFamily::Proportional);
+        let title_w = ui.fonts(|f| {
+            f.layout_no_wrap(title.into(), title_font.clone(), theme::TEXT_MUTED)
+                .size()
+                .x
+        });
+        const ICON_W: f32 = 18.0;
+        const GAP: f32 = 6.0;
+        let total_w = ICON_W + GAP + title_w;
         let avail = ui.available_width();
-        ui.add_space((avail - ui.fonts(|f| f.layout_no_wrap(title.into(), FontId::new(13.0, egui::FontFamily::Proportional), theme::TEXT_MUTED)).size().x) / 2.0 - 26.0);
+        ui.add_space(((avail - total_w) / 2.0 - 26.0).max(0.0));
+
+        // Icon: two small screens with an arrow between them — literal
+        // pictogram for "mouse/input shared across two displays".
+        let (icon_rect, _) =
+            ui.allocate_exact_size(Vec2::new(ICON_W, 18.0), Sense::hover());
+        draw_app_icon(ui.painter(), icon_rect);
+
         ui.label(
             RichText::new(title)
                 .size(13.0)
@@ -1099,6 +1107,69 @@ fn title_bar(ui: &mut Ui, title: &str) {
         );
     });
     ui.add_space(12.0);
+}
+
+/// Draw the mouse-share app icon at the given rect. Vector-drawn so it
+/// scales cleanly and doesn't need a bundled image asset. The pictogram
+/// is "two screens + an arrow pointing from left to right" — a compact
+/// visual cue for "input shared between two devices".
+fn draw_app_icon(painter: &eframe::egui::Painter, rect: Rect) {
+    use eframe::egui::Pos2;
+
+    let color = theme::PRIMARY;
+    let stroke = Stroke::new(1.4, color);
+
+    // Two identical screen rectangles, left and right. Height is chosen
+    // to leave vertical room for the arrow at the screens' midline.
+    let screen_w: f32 = 6.5;
+    let screen_h: f32 = 5.0;
+    let cy = rect.center().y - 1.5;
+
+    let left = Rect::from_min_size(
+        Pos2::new(rect.left() + 1.0, cy - screen_h / 2.0),
+        Vec2::new(screen_w, screen_h),
+    );
+    let right = Rect::from_min_size(
+        Pos2::new(rect.right() - 1.0 - screen_w, cy - screen_h / 2.0),
+        Vec2::new(screen_w, screen_h),
+    );
+    painter.rect_stroke(left, Rounding::same(1.2), stroke);
+    painter.rect_stroke(right, Rounding::same(1.2), stroke);
+
+    // Tiny stands under each screen — just two short horizontal ticks,
+    // positioned below the rects. Makes them read as "monitors".
+    let stand_y = left.bottom() + 1.6;
+    let tick = 2.0;
+    painter.line_segment(
+        [
+            Pos2::new(left.center().x - tick, stand_y),
+            Pos2::new(left.center().x + tick, stand_y),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(right.center().x - tick, stand_y),
+            Pos2::new(right.center().x + tick, stand_y),
+        ],
+        stroke,
+    );
+
+    // Arrow from left screen to right screen, above the screens so it
+    // doesn't overlap them. The arrow is what communicates "sharing".
+    let arrow_y = left.top() - 2.2;
+    let ax1 = left.center().x;
+    let ax2 = right.center().x;
+    painter.line_segment([Pos2::new(ax1, arrow_y), Pos2::new(ax2, arrow_y)], stroke);
+    // Arrowhead (two short strokes).
+    painter.line_segment(
+        [Pos2::new(ax2 - 2.0, arrow_y - 1.8), Pos2::new(ax2, arrow_y)],
+        stroke,
+    );
+    painter.line_segment(
+        [Pos2::new(ax2 - 2.0, arrow_y + 1.8), Pos2::new(ax2, arrow_y)],
+        stroke,
+    );
 }
 
 fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
@@ -1184,8 +1255,8 @@ fn field_pair(ui: &mut Ui, l1: &str, v1: &str, l2: &str, v2: &str) {
     });
 }
 
-fn field_quad(ui: &mut Ui, labels: [(&str, &str); 4]) {
-    ui.columns(4, |cols| {
+fn field_trio(ui: &mut Ui, labels: [(&str, &str); 3]) {
+    ui.columns(3, |cols| {
         for (i, (l, v)) in labels.iter().enumerate() {
             field(&mut cols[i], l, v);
         }
@@ -1221,6 +1292,79 @@ fn ghost_button(ui: &mut Ui, text: &str) -> Response {
         .rounding(Rounding::same(10.0))
         .min_size(Vec2::new(ui.available_width(), 36.0));
     ui.add(btn)
+}
+
+/// Solid-red "Stop server" button with a pulsing white dot on the left
+/// indicating the service is actively running. Used when a session is live
+/// — the dot's pulse gives a subtle heartbeat cue so the user can tell at
+/// a glance that the backend is alive even when there's no visible
+/// activity (e.g. no events flowing at the moment).
+///
+/// The pulse is driven directly off `ctx.input(|i| i.time)` rather than a
+/// stored phase, so the animation stays smooth across repaints. We request
+/// a short follow-up repaint (~33 ms → ~30 fps) so the pulse keeps ticking
+/// even when the rest of the UI is idle.
+fn stop_running_button(ui: &mut Ui, text: &str) -> Response {
+    use eframe::egui::{Align2, FontFamily, Pos2};
+
+    let size = Vec2::new(ui.available_width(), 36.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+
+    // Drive pulse off wall-clock. 1.2 s period is slow enough to read as
+    // a heartbeat rather than strobing, fast enough to feel alive.
+    let time = ui.ctx().input(|i| i.time);
+    let pulse = ((time * std::f64::consts::TAU / 1.2).sin() * 0.5 + 0.5) as f32;
+    // Keep the animation moving even during otherwise-idle frames.
+    ui.ctx().request_repaint_after(Duration::from_millis(33));
+
+    // Base fill darkens slightly on hover / press so the button still
+    // feels interactive despite the custom paint.
+    let base_fill = if resp.is_pointer_button_down_on() {
+        Color32::from_rgb(180, 30, 42)
+    } else if resp.hovered() {
+        Color32::from_rgb(226, 52, 64)
+    } else {
+        theme::DANGER
+    };
+
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        Rounding::same(10.0),
+        base_fill,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
+    );
+
+    // Pulsing dot on the left. Radius breathes between 3.5 and 5.5 px;
+    // alpha breathes in lockstep so the dot feels like it's glowing rather
+    // than just expanding.
+    let dot_center = Pos2::new(rect.left() + 16.0, rect.center().y);
+    let dot_radius = 3.5 + pulse * 2.0;
+    let dot_alpha = 140 + (pulse * 115.0) as u8;
+    let dot_color = Color32::from_rgba_unmultiplied(255, 255, 255, dot_alpha);
+    painter.circle_filled(dot_center, dot_radius, dot_color);
+    // Soft outer ring for the "running" glow effect.
+    let ring_alpha = ((1.0 - pulse) * 90.0) as u8;
+    if ring_alpha > 0 {
+        painter.circle_stroke(
+            dot_center,
+            dot_radius + 2.0 + pulse * 2.5,
+            Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, ring_alpha),
+            ),
+        );
+    }
+
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::new(13.0, FontFamily::Proportional),
+        Color32::WHITE,
+    );
+
+    resp
 }
 
 /// Draw a "screen" card — a rectangle with resolution text, used in the
@@ -1482,7 +1626,7 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
     });
     ui.add_space(6.0);
     if running {
-        if danger_button(ui, s.btn_stop_server).clicked() {
+        if stop_running_button(ui, s.btn_stop_server).clicked() {
             app.pending_action = Some(Action::StopSession);
         }
     } else {
@@ -1501,7 +1645,6 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
 fn server_connected(ui: &mut Ui, app: &mut App) {
     let s = app.s();
     let peer = app.peer_addr_display();
-    let events = app.events_display();
     let uptime = app.uptime_display();
     ui.horizontal(|ui| {
         pill(ui, s.pill_connected, theme::PRIMARY, theme::PRIMARY_SOFT);
@@ -1528,12 +1671,11 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
     ui.add_space(18.0);
     let port_str = app.port.clone();
     let edge_str = app.edge.label(s);
-    field_quad(
+    field_trio(
         ui,
         [
             (s.label_port, port_str.as_str()),
             (s.label_edge, edge_str),
-            (s.label_events, events.as_str()),
             (s.label_up, uptime.as_str()),
         ],
     );
@@ -1541,7 +1683,7 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
     toggle(ui, s.toggle_clipboard_sync, &mut app.clipboard_sync);
     toggle(ui, s.toggle_keyboard_fwd, &mut app.keyboard_fwd);
     ui.add_space(4.0);
-    if danger_button(ui, s.btn_stop_server).clicked() {
+    if stop_running_button(ui, s.btn_stop_server).clicked() {
         app.pending_action = Some(Action::StopSession);
     }
 }
@@ -1922,7 +2064,6 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
 fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
     let s = app.s();
     let peer = app.peer_addr_display();
-    let events = app.events_display();
     let uptime = app.uptime_display();
     ui.horizontal(|ui| {
         pill(ui, s.pill_connected, theme::PRIMARY, theme::PRIMARY_SOFT);
@@ -1958,11 +2099,10 @@ fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
             );
         });
     ui.add_space(8.0);
-    field_quad(
+    field_trio(
         ui,
         [
             (s.label_edge, app.client_edge.label(s)),
-            (s.label_events, events.as_str()),
             (s.label_keys, "—"),
             (s.label_uptime, uptime.as_str()),
         ],
@@ -1976,7 +2116,6 @@ fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
 fn client_mouse_active(ui: &mut Ui, app: &mut App) {
     let s = app.s();
     let peer = app.peer_addr_display();
-    let events = app.events_display();
     let uptime = app.uptime_display();
     ui.horizontal(|ui| {
         pill(ui, s.pill_receiving_input, theme::INFO, theme::INFO_SOFT);
@@ -2012,11 +2151,10 @@ fn client_mouse_active(ui: &mut Ui, app: &mut App) {
             );
         });
     ui.add_space(8.0);
-    field_quad(
+    field_trio(
         ui,
         [
             (s.label_edge, app.client_edge.label(s)),
-            (s.label_events, events.as_str()),
             (s.label_keys, "—"),
             (s.label_uptime, uptime.as_str()),
         ],

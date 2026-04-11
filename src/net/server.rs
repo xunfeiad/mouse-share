@@ -291,7 +291,6 @@ impl Server {
                         );
                         protocol::serialize_into(&mut send_buf, &Message::Input(ev))?;
                         let _ = socket.send_to(&send_buf, client_addr);
-                        state.events_total.fetch_add(1, Ordering::Relaxed);
                         state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                         pending_dx = 0.0;
                         pending_dy = 0.0;
@@ -320,7 +319,6 @@ impl Server {
                                 &Message::KeyInput(key_event),
                             )?;
                             let _ = socket.send_to(&send_buf, client_addr);
-                            state.events_total.fetch_add(1, Ordering::Relaxed);
                             state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                         }
                     }
@@ -441,7 +439,6 @@ impl Server {
                                         &Message::Input(event),
                                     )?;
                                     let _ = socket.send_to(&send_buf, client_addr);
-                                    state.events_total.fetch_add(1, Ordering::Relaxed);
                                     state
                                         .last_event_ms
                                         .store(now_ms(), Ordering::SeqCst);
