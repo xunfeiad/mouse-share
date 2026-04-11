@@ -45,6 +45,9 @@ fn main() -> eframe::Result<()> {
     // works, but bare `cargo run` from a terminal would be a background
     // process and silently no-op the hide.
     input_capture::promote_to_foreground_app();
+    // Defensive unstick in case a previous run crashed with the cursor
+    // hidden or mouse/cursor association off. No-op on a healthy system.
+    input_capture::restore_cursor_state_on_startup();
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

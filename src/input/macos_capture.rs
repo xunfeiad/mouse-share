@@ -115,7 +115,36 @@ impl InputCapture for MacOsCapture {
                     }
                 }
 
-                if suppressing.load(Ordering::Relaxed) {
+                // Upgraded to SeqCst to remove any doubt about the read
+                // seeing the latest store from the server event loop.
+                // This costs a memory barrier per event (~ns) — negligible
+                // at human mouse rates.
+                let suppress = suppressing.load(Ordering::SeqCst);
+                // Diagnostic: when a button / scroll event flows through the
+                // tap, log which side of the suppress fence it took. This
+                // nails down whether the "click fires on server too" bug is
+                // (a) tap returning None but macOS ignoring it, or (b) the
+                // suppress flag not being set at that moment. Moves are not
+                // logged — they're too frequent.
+                let is_discrete = matches!(
+                    event_type,
+                    CGEventType::LeftMouseDown
+                        | CGEventType::LeftMouseUp
+                        | CGEventType::RightMouseDown
+                        | CGEventType::RightMouseUp
+                        | CGEventType::OtherMouseDown
+                        | CGEventType::OtherMouseUp
+                        | CGEventType::ScrollWheel
+                );
+                if is_discrete {
+                    if suppress {
+                        log::info!("tap suppressing {:?}", event_type);
+                    } else {
+                        log::info!("tap passing through {:?}", event_type);
+                    }
+                }
+
+                if suppress {
                     None // Suppress: swallow the event
                 } else {
                     Some(event.clone()) // Pass through
@@ -143,6 +172,13 @@ impl InputCapture for MacOsCapture {
         // Poll the runloop in short slices so we can notice `shutdown` and
         // break out cleanly. `run_current()` would block forever and leave
         // no way for the UI to stop the backend.
+        //
+        // 16 ms poll instead of 100 ms: when macOS auto-disables the tap
+        // (TapDisabledByTimeout / TapDisabledByUserInput) we only see it
+        // at the next poll cycle. With a 100 ms slice, up to 100 ms of
+        // events (clicks included!) can flow through unsuppressed — this
+        // is one root cause of the "click fires on server too" bug. A
+        // 16 ms slice caps the leak window at ~one display frame.
         loop {
             if shutdown.load(Ordering::SeqCst) {
                 log::info!("macOS event tap: shutdown requested, exiting run loop");
@@ -158,7 +194,7 @@ impl InputCapture for MacOsCapture {
             }
             let result = CFRunLoop::run_in_mode(
                 unsafe { kCFRunLoopDefaultMode },
-                Duration::from_millis(100),
+                Duration::from_millis(16),
                 false,
             );
             if matches!(result, CFRunLoopRunResult::Finished | CFRunLoopRunResult::Stopped) {

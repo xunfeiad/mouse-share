@@ -42,6 +42,12 @@ fn main() -> anyhow::Result<()> {
     // when mouse is on server).
     input::capture::promote_to_foreground_app();
 
+    // Defensively restore cursor state in case a previous run crashed
+    // while the cursor was hidden or mouse/cursor association was off.
+    // No-op when the system is already healthy; the point is to let a
+    // fresh launch self-heal after a bad previous session.
+    input::capture::restore_cursor_state_on_startup();
+
     let state = std::sync::Arc::new(net::SharedState::new());
 
     match cli.command {

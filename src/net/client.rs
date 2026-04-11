@@ -1,7 +1,7 @@
 use crate::input::{capture, simulate};
 use crate::net::state::{now_ms, SharedState};
 use crate::protocol::{self, Message, MouseEventType};
-use crate::screen::get_screen_info;
+use crate::screen::{get_display_refresh_hz, get_screen_info};
 use anyhow::Result;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,6 +84,35 @@ impl Client {
         let mut last_move_log = Instant::now();
         let mut sim_x: f64 = 0.0;
         let mut sim_y: f64 = 0.0;
+        // Instant-based rate limiter for cursor warps, sized to the
+        // actual display refresh rate instead of a hard-coded 125 Hz.
+        //
+        // Why tie it to the display rate: `CGWarpMouseCursorPosition` is
+        // IPC to the window server, whose cursor pipeline is clocked to
+        // the physical display. Warping faster than the display refreshes
+        // just backlogs the pipeline — the extra warps are coalesced by
+        // the compositor into the same frame and the visible cursor
+        // lags behind reality. Warping slower than refresh wastes
+        // motion resolution. Matching makes the cursor feel as smooth
+        // as the hardware allows: 60 Hz on an office monitor, 120 Hz on
+        // ProMotion, 240 Hz on a gaming display — all handled correctly
+        // without user-visible tuning knobs.
+        //
+        // Mouse polling rate is *unrelated*: a 1000 Hz gaming mouse
+        // still generates 1000 events/s, all captured by the server and
+        // sent to the client. The client coalesces whatever arrived in
+        // a drain cycle into one warp, so the per-warp delta scales
+        // with mouse rate but the warp *frequency* is bounded by the
+        // display. No motion is lost, just batched into bigger hops
+        // that land exactly one per display frame.
+        let refresh_hz = get_display_refresh_hz();
+        let min_warp_interval = Duration::from_secs_f64(1.0 / refresh_hz);
+        log::info!(
+            "Client warp rate limit: {:.0} Hz ({} ms per flush)",
+            refresh_hz,
+            min_warp_interval.as_millis()
+        );
+        let mut last_warp = Instant::now() - min_warp_interval;
 
         let loop_result: Result<()> = 'evt: loop {
             // Graceful shutdown request from UI
@@ -270,6 +299,25 @@ impl Client {
 
             // Flush the accumulated move as a single simulator call.
             if have_move {
+                // Rate-limit cursor warps to ~125 Hz using an Instant
+                // budget rather than a fixed post-flush sleep. Why not a
+                // fixed sleep: `CGWarpMouseCursorPosition` is IPC to the
+                // window server, whose cursor pipeline is clocked to the
+                // display (~60–120 Hz). Firing warps faster than that
+                // backlogs the pipeline and the visible cursor lags
+                // behind — the original "feels like low frame rate" bug.
+                // A *fixed* 8 ms sleep fixes that symptom but quantises
+                // slow motion into visible 8 ms steps regardless of how
+                // long the drain cycle itself took, which the user sees
+                // as periodic jitter. Tracking the real time since the
+                // last warp and only sleeping the remainder gives smooth
+                // 125 Hz output: fast drain cycles still cap at 125 Hz,
+                // slow drain cycles pass through with zero added latency.
+                let since = last_warp.elapsed();
+                if since < min_warp_interval {
+                    std::thread::sleep(min_warp_interval - since);
+                }
+
                 if last_move_log.elapsed() > Duration::from_millis(1000) {
                     log::info!(
                         "sim cursor=({:.0},{:.0}) flush dx={:.1} dy={:.1}",
@@ -280,32 +328,7 @@ impl Client {
                 if let Err(e) = simulator.move_relative(pending_dx, pending_dy) {
                     log::error!("Simulation error: {}", e);
                 }
-
-                // Rate-limit cursor warps to ~125 Hz (8 ms per flush).
-                //
-                // Why this matters even though CPU is idle:
-                // `CGWarpMouseCursorPosition` is a non-blocking IPC to
-                // the window server — it returns fast, but the window
-                // server processes cursor moves on its own pipeline
-                // clocked to the display refresh rate (~60–120 Hz).
-                // Sending warps faster than that backlogs the pipeline,
-                // and the visible cursor ends up lagging behind the real
-                // mouse by however much has accumulated — the classic
-                // "feels like low frame rate" symptom the user reported
-                // while CPU was flat.
-                //
-                // Sleeping 8 ms after a flush does two things:
-                //   1. Caps the per-second warp count at ~125, below the
-                //      point where the window server pipeline backs up.
-                //   2. Lets the kernel UDP buffer accumulate more packets
-                //      in the meantime — the next drain cycle then
-                //      coalesces all of them into one larger warp,
-                //      so no motion is dropped, just batched.
-                //
-                // Non-move events (click/scroll/key/Enter/Leave) already
-                // flush pending moves inline and are processed before we
-                // reach this sleep, so click latency is unaffected.
-                std::thread::sleep(Duration::from_millis(8));
+                last_warp = Instant::now();
             }
         };
 
