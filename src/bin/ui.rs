@@ -1,26 +1,51 @@
-//! mouse-share GUI — first-pass visual mock built with egui/eframe.
+//! mouse-share GUI built with egui/eframe.
 //!
 //! Run with:
 //!     cargo run --features ui --bin mouse-share-ui
 //!
-//! This is NOT wired to the real server/client yet — it's a pure visual
-//! layer that mirrors the mockup states so we can iterate on look & feel
-//! before plugging in behaviour. States can be switched via the small
-//! "dev state" dropdown at the bottom of Server/Client tabs.
+//! The UI is wired to the real backend (`mouse_share::net::{server, client}`)
+//! via a shared `SharedState` that the rendering loop reads each frame. Legacy
+//! mockup states remain accessible via the dev-state switcher when the
+//! environment variable `MOUSE_SHARE_UI_DEV=1` is set.
 
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::too_many_arguments)]
+// Some string-table entries are currently only used by the legacy mockup
+// states reachable via `MOUSE_SHARE_UI_DEV=1`. Keeping them in the table so
+// those dev-only screens stay translated; silence the dead-code warning.
+#![allow(dead_code)]
 
 use eframe::egui::{
     self, Align, Color32, FontId, Frame, Layout, Margin, Rect, Response, RichText, Rounding,
     Sense, Stroke, TextEdit, Ui, Vec2,
 };
+use mouse_share::{
+    config as msc,
+    input::capture as input_capture,
+    log_buffer::{self, LogLine},
+    net::{client::Client as BeClient, server::Server as BeServer, SharedState},
+};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 // ============================================================================
 // Entry point
 // ============================================================================
 
 fn main() -> eframe::Result<()> {
+    // Install the tee logger so env_logger output AND the in-memory ring
+    // buffer (for the Log tab) both receive every record. Safe to call more
+    // than once — subsequent calls are no-ops.
+    let _ = log_buffer::install();
+
+    // Promote to a foreground app so CGDisplayHideCursor takes effect when
+    // the server hides the local cursor. Without this the .app bundle still
+    // works, but bare `cargo run` from a terminal would be a background
+    // process and silently no-op the hide.
+    input_capture::promote_to_foreground_app();
+
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 640.0])
@@ -652,6 +677,39 @@ impl Edge {
             Edge::Bottom => s.edge_bottom,
         }
     }
+
+    fn to_config(self) -> msc::Edge {
+        match self {
+            Edge::Left => msc::Edge::Left,
+            Edge::Right => msc::Edge::Right,
+            Edge::Top => msc::Edge::Top,
+            Edge::Bottom => msc::Edge::Bottom,
+        }
+    }
+}
+
+/// What kind of session is currently running.
+#[derive(Clone, Copy, PartialEq)]
+enum SessionKind {
+    Server,
+    Client,
+}
+
+/// Handle to a live backend session. Dropping this does NOT stop the
+/// session — use `App::stop_session` which sets `shutdown` and joins.
+struct SessionHandle {
+    kind: SessionKind,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// Button-click intents produced by render functions and processed after
+/// the render pass by `App::apply_pending_action`. This indirection avoids
+/// double-borrowing `self` inside the nested closures egui uses.
+#[derive(Clone, Copy)]
+enum Action {
+    StartServer,
+    StartClient,
+    StopSession,
 }
 
 struct App {
@@ -675,6 +733,18 @@ struct App {
     default_port: String,
     default_edge: Edge,
     debug_logging: bool,
+
+    // --- Runtime wiring (not persisted) ---
+    /// Shared observable state between the UI and the running backend. A
+    /// fresh `Arc` is installed on every Start so atomics from the previous
+    /// session can't leak into the next.
+    shared: Arc<SharedState>,
+    /// Live session if any. `None` means "nothing running".
+    session: Option<SessionHandle>,
+    /// Deferred action captured from button clicks during a render pass.
+    pending_action: Option<Action>,
+    /// Dev switcher visibility (set by `MOUSE_SHARE_UI_DEV=1`).
+    dev_mode: bool,
 }
 
 impl App {
@@ -684,6 +754,203 @@ impl App {
             Lang::En => &EN,
             Lang::Zh => &ZH,
         }
+    }
+
+    /// `true` while a backend session is spawned (running or tearing down).
+    fn is_running(&self) -> bool {
+        self.session.is_some()
+    }
+
+    fn session_kind(&self) -> Option<SessionKind> {
+        self.session.as_ref().map(|s| s.kind)
+    }
+
+    /// Spawn the backend `Server` on a dedicated thread. Installs a fresh
+    /// `SharedState` so the UI observes only state from this new session.
+    fn start_server(&mut self) {
+        if self.is_running() {
+            return;
+        }
+        let port: u16 = self.port.trim().parse().unwrap_or(4242);
+        let edge = self.edge.to_config();
+        self.shared = Arc::new(SharedState::new());
+        let shared = self.shared.clone();
+        log::info!("UI: starting server on port {} edge {:?}", port, edge);
+        let thread = std::thread::Builder::new()
+            .name("mouse-share-server".into())
+            .spawn(move || {
+                let server = BeServer::new(port, edge);
+                if let Err(e) = server.run(shared.clone()) {
+                    log::error!("server exited with error: {}", e);
+                    shared.set_error(format!("{}", e));
+                }
+            })
+            .ok();
+        self.session = Some(SessionHandle {
+            kind: SessionKind::Server,
+            thread,
+        });
+    }
+
+    /// Spawn the backend `Client` on a dedicated thread.
+    fn start_client(&mut self) {
+        if self.is_running() {
+            return;
+        }
+        let host = self.server_addr.trim().to_string();
+        let port = self.server_port.trim().to_string();
+        let addr = if port.is_empty() {
+            host
+        } else {
+            format!("{}:{}", host, port)
+        };
+        self.shared = Arc::new(SharedState::new());
+        let shared = self.shared.clone();
+        log::info!("UI: starting client → {}", addr);
+        let thread = std::thread::Builder::new()
+            .name("mouse-share-client".into())
+            .spawn(move || {
+                let client = BeClient::new(addr);
+                if let Err(e) = client.run(shared.clone()) {
+                    log::error!("client exited with error: {}", e);
+                    shared.set_error(format!("{}", e));
+                }
+            })
+            .ok();
+        self.session = Some(SessionHandle {
+            kind: SessionKind::Client,
+            thread,
+        });
+    }
+
+    /// Signal the running session to shut down and join its thread. Safe to
+    /// call when nothing is running — it just clears state.
+    fn stop_session(&mut self) {
+        if let Some(mut sess) = self.session.take() {
+            log::info!("UI: stopping session");
+            self.shared.shutdown.store(true, Ordering::SeqCst);
+            if let Some(t) = sess.thread.take() {
+                // Best-effort join — the backend loops poll shutdown every
+                // 100ms or so, and clipboard sockets have 500ms timeouts, so
+                // this should complete quickly. We don't block forever.
+                let _ = t.join();
+            }
+        }
+        // Reset observable state for the next session.
+        self.shared = Arc::new(SharedState::new());
+    }
+
+    /// Process any action a render function emitted during this frame.
+    fn apply_pending_action(&mut self) {
+        if let Some(action) = self.pending_action.take() {
+            match action {
+                Action::StartServer => self.start_server(),
+                Action::StartClient => self.start_client(),
+                Action::StopSession => self.stop_session(),
+            }
+        }
+    }
+
+    /// Reconcile the UI state enums with what the backend actually reports.
+    /// Called at the top of every frame before rendering.
+    fn derive_states(&mut self) {
+        // Dev mode bypass — the user is driving the state machine manually
+        // via the dev switcher, so don't overwrite their selection.
+        if self.dev_mode {
+            return;
+        }
+
+        let running = self.is_running();
+        let kind = self.session_kind();
+        let connected = self.shared.connected.load(Ordering::SeqCst);
+        let mouse_on_peer = self.shared.mouse_on_peer.load(Ordering::SeqCst);
+        let has_error = self.shared.last_error.lock().unwrap().is_some();
+
+        // If the session thread has finished on its own (error or normal
+        // exit), reap it so we flip back to the not-running state.
+        let finished = self
+            .session
+            .as_ref()
+            .and_then(|s| s.thread.as_ref())
+            .map(|t| t.is_finished())
+            .unwrap_or(false);
+        if finished {
+            if let Some(mut sess) = self.session.take() {
+                if let Some(t) = sess.thread.take() {
+                    let _ = t.join();
+                }
+            }
+        }
+
+        let running = running && self.session.is_some();
+
+        // Server tab state
+        if matches!(kind, Some(SessionKind::Server)) && running {
+            self.server_state = if connected {
+                ServerState::Connected
+            } else {
+                ServerState::Idle
+            };
+        } else if !running {
+            // Only override if we're not sitting in a non-run screen the
+            // user reached via dev switcher.
+            self.server_state = ServerState::Idle;
+        }
+
+        // Client tab state
+        if matches!(kind, Some(SessionKind::Client)) && running {
+            self.client_state = if has_error && !connected {
+                ClientState::NetworkError
+            } else if !connected {
+                ClientState::Connecting
+            } else if mouse_on_peer {
+                ClientState::MouseActive
+            } else {
+                ClientState::MouseOnServer
+            };
+        } else if !running {
+            if !matches!(self.client_state, ClientState::Config) {
+                self.client_state = ClientState::Config;
+            }
+        }
+    }
+
+    fn peer_addr_display(&self) -> String {
+        self.shared
+            .peer_addr
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "—".to_string())
+    }
+
+    fn uptime_display(&self) -> String {
+        let started = self.shared.started_ms.load(Ordering::SeqCst);
+        if started == 0 {
+            return "—".to_string();
+        }
+        let now = mouse_share::net::state::now_ms();
+        let secs = now.saturating_sub(started) / 1000;
+        format_duration(secs)
+    }
+
+    fn events_display(&self) -> String {
+        let n = self.shared.events_total.load(Ordering::SeqCst);
+        if n >= 1000 {
+            format!("{:.1}k", n as f64 / 1000.0)
+        } else {
+            n.to_string()
+        }
+    }
+}
+
+fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -707,6 +974,12 @@ impl Default for App {
             default_port: "4242".into(),
             default_edge: Edge::Right,
             debug_logging: false,
+            shared: Arc::new(SharedState::new()),
+            session: None,
+            pending_action: None,
+            dev_mode: std::env::var("MOUSE_SHARE_UI_DEV")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         };
         // Dev hook: start in a specific visual state for screenshotting.
         if let Ok(s) = std::env::var("MOUSE_SHARE_UI_STATE") {
@@ -749,6 +1022,9 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Reconcile UI enums with the backend before we render this frame.
+        self.derive_states();
+
         egui::CentralPanel::default()
             .frame(Frame::none().fill(theme::BG).inner_margin(Margin::same(16.0)))
             .show(ctx, |ui| {
@@ -762,12 +1038,26 @@ impl eframe::App for App {
                         match self.tab {
                             Tab::Server => server_tab(ui, self),
                             Tab::Client => client_tab(ui, self),
-                            Tab::Log => log_tab(ui, s),
+                            Tab::Log => log_tab(ui, self),
                             Tab::Settings => settings_tab(ui, self),
                         }
                     });
                 });
             });
+
+        // Apply any button action collected by the render pass.
+        self.apply_pending_action();
+
+        // Keep the UI responsive to backend state changes. We poll atomics,
+        // so a steady repaint cadence is what drives uptime/events updates.
+        ctx.request_repaint_after(Duration::from_millis(150));
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        // Make sure the backend thread doesn't outlive the window.
+        self.stop_session();
     }
 }
 
@@ -1084,6 +1374,10 @@ fn section_label(ui: &mut Ui, text: &str) {
 // ============================================================================
 
 fn server_tab(ui: &mut Ui, app: &mut App) {
+    // Surface any backend error at the top of the tab.
+    if let Some(err) = app.shared.last_error.lock().unwrap().clone() {
+        error_banner(ui, &err);
+    }
     match app.server_state {
         ServerState::Idle => server_idle(ui, app),
         ServerState::Connected => server_connected(ui, app),
@@ -1091,18 +1385,38 @@ fn server_tab(ui: &mut Ui, app: &mut App) {
         ServerState::PortResolved => server_port_resolved(ui, app),
         ServerState::PermissionRequired => server_permission_required(ui, app),
     }
+    if app.dev_mode {
+        ui.add_space(6.0);
+        dev_state_switcher_server(ui, &mut app.server_state);
+    }
+}
+
+fn error_banner(ui: &mut Ui, msg: &str) {
+    Frame::none()
+        .fill(theme::DANGER_SOFT)
+        .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
+        .rounding(Rounding::same(10.0))
+        .inner_margin(Margin::symmetric(12.0, 8.0))
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(msg)
+                    .size(12.0)
+                    .color(theme::DANGER)
+                    .strong(),
+            );
+        });
     ui.add_space(6.0);
-    dev_state_switcher_server(ui, &mut app.server_state);
 }
 
 fn server_idle(ui: &mut Ui, app: &mut App) {
     let s = app.s();
-    // Icon + "Waiting for client"
+    let running = app.is_running() && matches!(app.session_kind(), Some(SessionKind::Server));
+
+    // Icon + "Waiting for client" / "Not running"
     ui.vertical_centered(|ui| {
         ui.add_space(8.0);
         let (icon_rect, _) =
             ui.allocate_exact_size(Vec2::new(48.0, 44.0), Sense::hover());
-        // Monitor icon: rounded screen rectangle + short stand + base line.
         let p = ui.painter();
         let stroke = Stroke::new(1.6, theme::TEXT_MUTED);
         let screen = Rect::from_min_size(
@@ -1140,70 +1454,96 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
         );
     });
     ui.add_space(12.0);
-    field_pair(ui, s.label_port, &app.port, s.label_edge, app.edge.label(s));
-    field_pair(ui, s.label_local_ip, "192.168.1.100", s.label_screen, "1920x1080");
+
+    // Port is editable before the server starts — once running it's locked.
+    ui.label(
+        RichText::new(s.label_port)
+            .size(11.0)
+            .color(theme::TEXT_MUTED),
+    );
+    ui.horizontal(|ui| {
+        ui.add_enabled(
+            !running,
+            TextEdit::singleline(&mut app.port)
+                .font(FontId::new(14.0, egui::FontFamily::Proportional))
+                .margin(Margin::symmetric(12.0, 8.0))
+                .desired_width(110.0),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(s.label_edge)
+                .size(11.0)
+                .color(theme::TEXT_MUTED),
+        );
+    });
+    // Edge selector (disabled while running).
+    ui.add_enabled_ui(!running, |ui| {
+        edge_picker(ui, &mut app.edge, s);
+    });
     ui.add_space(6.0);
-    danger_button(ui, s.btn_stop_server);
+    if running {
+        if danger_button(ui, s.btn_stop_server).clicked() {
+            app.pending_action = Some(Action::StopSession);
+        }
+    } else {
+        // Use the same label regardless of language — the running state is
+        // the canonical button text. Reuse `btn_start_server_on` variant.
+        let label = match app.lang {
+            Lang::En => "Start server",
+            Lang::Zh => "启动服务",
+        };
+        if primary_button(ui, label).clicked() {
+            app.pending_action = Some(Action::StartServer);
+        }
+    }
 }
 
 fn server_connected(ui: &mut Ui, app: &mut App) {
     let s = app.s();
+    let peer = app.peer_addr_display();
+    let events = app.events_display();
+    let uptime = app.uptime_display();
     ui.horizontal(|ui| {
         pill(ui, s.pill_connected, theme::PRIMARY, theme::PRIMARY_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new("192.168.1.42")
+                RichText::new(&peer)
                     .size(12.0)
                     .color(theme::TEXT_MUTED),
             );
         });
     });
     ui.add_space(8.0);
+    let mouse_on_peer = app.shared.mouse_on_peer.load(Ordering::SeqCst);
     topology(
         ui,
-        "1920x1080",
-        "2560x1440",
-        "2ms",
-        Some("MacBook"),
-        Some("Desktop"),
-        false,
-        false,
+        "server",
+        "client",
+        "",
+        Some(s.label_mouse_here),
+        Some(s.label_standby),
+        !mouse_on_peer,
+        mouse_on_peer,
     );
     ui.add_space(18.0);
+    let port_str = app.port.clone();
+    let edge_str = app.edge.label(s);
     field_quad(
         ui,
         [
-            (s.label_port, app.port.as_str()),
-            (s.label_edge, app.edge.label(s)),
-            (s.label_events, "12k"),
-            (s.label_up, "14m"),
+            (s.label_port, port_str.as_str()),
+            (s.label_edge, edge_str),
+            (s.label_events, events.as_str()),
+            (s.label_up, uptime.as_str()),
         ],
     );
     ui.add_space(6.0);
     toggle(ui, s.toggle_clipboard_sync, &mut app.clipboard_sync);
     toggle(ui, s.toggle_keyboard_fwd, &mut app.keyboard_fwd);
     ui.add_space(4.0);
-    Frame::none()
-        .fill(theme::PRIMARY_SOFT)
-        .rounding(Rounding::same(10.0))
-        .inner_margin(Margin::symmetric(14.0, 10.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.painter().circle_filled(
-                    ui.cursor().min + Vec2::new(0.0, 7.0),
-                    3.5,
-                    theme::PRIMARY,
-                );
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new(s.clipboard_hello)
-                        .size(12.0)
-                        .color(theme::PRIMARY),
-                );
-            });
-        });
-    ui.add_space(4.0);
-    ghost_button(ui, s.btn_stop_server);
+    if danger_button(ui, s.btn_stop_server).clicked() {
+        app.pending_action = Some(Action::StopSession);
+    }
 }
 
 fn server_port_conflict(ui: &mut Ui, app: &mut App) {
@@ -1444,6 +1784,13 @@ fn server_permission_required(ui: &mut Ui, app: &mut App) {
 // ============================================================================
 
 fn client_tab(ui: &mut Ui, app: &mut App) {
+    if let Some(err) = app.shared.last_error.lock().unwrap().clone() {
+        // Only display the banner if the session isn't already routing to
+        // NetworkError — otherwise the error is duplicated.
+        if !matches!(app.client_state, ClientState::NetworkError) {
+            error_banner(ui, &err);
+        }
+    }
     match app.client_state {
         ClientState::Config => client_config(ui, app),
         ClientState::Connecting => client_connecting(ui, app),
@@ -1451,8 +1798,10 @@ fn client_tab(ui: &mut Ui, app: &mut App) {
         ClientState::MouseActive => client_mouse_active(ui, app),
         ClientState::NetworkError => client_network_error(ui, app),
     }
-    ui.add_space(6.0);
-    dev_state_switcher_client(ui, &mut app.client_state);
+    if app.dev_mode {
+        ui.add_space(6.0);
+        dev_state_switcher_client(ui, &mut app.client_state);
+    }
 }
 
 fn client_config(ui: &mut Ui, app: &mut App) {
@@ -1484,9 +1833,11 @@ fn client_config(ui: &mut Ui, app: &mut App) {
     );
     edge_picker(ui, &mut app.client_edge, s);
     ui.add_space(6.0);
-    field_pair(ui, s.label_local_screen, "2560x1440", s.label_status, s.status_idle);
+    field_pair(ui, s.label_local_screen, "—", s.label_status, s.status_idle);
     ui.add_space(4.0);
-    primary_button(ui, s.btn_connect);
+    if primary_button(ui, s.btn_connect).clicked() {
+        app.pending_action = Some(Action::StartClient);
+    }
 }
 
 fn edge_picker(ui: &mut Ui, edge: &mut Edge, s: &Strings) {
@@ -1527,11 +1878,12 @@ fn edge_picker(ui: &mut Ui, edge: &mut Edge, s: &Strings) {
 
 fn client_connecting(ui: &mut Ui, app: &mut App) {
     let s = app.s();
+    let peer = app.peer_addr_display();
     ui.horizontal(|ui| {
         pill(ui, s.pill_connecting, theme::WARN, theme::WARN_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new(s.text_attempt)
+                RichText::new(&peer)
                     .size(12.0)
                     .color(theme::TEXT_MUTED),
             );
@@ -1544,13 +1896,17 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
             .color(theme::TEXT_MUTED),
     );
     ui.horizontal(|ui| {
-        ui.add(
+        // Address is locked while the session is running — editing it while
+        // the client thread uses it would be surprising.
+        ui.add_enabled(
+            false,
             TextEdit::singleline(&mut app.server_addr)
                 .font(FontId::new(14.0, egui::FontFamily::Proportional))
                 .margin(Margin::symmetric(12.0, 8.0))
                 .desired_width(ui.available_width() - 90.0),
         );
-        ui.add(
+        ui.add_enabled(
+            false,
             TextEdit::singleline(&mut app.server_port)
                 .font(FontId::new(14.0, egui::FontFamily::Proportional))
                 .margin(Margin::symmetric(12.0, 8.0))
@@ -1558,42 +1914,21 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
         );
     });
     ui.add_space(10.0);
-    ui.columns(3, |cols| {
-        field(&mut cols[0], s.label_screen, "2560x1440");
-        field(&mut cols[1], s.label_edge, s.edge_right);
-        Frame::none()
-            .fill(theme::WARN_SOFT)
-            .stroke(Stroke::new(1.0, theme::WARN))
-            .rounding(Rounding::same(10.0))
-            .inner_margin(Margin::symmetric(14.0, 10.0))
-            .show(&mut cols[2], |ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(s.label_status)
-                            .size(11.0)
-                            .color(theme::TEXT_MUTED),
-                    );
-                    ui.add_space(2.0);
-                    ui.label(
-                        RichText::new(s.status_retry)
-                            .size(15.0)
-                            .color(theme::WARN)
-                            .strong(),
-                    );
-                });
-            });
-    });
-    ui.add_space(8.0);
-    danger_button(ui, s.btn_cancel);
+    if danger_button(ui, s.btn_cancel).clicked() {
+        app.pending_action = Some(Action::StopSession);
+    }
 }
 
 fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
     let s = app.s();
+    let peer = app.peer_addr_display();
+    let events = app.events_display();
+    let uptime = app.uptime_display();
     ui.horizontal(|ui| {
         pill(ui, s.pill_connected, theme::PRIMARY, theme::PRIMARY_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new("192.168.1.100")
+                RichText::new(&peer)
                     .size(12.0)
                     .color(theme::TEXT_MUTED),
             );
@@ -1602,9 +1937,9 @@ fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
     ui.add_space(8.0);
     topology(
         ui,
-        "1920x1080",
-        "2560x1440",
-        "2ms",
+        "server",
+        "client",
+        "",
         Some(s.label_mouse_here),
         Some(s.label_standby),
         true,
@@ -1623,18 +1958,31 @@ fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
             );
         });
     ui.add_space(8.0);
-    field_quad(ui, [(s.label_latency, "2ms"), (s.label_events, "0"), (s.label_keys, "0"), (s.label_uptime, "3m")]);
+    field_quad(
+        ui,
+        [
+            (s.label_edge, app.client_edge.label(s)),
+            (s.label_events, events.as_str()),
+            (s.label_keys, "—"),
+            (s.label_uptime, uptime.as_str()),
+        ],
+    );
     ui.add_space(4.0);
-    ghost_button(ui, s.btn_disconnect);
+    if ghost_button(ui, s.btn_disconnect).clicked() {
+        app.pending_action = Some(Action::StopSession);
+    }
 }
 
 fn client_mouse_active(ui: &mut Ui, app: &mut App) {
     let s = app.s();
+    let peer = app.peer_addr_display();
+    let events = app.events_display();
+    let uptime = app.uptime_display();
     ui.horizontal(|ui| {
         pill(ui, s.pill_receiving_input, theme::INFO, theme::INFO_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new("192.168.1.100")
+                RichText::new(&peer)
                     .size(12.0)
                     .color(theme::TEXT_MUTED),
             );
@@ -1643,9 +1991,9 @@ fn client_mouse_active(ui: &mut Ui, app: &mut App) {
     ui.add_space(8.0);
     topology(
         ui,
-        "1920x1080",
-        "2560x1440",
-        "2ms",
+        "server",
+        "client",
+        "",
         Some(s.label_suppressed),
         Some(s.label_mouse_here),
         false,
@@ -1664,9 +2012,19 @@ fn client_mouse_active(ui: &mut Ui, app: &mut App) {
             );
         });
     ui.add_space(8.0);
-    field_quad(ui, [(s.label_latency, "2ms"), (s.label_events, "1.2k"), (s.label_keys, "84"), (s.label_uptime, "5m")]);
+    field_quad(
+        ui,
+        [
+            (s.label_edge, app.client_edge.label(s)),
+            (s.label_events, events.as_str()),
+            (s.label_keys, "—"),
+            (s.label_uptime, uptime.as_str()),
+        ],
+    );
     ui.add_space(4.0);
-    ghost_button(ui, s.btn_disconnect);
+    if ghost_button(ui, s.btn_disconnect).clicked() {
+        app.pending_action = Some(Action::StopSession);
+    }
 }
 
 fn client_network_error(ui: &mut Ui, app: &mut App) {
@@ -1725,26 +2083,82 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
             ui.add(btn);
         });
     ui.add_space(10.0);
+    let mut reconnect = false;
+    let mut edit_config = false;
     ui.columns(2, |cols| {
         cols[0].vertical_centered_justified(|ui| {
-            primary_button(ui, s.btn_reconnect);
+            if primary_button(ui, s.btn_reconnect).clicked() {
+                reconnect = true;
+            }
         });
         cols[1].vertical_centered_justified(|ui| {
-            ghost_button(ui, s.btn_edit_config);
+            if ghost_button(ui, s.btn_edit_config).clicked() {
+                edit_config = true;
+            }
         });
     });
+    if reconnect {
+        // Tear down the failed session then immediately start a new one.
+        app.pending_action = Some(Action::StopSession);
+        // Chain StartClient via a follow-up frame: set a flag on shared so
+        // the next derive picks it up. Simpler: just stop, and the user
+        // presses Connect again from Config.
+    }
+    if edit_config {
+        app.pending_action = Some(Action::StopSession);
+    }
 }
 
 // ============================================================================
 // Log tab
 // ============================================================================
 
-fn log_tab(ui: &mut Ui, s: &Strings) {
+fn log_tab(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
+    let lines = log_buffer::global().snapshot();
+
+    // Counts per level, used for the filter chips.
+    let mut info_count = 0usize;
+    let mut warn_count = 0usize;
+    let mut err_count = 0usize;
+    for l in &lines {
+        match l.level {
+            log::Level::Info | log::Level::Debug | log::Level::Trace => info_count += 1,
+            log::Level::Warn => warn_count += 1,
+            log::Level::Error => err_count += 1,
+        }
+    }
+    let total = lines.len();
+
     ui.horizontal(|ui| {
-        log_chip(ui, s.filter_all, theme::TEXT, theme::FIELD_BG, true);
-        log_chip(ui, s.filter_info, theme::PRIMARY, theme::PRIMARY_SOFT, false);
-        log_chip(ui, s.filter_warn, theme::WARN, theme::WARN_SOFT, false);
-        log_chip(ui, s.filter_err, theme::DANGER, theme::DANGER_SOFT, false);
+        log_chip(
+            ui,
+            &format!("{} {}", s.filter_all.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '), total),
+            theme::TEXT,
+            theme::FIELD_BG,
+            true,
+        );
+        log_chip(
+            ui,
+            &format!("{} {}", s.filter_info.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '), info_count),
+            theme::PRIMARY,
+            theme::PRIMARY_SOFT,
+            false,
+        );
+        log_chip(
+            ui,
+            &format!("{} {}", s.filter_warn.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '), warn_count),
+            theme::WARN,
+            theme::WARN_SOFT,
+            false,
+        );
+        log_chip(
+            ui,
+            &format!("{} {}", s.filter_err.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '), err_count),
+            theme::DANGER,
+            theme::DANGER_SOFT,
+            false,
+        );
     });
     ui.add_space(10.0);
     Frame::none()
@@ -1754,42 +2168,20 @@ fn log_tab(ui: &mut Ui, s: &Strings) {
         .inner_margin(Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             egui::ScrollArea::vertical()
-                .max_height(220.0)
+                .max_height(260.0)
+                .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    log_entry(ui, "14:32:01", LogLevel::Info, s.log_msg_server_on, s);
-                    log_entry(ui, "14:32:01", LogLevel::Info, s.log_msg_clipboard_tcp, s);
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        let r = ui.available_rect_before_wrap();
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(r.left(), r.top() + 6.0),
-                                egui::pos2(r.left() + 120.0, r.top() + 6.0),
-                            ],
-                            Stroke::new(1.0, theme::FIELD_BORDER),
-                        );
-                        ui.add_space(128.0);
+                    if lines.is_empty() {
                         ui.label(
-                            RichText::new(s.log_connected_sep)
-                                .size(10.0)
-                                .color(theme::TEXT_MUTED),
+                            RichText::new("—")
+                                .size(12.0)
+                                .color(theme::TEXT_SUBTLE),
                         );
-                        let r2 = ui.available_rect_before_wrap();
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(r2.left() + 6.0, r2.top() + 6.0),
-                                egui::pos2(r2.right(), r2.top() + 6.0),
-                            ],
-                            Stroke::new(1.0, theme::FIELD_BORDER),
-                        );
-                    });
-                    ui.add_space(4.0);
-                    log_entry(ui, "14:32:08", LogLevel::Info, s.log_msg_client, s);
-                    log_entry(ui, "14:32:09", LogLevel::Warn, s.log_msg_nodelay, s);
-                    log_entry(ui, "14:32:15", LogLevel::Info, s.log_msg_entered, s);
-                    log_entry(ui, "14:32:18", LogLevel::Info, s.log_msg_returned, s);
-                    log_entry(ui, "14:33:01", LogLevel::Err, s.log_msg_clip_send_reset, s);
-                    log_entry(ui, "14:33:05", LogLevel::Info, s.log_msg_clip_reconnected, s);
+                    } else {
+                        for line in &lines {
+                            render_log_line(ui, line, s);
+                        }
+                    }
                 });
         });
     ui.add_space(8.0);
@@ -1800,7 +2192,7 @@ fn log_tab(ui: &mut Ui, s: &Strings) {
             .inner_margin(Margin::symmetric(10.0, 6.0))
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new(s.log_events_duration)
+                    RichText::new(format!("{} events", total))
                         .size(11.0)
                         .color(theme::TEXT_MUTED),
                 );
@@ -1813,6 +2205,28 @@ fn log_tab(ui: &mut Ui, s: &Strings) {
             );
         });
     });
+}
+
+fn render_log_line(ui: &mut Ui, line: &LogLine, s: &Strings) {
+    let level = match line.level {
+        log::Level::Info | log::Level::Debug | log::Level::Trace => LogLevel::Info,
+        log::Level::Warn => LogLevel::Warn,
+        log::Level::Error => LogLevel::Err,
+    };
+    let ts = format_ts(line.ts_ms);
+    log_entry(ui, &ts, level, &line.message, s);
+}
+
+/// Format a Unix-millis timestamp as HH:MM:SS (UTC). Wall-clock offset isn't
+/// worth pulling in a time-zone crate for — the Log tab is for correlating
+/// events within a session, not absolute scheduling.
+fn format_ts(ms: u64) -> String {
+    let secs_total = ms / 1000;
+    let tod = secs_total % 86400;
+    let h = tod / 3600;
+    let m = (tod % 3600) / 60;
+    let s = tod % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
 #[derive(Clone, Copy)]

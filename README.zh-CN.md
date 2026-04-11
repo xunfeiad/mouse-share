@@ -26,9 +26,29 @@
 cargo build --release
 ```
 
-编译产物位于 `target/release/mouse-share`。
+CLI 可执行文件位于 `target/release/mouse-share`。
 
-### 使用
+### 图形界面（macOS）
+
+项目自带一个小型 GUI，将 server/client 统一封装到一个窗口里。在 macOS 上推荐
+以 `.app` 形式运行——这样「辅助功能」权限绑定在 bundle identifier 上，重新
+编译后不需要重新授权：
+
+```bash
+./scripts/build-app.sh
+open "dist/mouse share.app"
+```
+
+也可以直接从源码运行而不打包：
+
+```bash
+cargo run --release --features ui --bin mouse-share-ui
+```
+
+首次启动 macOS 会弹窗索要「辅助功能」权限。在**系统设置 → 隐私与安全性 →
+辅助功能**里勾选 `mouse share` 并重启应用即可。
+
+### 命令行使用
 
 **在控制端电脑（Server）上运行：**
 

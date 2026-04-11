@@ -16,8 +16,9 @@ pub enum CapturedInput {
 /// Trait for capturing global input events on the server side.
 pub trait InputCapture: Send {
     /// Start the capture loop. Sends captured events through `sender`.
-    /// This blocks the calling thread (runs an event loop).
-    fn run(&mut self, sender: Sender<CapturedInput>) -> Result<()>;
+    /// This blocks the calling thread (runs an event loop). The loop exits
+    /// cleanly when `shutdown` flips to `true`.
+    fn run(&mut self, sender: Sender<CapturedInput>, shutdown: Arc<AtomicBool>) -> Result<()>;
 
     /// Get a handle to toggle event suppression.
     /// When suppressed, events are consumed (not delivered to the local OS).

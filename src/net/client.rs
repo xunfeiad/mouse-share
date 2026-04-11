@@ -1,8 +1,11 @@
 use crate::input::{capture, simulate};
+use crate::net::state::{now_ms, SharedState};
 use crate::protocol::{self, Message, MouseEventType};
 use crate::screen::get_screen_info;
 use anyhow::Result;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct Client {
@@ -14,7 +17,11 @@ impl Client {
         Self { server_addr }
     }
 
-    pub fn run(&self) -> Result<()> {
+    pub fn run(&self, state: Arc<SharedState>) -> Result<()> {
+        state.started_ms.store(now_ms(), Ordering::SeqCst);
+        state.clear_error();
+        state.set_peer(self.server_addr.clone());
+
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
         log::info!("Connecting to server at {}", self.server_addr);
@@ -25,20 +32,33 @@ impl Client {
 
         // Send Hello with retries
         let hello = protocol::serialize(&Message::Hello(screen.clone()))?;
-        let server_screen = self.connect_with_retry(&socket, &hello)?;
+        let server_screen = match self.connect_with_retry(&socket, &hello, &state) {
+            Ok(s) => s,
+            Err(e) => {
+                state.set_error(format!("{}", e));
+                return Err(e);
+            }
+        };
+        if state.shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         log::info!(
             "Connected to server (screen: {}x{})",
             server_screen.width,
             server_screen.height
         );
+        state.connected.store(true, Ordering::SeqCst);
+        state.last_heartbeat_ms.store(now_ms(), Ordering::SeqCst);
 
         // Start clipboard TCP client in background (port = udp_port + 1)
         let server_sock: SocketAddr = self.server_addr.parse()?;
         let clipboard_addr = SocketAddr::new(server_sock.ip(), server_sock.port() + 1);
-        std::thread::Builder::new()
+        let clip_shutdown = Arc::new(AtomicBool::new(false));
+        let clip_shutdown_for_thread = clip_shutdown.clone();
+        let clipboard_thread = std::thread::Builder::new()
             .name("clipboard-client".into())
             .spawn(move || {
-                crate::clipboard::run_client(clipboard_addr);
+                crate::clipboard::run_client(clipboard_addr, clip_shutdown_for_thread);
             })?;
 
         // Create simulator
@@ -59,7 +79,13 @@ impl Client {
         let mut sim_x: f64 = 0.0;
         let mut sim_y: f64 = 0.0;
 
-        loop {
+        let loop_result: Result<()> = 'evt: loop {
+            // Graceful shutdown request from UI
+            if state.shutdown.load(Ordering::SeqCst) {
+                log::info!("Client event loop: shutdown requested");
+                break 'evt Ok(());
+            }
+
             // Send heartbeat
             if last_heartbeat.elapsed() > Duration::from_secs(1) {
                 let hb = protocol::serialize(&Message::Heartbeat)?;
@@ -77,6 +103,7 @@ impl Client {
                     match msg {
                         Message::Enter { x, y } => {
                             active = true;
+                            state.mouse_on_peer.store(true, Ordering::SeqCst);
                             sim_x = x;
                             sim_y = y;
                             // Show cursor on entry so the user sees it.
@@ -91,6 +118,7 @@ impl Client {
                         }
                         Message::Leave => {
                             active = false;
+                            state.mouse_on_peer.store(false, Ordering::SeqCst);
                             // Mouse is going back to the server — hide local cursor.
                             if !cursor_hidden {
                                 capture::hide_local_cursor();
@@ -106,8 +134,12 @@ impl Client {
                             if let Err(e) = simulator.key_event(key.keycode, key.down, key.flags) {
                                 log::error!("Key simulation error: {}", e);
                             }
+                            state.events_total.fetch_add(1, Ordering::Relaxed);
+                            state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                         }
                         Message::Input(event) if active => {
+                            state.events_total.fetch_add(1, Ordering::Relaxed);
+                            state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                             let result = match &event.event_type {
                                 MouseEventType::Move => {
                                     sim_x += event.dx;
@@ -131,7 +163,9 @@ impl Client {
                                 log::error!("Simulation error: {}", e);
                             }
                         }
-                        Message::Heartbeat => {}
+                        Message::Heartbeat => {
+                            state.last_heartbeat_ms.store(now_ms(), Ordering::SeqCst);
+                        }
                         _ => {}
                     }
                 }
@@ -140,18 +174,33 @@ impl Client {
                         || e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => {
                     log::error!("Network error: {}", e);
+                    state.set_error(format!("{}", e));
                 }
             }
+        };
+
+        // Graceful teardown.
+        state.connected.store(false, Ordering::SeqCst);
+        state.mouse_on_peer.store(false, Ordering::SeqCst);
+        if cursor_hidden {
+            capture::show_local_cursor();
         }
+        clip_shutdown.store(true, Ordering::SeqCst);
+        let _ = clipboard_thread.join();
+        loop_result
     }
 
     fn connect_with_retry(
         &self,
         socket: &UdpSocket,
         hello: &[u8],
+        state: &Arc<SharedState>,
     ) -> Result<crate::protocol::ScreenInfo> {
         let mut buf = [0u8; 4096];
         for attempt in 0..10 {
+            if state.shutdown.load(Ordering::SeqCst) {
+                return Err(anyhow::anyhow!("connect cancelled"));
+            }
             if attempt > 0 {
                 log::info!("Retrying Hello (attempt {}/10)...", attempt + 1);
             }
@@ -159,6 +208,9 @@ impl Client {
 
             let deadline = Instant::now() + Duration::from_secs(2);
             while Instant::now() < deadline {
+                if state.shutdown.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("connect cancelled"));
+                }
                 match socket.recv_from(&mut buf) {
                     Ok((len, _)) => {
                         if let Ok(Message::HelloAck(screen)) =

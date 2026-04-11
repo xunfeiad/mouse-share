@@ -1,6 +1,8 @@
 use crate::protocol::{KeyEvent, MouseButton, MouseEvent, MouseEventType};
 use anyhow::Result;
-use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+use core_foundation::runloop::{
+    kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopRunResult,
+};
 use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType, EventField,
@@ -8,6 +10,7 @@ use core_graphics::event::{
 use crossbeam_channel::Sender;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::capture::{CapturedInput, InputCapture};
 
@@ -24,7 +27,7 @@ impl MacOsCapture {
 }
 
 impl InputCapture for MacOsCapture {
-    fn run(&mut self, sender: Sender<CapturedInput>) -> Result<()> {
+    fn run(&mut self, sender: Sender<CapturedInput>, shutdown: Arc<AtomicBool>) -> Result<()> {
         let suppressing = self.suppressing.clone();
 
         let events_of_interest = vec![
@@ -116,8 +119,27 @@ impl InputCapture for MacOsCapture {
         tap.enable();
 
         log::info!("macOS event tap started, entering run loop");
-        CFRunLoop::run_current();
+        // Poll the runloop in short slices so we can notice `shutdown` and
+        // break out cleanly. `run_current()` would block forever and leave
+        // no way for the UI to stop the backend.
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                log::info!("macOS event tap: shutdown requested, exiting run loop");
+                break;
+            }
+            let result = CFRunLoop::run_in_mode(
+                unsafe { kCFRunLoopDefaultMode },
+                Duration::from_millis(100),
+                false,
+            );
+            if matches!(result, CFRunLoopRunResult::Finished | CFRunLoopRunResult::Stopped) {
+                break;
+            }
+        }
 
+        run_loop.remove_source(&loop_source, unsafe { kCFRunLoopCommonModes });
+        // Dropping `tap` disables and releases it.
+        drop(tap);
         Ok(())
     }
 

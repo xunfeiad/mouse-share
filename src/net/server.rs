@@ -1,5 +1,6 @@
 use crate::config::{Edge, ScreenConfig};
 use crate::input::capture::{self, CapturedInput};
+use crate::net::state::{now_ms, SharedState};
 use crate::protocol::{self, Message, ScreenInfo};
 use crate::screen::get_screen_info;
 use anyhow::Result;
@@ -26,22 +27,48 @@ impl Server {
         Self { port, edge }
     }
 
-    pub fn run(&self) -> Result<()> {
-        let socket = UdpSocket::bind(format!("0.0.0.0:{}", self.port))?;
+    pub fn run(&self, state: Arc<SharedState>) -> Result<()> {
+        state.started_ms.store(now_ms(), Ordering::SeqCst);
+        state.clear_error();
+
+        let socket = match UdpSocket::bind(format!("0.0.0.0:{}", self.port)) {
+            Ok(s) => s,
+            Err(e) => {
+                state.set_error(format!("Failed to bind port {}: {}", self.port, e));
+                return Err(e.into());
+            }
+        };
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
         log::info!("Server listening on 0.0.0.0:{}", self.port);
 
         // Start clipboard TCP server on port+1 in background
         let clipboard_port = self.port + 1;
-        std::thread::Builder::new()
+        let clip_shutdown = Arc::new(AtomicBool::new(false));
+        let clip_shutdown_for_thread = clip_shutdown.clone();
+        let clipboard_thread = std::thread::Builder::new()
             .name("clipboard-server".into())
             .spawn(move || {
-                crate::clipboard::run_server(clipboard_port);
+                crate::clipboard::run_server(clipboard_port, clip_shutdown_for_thread);
             })?;
 
-        // Wait for client Hello
-        let (client_addr, client_screen) = self.wait_for_client(&socket)?;
+        // Wait for client Hello (interruptible)
+        let (client_addr, client_screen) = match self.wait_for_client(&socket, &state) {
+            Ok(v) => v,
+            Err(e) => {
+                clip_shutdown.store(true, Ordering::SeqCst);
+                let _ = clipboard_thread.join();
+                return Err(e);
+            }
+        };
+        if state.shutdown.load(Ordering::SeqCst) {
+            clip_shutdown.store(true, Ordering::SeqCst);
+            let _ = clipboard_thread.join();
+            return Ok(());
+        }
         log::info!("Client connected: {} ({:?})", client_addr, client_screen);
+        state.connected.store(true, Ordering::SeqCst);
+        state.set_peer(client_addr.to_string());
+        state.last_heartbeat_ms.store(now_ms(), Ordering::SeqCst);
 
         // Get server screen info
         let server_screen = get_screen_info()?;
@@ -60,10 +87,12 @@ impl Server {
         let suppress = capturer.suppress_handle();
         let (sender, receiver) = bounded::<CapturedInput>(256);
 
-        let _capture_thread = std::thread::Builder::new()
+        let capture_shutdown = Arc::new(AtomicBool::new(false));
+        let capture_shutdown_for_thread = capture_shutdown.clone();
+        let capture_thread = std::thread::Builder::new()
             .name("input-capture".into())
             .spawn(move || {
-                if let Err(e) = capturer.run(sender) {
+                if let Err(e) = capturer.run(sender, capture_shutdown_for_thread) {
                     log::error!("Capture error: {}", e);
                 }
             })?;
@@ -72,23 +101,56 @@ impl Server {
         socket.set_nonblocking(true)?;
 
         // Main event loop
-        self.event_loop(socket, client_addr, receiver, suppress, &screen_config)?;
+        let loop_result = self.event_loop(
+            socket,
+            client_addr,
+            receiver,
+            suppress,
+            &screen_config,
+            &state,
+        );
 
-        Ok(())
+        // Graceful teardown: tell capture + clipboard threads to exit, then
+        // join. The event_loop always releases cursor suppression on exit.
+        capture_shutdown.store(true, Ordering::SeqCst);
+        clip_shutdown.store(true, Ordering::SeqCst);
+        state.connected.store(false, Ordering::SeqCst);
+        state.mouse_on_peer.store(false, Ordering::SeqCst);
+        let _ = capture_thread.join();
+        let _ = clipboard_thread.join();
+
+        loop_result
     }
 
-    fn wait_for_client(&self, socket: &UdpSocket) -> Result<(SocketAddr, ScreenInfo)> {
+    fn wait_for_client(
+        &self,
+        socket: &UdpSocket,
+        state: &Arc<SharedState>,
+    ) -> Result<(SocketAddr, ScreenInfo)> {
         log::info!("Waiting for client to connect...");
         let mut buf = [0u8; 4096];
         loop {
+            if state.shutdown.load(Ordering::SeqCst) {
+                // Return a sentinel error the caller converts into a clean
+                // shutdown path — but the caller also checks `shutdown`
+                // right after this, so any placeholder value will do.
+                return Ok((
+                    "0.0.0.0:0".parse().unwrap(),
+                    ScreenInfo { width: 0, height: 0 },
+                ));
+            }
             match socket.recv_from(&mut buf) {
                 Ok((len, addr)) => {
                     if let Ok(Message::Hello(screen)) = protocol::deserialize(&buf[..len]) {
                         return Ok((addr, screen));
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -101,6 +163,7 @@ impl Server {
         receiver: Receiver<CapturedInput>,
         suppress: Arc<AtomicBool>,
         config: &ScreenConfig,
+        state: &Arc<SharedState>,
     ) -> Result<()> {
         let mut forwarding = false;
         // Explicit tracking of local cursor visibility. Guarantees hide/show
@@ -126,11 +189,23 @@ impl Server {
         );
 
         loop {
+            // Graceful shutdown request from UI
+            if state.shutdown.load(Ordering::SeqCst) {
+                log::info!("Server event loop: shutdown requested");
+                suppress.store(false, Ordering::SeqCst);
+                if cursor_hidden {
+                    capture::show_local_cursor();
+                }
+                let _ = socket.send_to(&protocol::serialize(&Message::Leave)?, client_addr);
+                break;
+            }
+
             // Watchdog: release suppression if stuck
             if forwarding && last_forward_time.elapsed() > SUPPRESS_TIMEOUT {
                 log::warn!("Suppression watchdog triggered, releasing mouse");
                 forwarding = false;
                 suppress.store(false, Ordering::SeqCst);
+                state.mouse_on_peer.store(false, Ordering::SeqCst);
                 if cursor_hidden {
                     capture::show_local_cursor();
                     cursor_hidden = false;
@@ -160,6 +235,8 @@ impl Server {
                         );
                         let msg = protocol::serialize(&Message::KeyInput(key_event))?;
                         let _ = socket.send_to(&msg, client_addr);
+                        state.events_total.fetch_add(1, Ordering::Relaxed);
+                        state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                     }
                 }
                 Ok(CapturedInput::Mouse(event)) => {
@@ -177,6 +254,7 @@ impl Server {
                         if config.at_edge(cx, cy) {
                             forwarding = true;
                             suppress.store(true, Ordering::SeqCst);
+                            state.mouse_on_peer.store(true, Ordering::SeqCst);
                             if !cursor_hidden {
                                 capture::hide_local_cursor();
                                 cursor_hidden = true;
@@ -235,6 +313,7 @@ impl Server {
                         if should_return {
                             forwarding = false;
                             suppress.store(false, Ordering::SeqCst);
+                            state.mouse_on_peer.store(false, Ordering::SeqCst);
                             if cursor_hidden {
                                 capture::show_local_cursor();
                                 cursor_hidden = false;
@@ -251,6 +330,8 @@ impl Server {
 
                         let msg = protocol::serialize(&Message::Input(event))?;
                         let _ = socket.send_to(&msg, client_addr);
+                        state.events_total.fetch_add(1, Ordering::Relaxed);
+                        state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -269,10 +350,14 @@ impl Server {
             match socket.recv_from(&mut buf) {
                 Ok((len, addr)) => {
                     match protocol::deserialize(&buf[..len]) {
-                        Ok(Message::Heartbeat) => {}
+                        Ok(Message::Heartbeat) => {
+                            state.last_heartbeat_ms.store(now_ms(), Ordering::SeqCst);
+                        }
                         Ok(Message::Hello(_screen)) => {
                             // Client reconnected
                             log::info!("Client reconnected from {}", addr);
+                            state.set_peer(addr.to_string());
+                            state.last_heartbeat_ms.store(now_ms(), Ordering::SeqCst);
                             let ack = protocol::serialize(&Message::HelloAck(
                                 get_screen_info().unwrap_or(ScreenInfo { width: 1920, height: 1080 }),
                             ))?;

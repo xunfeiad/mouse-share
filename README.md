@@ -26,9 +26,29 @@ Share mouse control between multiple computers over a WiFi LAN. Cross-platform s
 cargo build --release
 ```
 
-The binary is at `target/release/mouse-share`.
+The CLI binary is at `target/release/mouse-share`.
 
-### Usage
+### GUI (macOS)
+
+A small GUI wraps the server/client in a single window. On macOS the
+recommended way to run it is as a `.app` bundle — Accessibility permission is
+granted to the bundle identifier and survives rebuilds:
+
+```bash
+./scripts/build-app.sh
+open "dist/mouse share.app"
+```
+
+You can also run the GUI directly from the tree without bundling:
+
+```bash
+cargo run --release --features ui --bin mouse-share-ui
+```
+
+The first launch will prompt for Accessibility. Grant it in **System Settings
+→ Privacy & Security → Accessibility**, then relaunch.
+
+### CLI usage
 
 **On the controlling machine (Server):**
 
@@ -173,8 +193,6 @@ RUST_LOG=debug mouse-share client --server 192.168.1.100:4242
 ## Known limitations
 
 - Only one client connection is supported.
-- No keyboard sharing (mouse only).
-- No clipboard sync.
 - UDP is unencrypted — only use it on a trusted LAN.
 - Linux is not supported.
 

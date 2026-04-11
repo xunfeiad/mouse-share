@@ -1,11 +1,5 @@
-mod clipboard;
-mod config;
-mod input;
-mod net;
-mod protocol;
-mod screen;
-
 use clap::{Parser, Subcommand};
+use mouse_share::{config, input, log_buffer, net};
 
 #[derive(Parser)]
 #[command(name = "mouse-share", about = "Share mouse across WiFi network")]
@@ -35,9 +29,9 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
+    // Install the tee logger so both stderr (env_logger) and the in-memory
+    // ring buffer (for the GUI Log tab) see every record.
+    let _ = log_buffer::install();
 
     let cli = Cli::parse();
 
@@ -48,6 +42,8 @@ fn main() -> anyhow::Result<()> {
     // when mouse is on server).
     input::capture::promote_to_foreground_app();
 
+    let state = std::sync::Arc::new(net::SharedState::new());
+
     match cli.command {
         Commands::Server { port, edge } => {
             let edge: config::Edge = edge
@@ -55,12 +51,12 @@ fn main() -> anyhow::Result<()> {
                 .map_err(|e: String| anyhow::anyhow!(e))?;
             log::info!("Starting server on port {}, client edge: {:?}", port, edge);
             let server = net::server::Server::new(port, edge);
-            server.run()
+            server.run(state)
         }
         Commands::Client { server } => {
             log::info!("Starting client, connecting to {}", server);
             let client = net::client::Client::new(server);
-            client.run()
+            client.run(state)
         }
     }
 }

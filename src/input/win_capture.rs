@@ -8,9 +8,9 @@ use super::capture::{CapturedInput, InputCapture};
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, GetSystemMetrics, SetCursorPos, SetWindowsHookExW,
-    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, SM_CXSCREEN, SM_CYSCREEN,
-    WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    CallNextHookEx, GetSystemMetrics, PeekMessageW, SetCursorPos, SetWindowsHookExW,
+    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PM_REMOVE, SM_CXSCREEN,
+    SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
@@ -51,7 +51,7 @@ thread_local! {
 }
 
 impl InputCapture for WinCapture {
-    fn run(&mut self, sender: Sender<CapturedInput>) -> Result<()> {
+    fn run(&mut self, sender: Sender<CapturedInput>, shutdown: Arc<AtomicBool>) -> Result<()> {
         // Store sender and suppress flag in thread-local storage
         HOOK_SENDER.with(|s| *s.borrow_mut() = Some(sender));
         HOOK_SUPPRESS.with(|s| *s.borrow_mut() = Some(self.suppressing.clone()));
@@ -74,16 +74,32 @@ impl InputCapture for WinCapture {
 
         log::info!("Windows mouse + keyboard hooks installed, entering message loop");
 
-        // Windows requires a message pump on the hook thread
+        // Non-blocking message pump: drain pending messages, then sleep
+        // briefly so we can notice `shutdown` and exit cleanly. Using
+        // GetMessageW blocks forever and leaves no way for the UI to stop
+        // the backend.
         let mut msg = MSG::default();
-        unsafe {
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                // No dispatch needed, we only care about the hooks
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                log::info!("Windows hook thread: shutdown requested, exiting pump");
+                break;
             }
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    // Hooks fire as a side effect of message delivery — no
+                    // explicit dispatch is needed for WH_*_LL.
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         unsafe { UnhookWindowsHookEx(mouse_hook)? };
         unsafe { UnhookWindowsHookEx(kbd_hook)? };
+        // Clean up thread-locals so a later session on the same thread
+        // doesn't see stale refs.
+        HOOK_SENDER.with(|s| *s.borrow_mut() = None);
+        HOOK_SUPPRESS.with(|s| *s.borrow_mut() = None);
+        LAST_POS.with(|p| p.set(None));
         Ok(())
     }
 
