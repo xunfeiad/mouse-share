@@ -35,6 +35,7 @@ fn main() -> eframe::Result<()> {
         "mouse share",
         opts,
         Box::new(|cc| {
+            install_fonts(&cc.egui_ctx);
             install_style(&cc.egui_ctx);
             Ok(Box::new(App::default()))
         }),
@@ -497,6 +498,53 @@ const ZH: Strings = Strings {
     lang_chinese: "中文",
 };
 
+/// Load a platform CJK font so Chinese glyphs render. Silent no-op if the
+/// expected system font is missing (egui falls back to its default font which
+/// can only render ASCII/latin, so Chinese would show as tofu squares).
+fn install_fonts(ctx: &egui::Context) {
+    // Candidate CJK font files we'll probe in order.
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        ]
+    } else if cfg!(target_os = "windows") {
+        &[
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttf",
+            "C:\\Windows\\Fonts\\simhei.ttf",
+        ]
+    } else {
+        &[]
+    };
+
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts.font_data.insert(
+                "cjk".to_owned(),
+                egui::FontData::from_owned(bytes),
+            );
+            // Append CJK font AFTER the existing defaults so latin characters
+            // still use the default font's kerning/metrics and only CJK
+            // codepoints fall back to the system font.
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .push("cjk".to_owned());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("cjk".to_owned());
+            ctx.set_fonts(fonts);
+            return;
+        }
+    }
+}
+
 fn install_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     let v = &mut style.visuals;
@@ -596,18 +644,19 @@ enum Edge {
 }
 
 impl Edge {
-    fn label(self) -> &'static str {
+    fn label(self, s: &Strings) -> &'static str {
         match self {
-            Edge::Left => "Left",
-            Edge::Right => "Right",
-            Edge::Top => "Top",
-            Edge::Bottom => "Bottom",
+            Edge::Left => s.edge_left,
+            Edge::Right => s.edge_right,
+            Edge::Top => s.edge_top,
+            Edge::Bottom => s.edge_bottom,
         }
     }
 }
 
 struct App {
     tab: Tab,
+    lang: Lang,
     // Server tab state
     server_state: ServerState,
     port: String,
@@ -628,10 +677,21 @@ struct App {
     debug_logging: bool,
 }
 
+impl App {
+    /// Return the active string table (static reference — zero allocation).
+    fn s(&self) -> &'static Strings {
+        match self.lang {
+            Lang::En => &EN,
+            Lang::Zh => &ZH,
+        }
+    }
+}
+
 impl Default for App {
     fn default() -> Self {
         let mut app = Self {
             tab: Tab::Server,
+            lang: Lang::from_system(),
             server_state: ServerState::Idle,
             port: "4242".into(),
             edge: Edge::Right,
@@ -666,6 +726,13 @@ impl Default for App {
                 _ => {}
             }
         }
+        // Language override for screenshotting.
+        if let Ok(l) = std::env::var("MOUSE_SHARE_UI_LANG") {
+            app.lang = match l.as_str() {
+                "zh" => Lang::Zh,
+                _ => Lang::En,
+            };
+        }
         app
     }
 }
@@ -685,16 +752,17 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(Frame::none().fill(theme::BG).inner_margin(Margin::same(16.0)))
             .show(ctx, |ui| {
+                let s = self.s();
                 card(ui, |ui| {
                     title_bar(ui, "mouse share");
-                    tab_bar(ui, &mut self.tab);
+                    tab_bar(ui, &mut self.tab, s);
                     ui.add_space(14.0);
                     ui.scope(|ui| {
                         ui.style_mut().spacing.item_spacing.y = 12.0;
                         match self.tab {
                             Tab::Server => server_tab(ui, self),
                             Tab::Client => client_tab(ui, self),
-                            Tab::Log => log_tab(ui),
+                            Tab::Log => log_tab(ui, s),
                             Tab::Settings => settings_tab(ui, self),
                         }
                     });
@@ -743,14 +811,14 @@ fn title_bar(ui: &mut Ui, title: &str) {
     ui.add_space(12.0);
 }
 
-fn tab_bar(ui: &mut Ui, tab: &mut Tab) {
+fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
     ui.horizontal(|ui| {
         ui.style_mut().spacing.item_spacing.x = 22.0;
         for (t, label) in [
-            (Tab::Server, "Server"),
-            (Tab::Client, "Client"),
-            (Tab::Log, "Log"),
-            (Tab::Settings, "Settings"),
+            (Tab::Server, s.tab_server),
+            (Tab::Client, s.tab_client),
+            (Tab::Log, s.tab_log),
+            (Tab::Settings, s.tab_settings),
         ] {
             let selected = *tab == t;
             let color = if selected {
@@ -1028,6 +1096,7 @@ fn server_tab(ui: &mut Ui, app: &mut App) {
 }
 
 fn server_idle(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     // Icon + "Waiting for client"
     ui.vertical_centered(|ui| {
         ui.add_space(8.0);
@@ -1036,13 +1105,11 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
         // Monitor icon: rounded screen rectangle + short stand + base line.
         let p = ui.painter();
         let stroke = Stroke::new(1.6, theme::TEXT_MUTED);
-        // Screen
         let screen = Rect::from_min_size(
             egui::pos2(icon_rect.left() + 6.0, icon_rect.top() + 4.0),
             Vec2::new(36.0, 26.0),
         );
         p.rect_stroke(screen, Rounding::same(4.0), stroke);
-        // Stand
         let stand_top = screen.bottom() + 2.0;
         let stand_bot = stand_top + 6.0;
         let cx = icon_rect.center().x;
@@ -1054,35 +1121,35 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
             [egui::pos2(cx + 4.0, stand_top), egui::pos2(cx + 6.0, stand_bot)],
             stroke,
         );
-        // Base
         p.line_segment(
             [egui::pos2(cx - 9.0, stand_bot), egui::pos2(cx + 9.0, stand_bot)],
             stroke,
         );
         ui.add_space(10.0);
-        ui.label(RichText::new("Waiting for client").size(15.0).strong());
+        ui.label(RichText::new(s.waiting_for_client).size(15.0).strong());
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Start the client on another device and")
+            RichText::new(s.start_client_hint_l1)
                 .size(12.0)
                 .color(theme::TEXT_MUTED),
         );
         ui.label(
-            RichText::new("point it here")
+            RichText::new(s.start_client_hint_l2)
                 .size(12.0)
                 .color(theme::TEXT_MUTED),
         );
     });
     ui.add_space(12.0);
-    field_pair(ui, "Port", &app.port, "Edge", app.edge.label());
-    field_pair(ui, "Local IP", "192.168.1.100", "Screen", "1920x1080");
+    field_pair(ui, s.label_port, &app.port, s.label_edge, app.edge.label(s));
+    field_pair(ui, s.label_local_ip, "192.168.1.100", s.label_screen, "1920x1080");
     ui.add_space(6.0);
-    danger_button(ui, "Stop server");
+    danger_button(ui, s.btn_stop_server);
 }
 
 fn server_connected(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     ui.horizontal(|ui| {
-        pill(ui, "Connected", theme::PRIMARY, theme::PRIMARY_SOFT);
+        pill(ui, s.pill_connected, theme::PRIMARY, theme::PRIMARY_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
                 RichText::new("192.168.1.42")
@@ -1106,15 +1173,15 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
     field_quad(
         ui,
         [
-            ("Port", app.port.as_str()),
-            ("Edge", app.edge.label()),
-            ("Events", "12k"),
-            ("Up", "14m"),
+            (s.label_port, app.port.as_str()),
+            (s.label_edge, app.edge.label(s)),
+            (s.label_events, "12k"),
+            (s.label_up, "14m"),
         ],
     );
     ui.add_space(6.0);
-    toggle(ui, "Clipboard sync", &mut app.clipboard_sync);
-    toggle(ui, "Keyboard fwd", &mut app.keyboard_fwd);
+    toggle(ui, s.toggle_clipboard_sync, &mut app.clipboard_sync);
+    toggle(ui, s.toggle_keyboard_fwd, &mut app.keyboard_fwd);
     ui.add_space(4.0);
     Frame::none()
         .fill(theme::PRIMARY_SOFT)
@@ -1129,24 +1196,24 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
                 );
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new("clipboard: \"Hello\" (5ch)")
+                    RichText::new(s.clipboard_hello)
                         .size(12.0)
-                        .color(theme::PRIMARY)
-                        .family(egui::FontFamily::Monospace),
+                        .color(theme::PRIMARY),
                 );
             });
         });
     ui.add_space(4.0);
-    ghost_button(ui, "Stop server");
+    ghost_button(ui, s.btn_stop_server);
 }
 
-fn server_port_conflict(ui: &mut Ui, _app: &mut App) {
+fn server_port_conflict(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     ui.horizontal(|ui| {
-        pill(ui, "Port unavailable", theme::DANGER, theme::DANGER_SOFT);
+        pill(ui, s.pill_port_unavailable, theme::DANGER, theme::DANGER_SOFT);
     });
     ui.add_space(10.0);
     ui.label(
-        RichText::new("Server port")
+        RichText::new(s.label_server_port)
             .size(11.0)
             .color(theme::TEXT_MUTED),
     );
@@ -1160,7 +1227,7 @@ fn server_port_conflict(ui: &mut Ui, _app: &mut App) {
                 ui.label(RichText::new("4242").size(15.0).strong());
             });
         ui.label(
-            RichText::new("Occupied")
+            RichText::new(s.text_occupied)
                 .size(12.0)
                 .color(theme::DANGER)
                 .strong(),
@@ -1174,7 +1241,7 @@ fn server_port_conflict(ui: &mut Ui, _app: &mut App) {
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
             ui.label(
-                RichText::new("Port 4242 is in use")
+                RichText::new(s.text_port_in_use)
                     .size(13.0)
                     .color(theme::TEXT)
                     .strong(),
@@ -1199,20 +1266,20 @@ fn server_port_conflict(ui: &mut Ui, _app: &mut App) {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let btn = egui::Button::new(
-                    RichText::new("Use 4244").size(12.0).color(Color32::WHITE).strong(),
+                    RichText::new(s.btn_use_next).size(12.0).color(Color32::WHITE).strong(),
                 )
                 .fill(theme::PRIMARY)
                 .rounding(Rounding::same(8.0))
                 .min_size(Vec2::new(110.0, 30.0));
                 ui.add(btn);
-                let btn = egui::Button::new(RichText::new("Retry").size(12.0))
+                let btn = egui::Button::new(RichText::new(s.btn_retry).size(12.0))
                     .fill(theme::CARD_BG)
                     .stroke(Stroke::new(1.0, theme::CARD_BORDER))
                     .rounding(Rounding::same(8.0))
                     .min_size(Vec2::new(70.0, 30.0));
                 ui.add(btn);
                 let btn = egui::Button::new(
-                    RichText::new("Kill").size(12.0).color(theme::DANGER).strong(),
+                    RichText::new(s.btn_kill).size(12.0).color(theme::DANGER).strong(),
                 )
                 .fill(theme::CARD_BG)
                 .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
@@ -1222,13 +1289,13 @@ fn server_port_conflict(ui: &mut Ui, _app: &mut App) {
             });
         });
     ui.add_space(10.0);
-    section_label(ui, "Nearby ports");
-    nearby_port(ui, "4242", "node", true);
-    nearby_port(ui, "4243", "node", true);
-    nearby_port(ui, "4244", "—", false);
+    section_label(ui, s.label_nearby_ports);
+    nearby_port(ui, "4242", "node", true, s);
+    nearby_port(ui, "4243", "node", true, s);
+    nearby_port(ui, "4244", "—", false, s);
 }
 
-fn nearby_port(ui: &mut Ui, port: &str, proc_name: &str, used: bool) {
+fn nearby_port(ui: &mut Ui, port: &str, proc_name: &str, used: bool, s: &Strings) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(port)
@@ -1240,9 +1307,9 @@ fn nearby_port(ui: &mut Ui, port: &str, proc_name: &str, used: bool) {
         ui.label(RichText::new(proc_name).size(12.0).color(theme::TEXT_MUTED));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let (fg, bg, txt) = if used {
-                (theme::DANGER, theme::DANGER_SOFT, "used")
+                (theme::DANGER, theme::DANGER_SOFT, s.chip_used)
             } else {
-                (theme::PRIMARY, theme::PRIMARY_SOFT, "free")
+                (theme::PRIMARY, theme::PRIMARY_SOFT, s.chip_free)
             };
             Frame::none()
                 .fill(bg)
@@ -1255,11 +1322,12 @@ fn nearby_port(ui: &mut Ui, port: &str, proc_name: &str, used: bool) {
     });
 }
 
-fn server_port_resolved(ui: &mut Ui, _app: &mut App) {
-    pill(ui, "Ready", theme::PRIMARY, theme::PRIMARY_SOFT);
+fn server_port_resolved(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
+    pill(ui, s.pill_ready, theme::PRIMARY, theme::PRIMARY_SOFT);
     ui.add_space(10.0);
     ui.label(
-        RichText::new("Server port")
+        RichText::new(s.label_server_port)
             .size(11.0)
             .color(theme::TEXT_MUTED),
     );
@@ -1273,7 +1341,7 @@ fn server_port_resolved(ui: &mut Ui, _app: &mut App) {
                 ui.label(RichText::new("4244").size(15.0).strong());
             });
         ui.label(
-            RichText::new("Available")
+            RichText::new(s.text_available)
                 .size(12.0)
                 .color(theme::PRIMARY)
                 .strong(),
@@ -1286,24 +1354,25 @@ fn server_port_resolved(ui: &mut Ui, _app: &mut App) {
         .inner_margin(Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {
             ui.label(
-                RichText::new("→  Switched 4242 → 4244")
+                RichText::new(s.text_switched)
                     .size(12.0)
                     .color(theme::PRIMARY),
             );
         });
     ui.add_space(10.0);
-    field_pair(ui, "UDP (input)", ":4244", "TCP (clipboard)", ":4245");
+    field_pair(ui, s.label_udp_input, ":4244", s.label_tcp_clipboard, ":4245");
     ui.add_space(4.0);
     ui.label(
-        RichText::new("ⓘ 2 consecutive ports needed")
+        RichText::new(s.text_consecutive_ports)
             .size(11.0)
             .color(theme::TEXT_MUTED),
     );
     ui.add_space(6.0);
-    primary_button(ui, "Start server on :4244");
+    primary_button(ui, s.btn_start_server_on);
 }
 
-fn server_permission_required(ui: &mut Ui, _app: &mut App) {
+fn server_permission_required(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     // Large orange warning icon
     ui.vertical_centered(|ui| {
         ui.add_space(14.0);
@@ -1324,19 +1393,15 @@ fn server_permission_required(ui: &mut Ui, _app: &mut App) {
         );
         p.circle_filled(egui::pos2(cx, top + 20.0), 1.8, theme::WARN);
         ui.add_space(12.0);
-        ui.label(
-            RichText::new("Accessibility permission required")
-                .size(15.0)
-                .strong(),
-        );
+        ui.label(RichText::new(s.perm_title).size(15.0).strong());
         ui.add_space(4.0);
         ui.label(
-            RichText::new("Mouse Share needs Accessibility access to")
+            RichText::new(s.perm_sub_l1)
                 .size(12.0)
                 .color(theme::TEXT_MUTED),
         );
         ui.label(
-            RichText::new("capture and simulate input events")
+            RichText::new(s.perm_sub_l2)
                 .size(12.0)
                 .color(theme::TEXT_MUTED),
         );
@@ -1350,29 +1415,26 @@ fn server_permission_required(ui: &mut Ui, _app: &mut App) {
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
             ui.label(
-                RichText::new("How to enable")
+                RichText::new(s.perm_how_to_enable)
                     .size(12.0)
                     .color(theme::WARN)
                     .strong(),
             );
             ui.add_space(4.0);
             ui.label(
-                RichText::new(
-                    "System Settings → Privacy & Security → Accessibility → toggle on \"mouse-share\"",
-                )
-                .size(11.5)
-                .color(theme::TEXT)
-                .italics(),
+                RichText::new(s.perm_instructions)
+                    .size(11.5)
+                    .color(theme::TEXT)
+                    .italics(),
             );
         });
     ui.add_space(10.0);
-    // Two-button row: Open Settings (primary) + Retry (ghost)
     ui.columns(2, |cols| {
         cols[0].vertical_centered_justified(|ui| {
-            primary_button(ui, "Open Settings");
+            primary_button(ui, s.btn_open_settings);
         });
         cols[1].vertical_centered_justified(|ui| {
-            ghost_button(ui, "Retry");
+            ghost_button(ui, s.btn_retry);
         });
     });
 }
@@ -1394,8 +1456,9 @@ fn client_tab(ui: &mut Ui, app: &mut App) {
 }
 
 fn client_config(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     ui.label(
-        RichText::new("Server address")
+        RichText::new(s.label_server_address)
             .size(11.0)
             .color(theme::TEXT_MUTED),
     );
@@ -1415,18 +1478,18 @@ fn client_config(ui: &mut Ui, app: &mut App) {
     });
     ui.add_space(6.0);
     ui.label(
-        RichText::new("Screen edge")
+        RichText::new(s.label_screen_edge)
             .size(11.0)
             .color(theme::TEXT_MUTED),
     );
-    edge_picker(ui, &mut app.client_edge);
+    edge_picker(ui, &mut app.client_edge, s);
     ui.add_space(6.0);
-    field_pair(ui, "Local screen", "2560x1440", "Status", "Idle");
+    field_pair(ui, s.label_local_screen, "2560x1440", s.label_status, s.status_idle);
     ui.add_space(4.0);
-    primary_button(ui, "Connect");
+    primary_button(ui, s.btn_connect);
 }
 
-fn edge_picker(ui: &mut Ui, edge: &mut Edge) {
+fn edge_picker(ui: &mut Ui, edge: &mut Edge, s: &Strings) {
     ui.columns(4, |cols| {
         for (i, e) in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
             .iter()
@@ -1447,7 +1510,7 @@ fn edge_picker(ui: &mut Ui, edge: &mut Edge) {
                 .show(col, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.label(
-                            RichText::new(e.label())
+                            RichText::new(e.label(s))
                                 .size(13.0)
                                 .color(text_c)
                                 .strong(),
@@ -1463,11 +1526,12 @@ fn edge_picker(ui: &mut Ui, edge: &mut Edge) {
 }
 
 fn client_connecting(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     ui.horizontal(|ui| {
-        pill(ui, "Connecting", theme::WARN, theme::WARN_SOFT);
+        pill(ui, s.pill_connecting, theme::WARN, theme::WARN_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new("attempt 3/10")
+                RichText::new(s.text_attempt)
                     .size(12.0)
                     .color(theme::TEXT_MUTED),
             );
@@ -1475,7 +1539,7 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
     });
     ui.add_space(10.0);
     ui.label(
-        RichText::new("Server address")
+        RichText::new(s.label_server_address)
             .size(11.0)
             .color(theme::TEXT_MUTED),
     );
@@ -1495,9 +1559,8 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
     });
     ui.add_space(10.0);
     ui.columns(3, |cols| {
-        field(&mut cols[0], "Screen", "2560x1440");
-        field(&mut cols[1], "Edge", "Right");
-        // Warn-colored status field
+        field(&mut cols[0], s.label_screen, "2560x1440");
+        field(&mut cols[1], s.label_edge, s.edge_right);
         Frame::none()
             .fill(theme::WARN_SOFT)
             .stroke(Stroke::new(1.0, theme::WARN))
@@ -1506,13 +1569,13 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
             .show(&mut cols[2], |ui| {
                 ui.vertical(|ui| {
                     ui.label(
-                        RichText::new("Status")
+                        RichText::new(s.label_status)
                             .size(11.0)
                             .color(theme::TEXT_MUTED),
                     );
                     ui.add_space(2.0);
                     ui.label(
-                        RichText::new("Retry")
+                        RichText::new(s.status_retry)
                             .size(15.0)
                             .color(theme::WARN)
                             .strong(),
@@ -1521,12 +1584,13 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
             });
     });
     ui.add_space(8.0);
-    danger_button(ui, "Cancel");
+    danger_button(ui, s.btn_cancel);
 }
 
-fn client_mouse_on_server(ui: &mut Ui, _app: &mut App) {
+fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     ui.horizontal(|ui| {
-        pill(ui, "Connected", theme::PRIMARY, theme::PRIMARY_SOFT);
+        pill(ui, s.pill_connected, theme::PRIMARY, theme::PRIMARY_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
                 RichText::new("192.168.1.100")
@@ -1541,8 +1605,8 @@ fn client_mouse_on_server(ui: &mut Ui, _app: &mut App) {
         "1920x1080",
         "2560x1440",
         "2ms",
-        Some("Mouse here"),
-        Some("Standby"),
+        Some(s.label_mouse_here),
+        Some(s.label_standby),
         true,
         false,
     );
@@ -1553,20 +1617,21 @@ fn client_mouse_on_server(ui: &mut Ui, _app: &mut App) {
         .inner_margin(Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {
             ui.label(
-                RichText::new("●  Cursor hidden  ·  waiting for entry")
+                RichText::new(s.text_cursor_hidden)
                     .size(12.0)
                     .color(theme::TEXT_MUTED),
             );
         });
     ui.add_space(8.0);
-    field_quad(ui, [("Latency", "2ms"), ("Events", "0"), ("Keys", "0"), ("Uptime", "3m")]);
+    field_quad(ui, [(s.label_latency, "2ms"), (s.label_events, "0"), (s.label_keys, "0"), (s.label_uptime, "3m")]);
     ui.add_space(4.0);
-    ghost_button(ui, "Disconnect");
+    ghost_button(ui, s.btn_disconnect);
 }
 
-fn client_mouse_active(ui: &mut Ui, _app: &mut App) {
+fn client_mouse_active(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     ui.horizontal(|ui| {
-        pill(ui, "Receiving input", theme::INFO, theme::INFO_SOFT);
+        pill(ui, s.pill_receiving_input, theme::INFO, theme::INFO_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
                 RichText::new("192.168.1.100")
@@ -1581,8 +1646,8 @@ fn client_mouse_active(ui: &mut Ui, _app: &mut App) {
         "1920x1080",
         "2560x1440",
         "2ms",
-        Some("Suppressed"),
-        Some("Mouse here"),
+        Some(s.label_suppressed),
+        Some(s.label_mouse_here),
         false,
         true,
     );
@@ -1593,23 +1658,23 @@ fn client_mouse_active(ui: &mut Ui, _app: &mut App) {
         .inner_margin(Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {
             ui.label(
-                RichText::new("❙❙❙  Cursor at (823, 412) · keyboard forwarding")
+                RichText::new(s.text_cursor_at)
                     .size(12.0)
                     .color(theme::INFO),
             );
         });
     ui.add_space(8.0);
-    field_quad(ui, [("Latency", "2ms"), ("Events", "1.2k"), ("Keys", "84"), ("Uptime", "5m")]);
+    field_quad(ui, [(s.label_latency, "2ms"), (s.label_events, "1.2k"), (s.label_keys, "84"), (s.label_uptime, "5m")]);
     ui.add_space(4.0);
-    ghost_button(ui, "Disconnect");
+    ghost_button(ui, s.btn_disconnect);
 }
 
-fn client_network_error(ui: &mut Ui, _app: &mut App) {
+fn client_network_error(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     ui.horizontal(|ui| {
-        pill(ui, "Connection lost", theme::DANGER, theme::DANGER_SOFT);
+        pill(ui, s.pill_connection_lost, theme::DANGER, theme::DANGER_SOFT);
     });
     ui.add_space(12.0);
-    // Red "Server unreachable" card
     Frame::none()
         .fill(theme::DANGER_SOFT)
         .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
@@ -1617,22 +1682,19 @@ fn client_network_error(ui: &mut Ui, _app: &mut App) {
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
             ui.label(
-                RichText::new("Server unreachable")
+                RichText::new(s.err_server_unreachable)
                     .size(13.0)
                     .color(theme::DANGER)
                     .strong(),
             );
             ui.add_space(4.0);
             ui.label(
-                RichText::new(
-                    "Cannot reach 192.168.1.100:4242. Check that both devices are on the same network and the server is running.",
-                )
-                .size(11.5)
-                .color(theme::DANGER),
+                RichText::new(s.err_unreachable_detail)
+                    .size(11.5)
+                    .color(theme::DANGER),
             );
         });
     ui.add_space(10.0);
-    // Blue "Firewall check" card
     Frame::none()
         .fill(theme::INFO_SOFT)
         .stroke(Stroke::new(1.0, theme::INFO.linear_multiply(0.3)))
@@ -1640,22 +1702,20 @@ fn client_network_error(ui: &mut Ui, _app: &mut App) {
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
             ui.label(
-                RichText::new("Firewall check")
+                RichText::new(s.err_firewall_check)
                     .size(13.0)
                     .color(theme::INFO)
                     .strong(),
             );
             ui.add_space(4.0);
             ui.label(
-                RichText::new(
-                    "Ensure UDP :4242 and TCP :4243 are allowed through your firewall.",
-                )
-                .size(11.5)
-                .color(theme::INFO),
+                RichText::new(s.err_firewall_detail)
+                    .size(11.5)
+                    .color(theme::INFO),
             );
             ui.add_space(6.0);
             let btn = egui::Button::new(
-                RichText::new("Copy firewall rules")
+                RichText::new(s.btn_copy_firewall)
                     .size(11.5)
                     .color(theme::INFO),
             )
@@ -1665,13 +1725,12 @@ fn client_network_error(ui: &mut Ui, _app: &mut App) {
             ui.add(btn);
         });
     ui.add_space(10.0);
-    // Reconnect (primary) + Edit config (ghost)
     ui.columns(2, |cols| {
         cols[0].vertical_centered_justified(|ui| {
-            primary_button(ui, "Reconnect");
+            primary_button(ui, s.btn_reconnect);
         });
         cols[1].vertical_centered_justified(|ui| {
-            ghost_button(ui, "Edit config");
+            ghost_button(ui, s.btn_edit_config);
         });
     });
 }
@@ -1680,12 +1739,12 @@ fn client_network_error(ui: &mut Ui, _app: &mut App) {
 // Log tab
 // ============================================================================
 
-fn log_tab(ui: &mut Ui) {
+fn log_tab(ui: &mut Ui, s: &Strings) {
     ui.horizontal(|ui| {
-        log_chip(ui, "All 24", theme::TEXT, theme::FIELD_BG, true);
-        log_chip(ui, "Info 18", theme::PRIMARY, theme::PRIMARY_SOFT, false);
-        log_chip(ui, "Warn 4", theme::WARN, theme::WARN_SOFT, false);
-        log_chip(ui, "Err 2", theme::DANGER, theme::DANGER_SOFT, false);
+        log_chip(ui, s.filter_all, theme::TEXT, theme::FIELD_BG, true);
+        log_chip(ui, s.filter_info, theme::PRIMARY, theme::PRIMARY_SOFT, false);
+        log_chip(ui, s.filter_warn, theme::WARN, theme::WARN_SOFT, false);
+        log_chip(ui, s.filter_err, theme::DANGER, theme::DANGER_SOFT, false);
     });
     ui.add_space(10.0);
     Frame::none()
@@ -1697,8 +1756,8 @@ fn log_tab(ui: &mut Ui) {
             egui::ScrollArea::vertical()
                 .max_height(220.0)
                 .show(ui, |ui| {
-                    log_entry(ui, "14:32:01", "info", "server on 0.0.0.0:4242");
-                    log_entry(ui, "14:32:01", "info", "clipboard TCP on :4243");
+                    log_entry(ui, "14:32:01", LogLevel::Info, s.log_msg_server_on, s);
+                    log_entry(ui, "14:32:01", LogLevel::Info, s.log_msg_clipboard_tcp, s);
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         let r = ui.available_rect_before_wrap();
@@ -1711,7 +1770,7 @@ fn log_tab(ui: &mut Ui) {
                         );
                         ui.add_space(128.0);
                         ui.label(
-                            RichText::new("connected")
+                            RichText::new(s.log_connected_sep)
                                 .size(10.0)
                                 .color(theme::TEXT_MUTED),
                         );
@@ -1725,12 +1784,12 @@ fn log_tab(ui: &mut Ui) {
                         );
                     });
                     ui.add_space(4.0);
-                    log_entry(ui, "14:32:08", "info", "client 192.168.1.42");
-                    log_entry(ui, "14:32:09", "warn", "TCP_NODELAY failed");
-                    log_entry(ui, "14:32:15", "info", "entered client (0, 540)");
-                    log_entry(ui, "14:32:18", "info", "returned to server");
-                    log_entry(ui, "14:33:01", "err", "clipboard send: reset");
-                    log_entry(ui, "14:33:05", "info", "clipboard reconnected");
+                    log_entry(ui, "14:32:08", LogLevel::Info, s.log_msg_client, s);
+                    log_entry(ui, "14:32:09", LogLevel::Warn, s.log_msg_nodelay, s);
+                    log_entry(ui, "14:32:15", LogLevel::Info, s.log_msg_entered, s);
+                    log_entry(ui, "14:32:18", LogLevel::Info, s.log_msg_returned, s);
+                    log_entry(ui, "14:33:01", LogLevel::Err, s.log_msg_clip_send_reset, s);
+                    log_entry(ui, "14:33:05", LogLevel::Info, s.log_msg_clip_reconnected, s);
                 });
         });
     ui.add_space(8.0);
@@ -1741,20 +1800,23 @@ fn log_tab(ui: &mut Ui) {
             .inner_margin(Margin::symmetric(10.0, 6.0))
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("24 events  ·  33s")
+                    RichText::new(s.log_events_duration)
                         .size(11.0)
                         .color(theme::TEXT_MUTED),
                 );
             });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
-                RichText::new("auto-scroll")
+                RichText::new(s.log_auto_scroll)
                     .size(11.0)
                     .color(theme::TEXT_MUTED),
             );
         });
     });
 }
+
+#[derive(Clone, Copy)]
+enum LogLevel { Info, Warn, Err }
 
 fn log_chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, selected: bool) {
     let border = if selected {
@@ -1781,7 +1843,7 @@ fn log_chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, selected: bool) {
         });
 }
 
-fn log_entry(ui: &mut Ui, ts: &str, level: &str, msg: &str) {
+fn log_entry(ui: &mut Ui, ts: &str, level: LogLevel, msg: &str, s: &Strings) {
     ui.horizontal(|ui| {
         ui.label(
             RichText::new(ts)
@@ -1789,11 +1851,10 @@ fn log_entry(ui: &mut Ui, ts: &str, level: &str, msg: &str) {
                 .color(theme::TEXT_MUTED)
                 .family(egui::FontFamily::Monospace),
         );
-        let (fg, bg) = match level {
-            "info" => (theme::PRIMARY, theme::PRIMARY_SOFT),
-            "warn" => (theme::WARN, theme::WARN_SOFT),
-            "err" => (theme::DANGER, theme::DANGER_SOFT),
-            _ => (theme::TEXT_MUTED, theme::FIELD_BG),
+        let (label, fg, bg) = match level {
+            LogLevel::Info => (s.log_info, theme::PRIMARY, theme::PRIMARY_SOFT),
+            LogLevel::Warn => (s.log_warn, theme::WARN, theme::WARN_SOFT),
+            LogLevel::Err => (s.log_err, theme::DANGER, theme::DANGER_SOFT),
         };
         Frame::none()
             .fill(bg)
@@ -1801,7 +1862,7 @@ fn log_entry(ui: &mut Ui, ts: &str, level: &str, msg: &str) {
             .inner_margin(Margin::symmetric(6.0, 1.0))
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new(level)
+                    RichText::new(label)
                         .size(10.0)
                         .color(fg)
                         .family(egui::FontFamily::Monospace)
@@ -1822,30 +1883,31 @@ fn log_entry(ui: &mut Ui, ts: &str, level: &str, msg: &str) {
 // ============================================================================
 
 fn settings_tab(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     egui::ScrollArea::vertical().show(ui, |ui| {
-        section_label(ui, "General");
+        section_label(ui, s.section_general);
         setting_row(
             ui,
-            "Start on login",
-            "Launch at system startup",
+            s.set_start_on_login,
+            s.set_start_on_login_sub,
             &mut app.start_on_login,
         );
         setting_row(
             ui,
-            "Auto-connect",
-            "Reconnect on disconnect",
+            s.set_auto_connect,
+            s.set_auto_connect_sub,
             &mut app.auto_connect,
         );
         setting_row(
             ui,
-            "Show in menu bar",
-            "Tray icon (macOS/Win)",
+            s.set_show_in_menubar,
+            s.set_show_in_menubar_sub,
             &mut app.show_in_menubar,
         );
         ui.add_space(8.0);
-        section_label(ui, "Network");
+        section_label(ui, s.section_network);
         ui.label(
-            RichText::new("Default port")
+            RichText::new(s.set_default_port)
                 .size(12.0)
                 .color(theme::TEXT_MUTED),
         );
@@ -1857,19 +1919,51 @@ fn settings_tab(ui: &mut Ui, app: &mut App) {
         );
         ui.add_space(6.0);
         ui.label(
-            RichText::new("Default edge")
+            RichText::new(s.set_default_edge)
                 .size(12.0)
                 .color(theme::TEXT_MUTED),
         );
-        edge_picker(ui, &mut app.default_edge);
+        edge_picker(ui, &mut app.default_edge, s);
         ui.add_space(8.0);
-        section_label(ui, "Advanced");
+        section_label(ui, s.section_language);
+        lang_picker(ui, &mut app.lang, s);
+        ui.add_space(8.0);
+        section_label(ui, s.section_advanced);
         setting_row(
             ui,
-            "Debug logging",
-            "Verbose output for troubleshooting",
+            s.set_debug_logging,
+            s.set_debug_logging_sub,
             &mut app.debug_logging,
         );
+    });
+}
+
+fn lang_picker(ui: &mut Ui, lang: &mut Lang, s: &Strings) {
+    ui.horizontal(|ui| {
+        for (l, label) in [
+            (Lang::En, s.lang_english),
+            (Lang::Zh, s.lang_chinese),
+        ] {
+            let selected = *lang == l;
+            let (bg, fg, border) = if selected {
+                (theme::PRIMARY_SOFT, theme::PRIMARY, theme::PRIMARY)
+            } else {
+                (theme::FIELD_BG, theme::TEXT, theme::FIELD_BORDER)
+            };
+            let resp = Frame::none()
+                .fill(bg)
+                .stroke(Stroke::new(1.0, border))
+                .rounding(Rounding::same(6.0))
+                .inner_margin(Margin::symmetric(14.0, 6.0))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(label).size(12.0).color(fg).strong());
+                })
+                .response
+                .interact(Sense::click());
+            if resp.clicked() {
+                *lang = l;
+            }
+        }
     });
 }
 
