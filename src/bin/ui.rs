@@ -213,7 +213,6 @@ struct Strings {
     pill_connecting: &'static str,
     text_attempt: &'static str,
     status_retry: &'static str,
-    btn_cancel: &'static str,
 
     // Client / mouse on server
     label_mouse_here: &'static str,
@@ -339,7 +338,6 @@ const EN: Strings = Strings {
     pill_connecting: "Connecting",
     text_attempt: "attempt 3/10",
     status_retry: "Retry",
-    btn_cancel: "Cancel",
 
     label_mouse_here: "Mouse here",
     label_standby: "Standby",
@@ -460,7 +458,6 @@ const ZH: Strings = Strings {
     pill_connecting: "连接中",
     text_attempt: "尝试 3/10",
     status_retry: "重试",
-    btn_cancel: "取消",
 
     label_mouse_here: "鼠标在此",
     label_standby: "待机",
@@ -1065,18 +1062,85 @@ fn card(ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
 
 fn title_bar(ui: &mut Ui, title: &str) {
     ui.horizontal(|ui| {
-        // Traffic lights — ghost/muted style to match mockup
+        // Traffic lights — functional close/minimize/maximize buttons.
+        // The eframe window is created with `with_decorations(false)` so the
+        // real macOS traffic lights aren't drawn; we paint our own and wire
+        // them to ViewportCommand so minimize/maximize/close actually work.
         let (rect, _) = ui.allocate_exact_size(Vec2::new(52.0, 14.0), Sense::hover());
         let y = rect.center().y;
         let colors = [theme::TL_RED, theme::TL_YELLOW, theme::TL_GREEN];
+        // Hover any dot → all three show their glyph (matches macOS).
+        let any_hover = (0..3).any(|i| {
+            let x = rect.left() + 7.0 + i as f32 * 16.0;
+            let hit = Rect::from_center_size(egui::pos2(x, y), Vec2::splat(14.0));
+            ui.rect_contains_pointer(hit)
+        });
         for (i, c) in colors.iter().enumerate() {
             let x = rect.left() + 7.0 + i as f32 * 16.0;
+            let center = egui::pos2(x, y);
+            let hit = Rect::from_center_size(center, Vec2::splat(14.0));
+            let resp = ui
+                .interact(hit, ui.id().with(("tl", i)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.clicked() {
+                match i {
+                    0 => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    1 => ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    _ => {
+                        // Toggle maximize. egui tracks this via ViewportInfo.
+                        let is_max = ui
+                            .ctx()
+                            .input(|i| i.viewport().maximized.unwrap_or(false));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                    }
+                }
+            }
             ui.painter().circle(
-                egui::pos2(x, y),
+                center,
                 5.5,
                 *c,
                 Stroke::new(1.0, theme::TL_STROKE),
             );
+            // On hover, overlay the macOS-style glyph: × / − / +
+            if any_hover {
+                let glyph_color = Color32::from_rgba_unmultiplied(0, 0, 0, 180);
+                let p = ui.painter();
+                match i {
+                    0 => {
+                        // ×
+                        let d = 2.5;
+                        p.line_segment(
+                            [egui::pos2(x - d, y - d), egui::pos2(x + d, y + d)],
+                            Stroke::new(1.2, glyph_color),
+                        );
+                        p.line_segment(
+                            [egui::pos2(x - d, y + d), egui::pos2(x + d, y - d)],
+                            Stroke::new(1.2, glyph_color),
+                        );
+                    }
+                    1 => {
+                        // −
+                        p.line_segment(
+                            [egui::pos2(x - 3.0, y), egui::pos2(x + 3.0, y)],
+                            Stroke::new(1.4, glyph_color),
+                        );
+                    }
+                    _ => {
+                        // + (simple zoom indicator)
+                        p.line_segment(
+                            [egui::pos2(x - 2.8, y), egui::pos2(x + 2.8, y)],
+                            Stroke::new(1.2, glyph_color),
+                        );
+                        p.line_segment(
+                            [egui::pos2(x, y - 2.8), egui::pos2(x, y + 2.8)],
+                            Stroke::new(1.2, glyph_color),
+                        );
+                    }
+                }
+            }
         }
 
         // Centered icon + title. Compute the combined width so the pair
@@ -1088,17 +1152,20 @@ fn title_bar(ui: &mut Ui, title: &str) {
                 .size()
                 .x
         });
-        const ICON_W: f32 = 18.0;
-        const GAP: f32 = 6.0;
+        const ICON_W: f32 = 16.0;
+        const GAP: f32 = 7.0;
         let total_w = ICON_W + GAP + title_w;
         let avail = ui.available_width();
         ui.add_space(((avail - total_w) / 2.0 - 26.0).max(0.0));
 
-        // Icon: two small screens with an arrow between them — literal
-        // pictogram for "mouse/input shared across two displays".
+        // App icon — classic NW-pointing mouse cursor silhouette in
+        // primary green. Directly communicates "mouse" which is in the
+        // product name and scales cleanly at small sizes because it's
+        // a single filled polygon rather than multiple tiny strokes.
         let (icon_rect, _) =
-            ui.allocate_exact_size(Vec2::new(ICON_W, 18.0), Sense::hover());
+            ui.allocate_exact_size(Vec2::new(ICON_W, 16.0), Sense::hover());
         draw_app_icon(ui.painter(), icon_rect);
+        ui.add_space(GAP - ui.spacing().item_spacing.x);
 
         ui.label(
             RichText::new(title)
@@ -1109,67 +1176,52 @@ fn title_bar(ui: &mut Ui, title: &str) {
     ui.add_space(12.0);
 }
 
-/// Draw the mouse-share app icon at the given rect. Vector-drawn so it
-/// scales cleanly and doesn't need a bundled image asset. The pictogram
-/// is "two screens + an arrow pointing from left to right" — a compact
-/// visual cue for "input shared between two devices".
+/// Draw the mouse-share app icon: a filled mouse-cursor (pointer arrow)
+/// silhouette. Vector-drawn so it scales cleanly and doesn't need a
+/// bundled image asset.
+///
+/// Why this shape and not "two screens + arrow": the earlier stroked
+/// two-rects-and-an-arrow rendering collapsed into an unreadable blob at
+/// 18×18 px because a 1.4 px stroke on a 6.5×5 rect leaves almost no
+/// interior, and the arrowhead strokes merged with the rectangles. A
+/// single filled polygon has no such problem — it renders crisply at
+/// small sizes.
 fn draw_app_icon(painter: &eframe::egui::Painter, rect: Rect) {
     use eframe::egui::Pos2;
 
     let color = theme::PRIMARY;
-    let stroke = Stroke::new(1.4, color);
 
-    // Two identical screen rectangles, left and right. Height is chosen
-    // to leave vertical room for the arrow at the screens' midline.
-    let screen_w: f32 = 6.5;
-    let screen_h: f32 = 5.0;
-    let cy = rect.center().y - 1.5;
+    // Normalized cursor shape in a 0..10 × 0..14 box. These points trace
+    // the classic NW-pointing pointer: tip at top-left, a long diagonal
+    // right edge, a short notch inward, a vertical tail, a small notch
+    // back out, and the left edge closing up to the tip. Order matters —
+    // must form a simple (non-self-intersecting) polygon for fills to
+    // render correctly.
+    let norm: [(f32, f32); 7] = [
+        (0.0, 0.0),   // tip
+        (0.0, 10.5),  // bottom of left edge
+        (2.8, 8.0),   // inward notch (heel of the arrow)
+        (5.0, 12.5),  // tail bottom-left
+        (6.5, 11.8),  // tail bottom-right
+        (4.3, 7.3),   // inward notch on the right
+        (8.0, 6.5),   // rightmost point of the arrowhead
+    ];
 
-    let left = Rect::from_min_size(
-        Pos2::new(rect.left() + 1.0, cy - screen_h / 2.0),
-        Vec2::new(screen_w, screen_h),
-    );
-    let right = Rect::from_min_size(
-        Pos2::new(rect.right() - 1.0 - screen_w, cy - screen_h / 2.0),
-        Vec2::new(screen_w, screen_h),
-    );
-    painter.rect_stroke(left, Rounding::same(1.2), stroke);
-    painter.rect_stroke(right, Rounding::same(1.2), stroke);
+    // Fit the normalized shape into `rect` while preserving aspect ratio.
+    // The normalized box is 8×12.5, so the cursor is taller than wide —
+    // we pad horizontally to keep it centered.
+    let scale = (rect.height() / 14.0).min(rect.width() / 10.0);
+    let draw_w = 10.0 * scale;
+    let draw_h = 14.0 * scale;
+    let ox = rect.center().x - draw_w / 2.0;
+    let oy = rect.center().y - draw_h / 2.0;
 
-    // Tiny stands under each screen — just two short horizontal ticks,
-    // positioned below the rects. Makes them read as "monitors".
-    let stand_y = left.bottom() + 1.6;
-    let tick = 2.0;
-    painter.line_segment(
-        [
-            Pos2::new(left.center().x - tick, stand_y),
-            Pos2::new(left.center().x + tick, stand_y),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            Pos2::new(right.center().x - tick, stand_y),
-            Pos2::new(right.center().x + tick, stand_y),
-        ],
-        stroke,
-    );
+    let points: Vec<Pos2> = norm
+        .iter()
+        .map(|(x, y)| Pos2::new(ox + x * scale, oy + y * scale))
+        .collect();
 
-    // Arrow from left screen to right screen, above the screens so it
-    // doesn't overlap them. The arrow is what communicates "sharing".
-    let arrow_y = left.top() - 2.2;
-    let ax1 = left.center().x;
-    let ax2 = right.center().x;
-    painter.line_segment([Pos2::new(ax1, arrow_y), Pos2::new(ax2, arrow_y)], stroke);
-    // Arrowhead (two short strokes).
-    painter.line_segment(
-        [Pos2::new(ax2 - 2.0, arrow_y - 1.8), Pos2::new(ax2, arrow_y)],
-        stroke,
-    );
-    painter.line_segment(
-        [Pos2::new(ax2 - 2.0, arrow_y + 1.8), Pos2::new(ax2, arrow_y)],
-        stroke,
-    );
+    painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
 }
 
 fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
@@ -1189,7 +1241,8 @@ fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
             };
             let text = RichText::new(label).size(14.0).color(color);
             let resp = ui
-                .add(egui::Label::new(text).sense(Sense::click()));
+                .add(egui::Label::new(text).sense(Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
             if resp.clicked() {
                 *tab = t;
             }
@@ -1263,35 +1316,94 @@ fn field_trio(ui: &mut Ui, labels: [(&str, &str); 3]) {
     });
 }
 
+/// Full-width button with custom paint. `egui::Button::new(text).min_size(...)`
+/// left-aligns its text when the button is wider than the text — users
+/// reported "the button text is stuck to the left". We paint the rect and
+/// text manually so the text lands at `Align2::CENTER_CENTER` regardless of
+/// width, and we get a single code path for hover / pressed states shared
+/// by every flat button in the UI.
+fn paint_button(
+    ui: &mut Ui,
+    text: &str,
+    fill: Color32,
+    hover_fill: Color32,
+    press_fill: Color32,
+    border: Stroke,
+    text_color: Color32,
+    strong: bool,
+) -> Response {
+    use eframe::egui::{Align2, FontFamily};
+
+    let size = Vec2::new(ui.available_width(), 36.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    let bg = if resp.is_pointer_button_down_on() {
+        press_fill
+    } else if resp.hovered() {
+        hover_fill
+    } else {
+        fill
+    };
+    let painter = ui.painter();
+    painter.rect(rect, Rounding::same(10.0), bg, border);
+
+    // egui's default proportional font has no separate "bold" face, so
+    // `RichText::strong()` just tints darker. For our custom-painted
+    // buttons we approximate bold by over-painting at a 0.5 px offset —
+    // the rasterizer antialiasing thickens the strokes.
+    let font = FontId::new(13.0, FontFamily::Proportional);
+    let center = rect.center();
+    painter.text(center, Align2::CENTER_CENTER, text, font.clone(), text_color);
+    if strong {
+        painter.text(
+            center + Vec2::new(0.5, 0.0),
+            Align2::CENTER_CENTER,
+            text,
+            font,
+            text_color,
+        );
+    }
+    resp
+}
+
 fn primary_button(ui: &mut Ui, text: &str) -> Response {
-    let btn = egui::Button::new(
-        RichText::new(text).size(13.0).color(Color32::WHITE).strong(),
+    paint_button(
+        ui,
+        text,
+        theme::PRIMARY,
+        Color32::from_rgb(58, 168, 116),
+        Color32::from_rgb(36, 132, 86),
+        Stroke::NONE,
+        Color32::WHITE,
+        true,
     )
-    .fill(theme::PRIMARY)
-    .stroke(Stroke::NONE)
-    .rounding(Rounding::same(10.0))
-    .min_size(Vec2::new(ui.available_width(), 36.0));
-    ui.add(btn)
 }
 
 fn danger_button(ui: &mut Ui, text: &str) -> Response {
-    let btn = egui::Button::new(
-        RichText::new(text).size(13.0).color(theme::DANGER).strong(),
+    paint_button(
+        ui,
+        text,
+        theme::CARD_BG,
+        theme::DANGER_SOFT,
+        Color32::from_rgb(250, 220, 222),
+        Stroke::new(1.0, theme::DANGER_SOFT_BORDER),
+        theme::DANGER,
+        true,
     )
-    .fill(theme::CARD_BG)
-    .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
-    .rounding(Rounding::same(10.0))
-    .min_size(Vec2::new(ui.available_width(), 36.0));
-    ui.add(btn)
 }
 
 fn ghost_button(ui: &mut Ui, text: &str) -> Response {
-    let btn = egui::Button::new(RichText::new(text).size(13.0).color(theme::TEXT))
-        .fill(theme::CARD_BG)
-        .stroke(Stroke::new(1.0, theme::CARD_BORDER))
-        .rounding(Rounding::same(10.0))
-        .min_size(Vec2::new(ui.available_width(), 36.0));
-    ui.add(btn)
+    paint_button(
+        ui,
+        text,
+        theme::CARD_BG,
+        theme::FIELD_BG,
+        theme::FIELD_BORDER,
+        Stroke::new(1.0, theme::CARD_BORDER),
+        theme::TEXT,
+        false,
+    )
 }
 
 /// Solid-red "Stop server" button with a pulsing white dot on the left
@@ -1309,6 +1421,7 @@ fn stop_running_button(ui: &mut Ui, text: &str) -> Response {
 
     let size = Vec2::new(ui.available_width(), 36.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
 
     // Drive pulse off wall-clock. 1.2 s period is slow enough to read as
     // a heartbeat rather than strobing, fast enough to feel alive.
@@ -1487,6 +1600,7 @@ fn toggle(ui: &mut Ui, label: &str, value: &mut bool) {
 fn toggle_switch(ui: &mut Ui, on: &mut bool) -> Response {
     let desired = Vec2::new(36.0, 20.0);
     let (rect, mut resp) = ui.allocate_exact_size(desired, Sense::click());
+    resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
@@ -2011,7 +2125,10 @@ fn edge_picker(ui: &mut Ui, edge: &mut Edge, s: &Strings) {
                     });
                 })
                 .response;
-            if resp.interact(Sense::click()).clicked() {
+            let resp = resp
+                .interact(Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.clicked() {
                 *edge = *e;
             }
         }
@@ -2056,7 +2173,7 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
         );
     });
     ui.add_space(10.0);
-    if danger_button(ui, s.btn_cancel).clicked() {
+    if danger_button(ui, s.btn_disconnect).clicked() {
         app.pending_action = Some(Action::StopSession);
     }
 }
