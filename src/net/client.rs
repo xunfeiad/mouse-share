@@ -143,29 +143,40 @@ impl Client {
             let mut pending_dx: f64 = 0.0;
             let mut pending_dy: f64 = 0.0;
             let mut have_move = false;
-            let mut first_pass = true;
+
+            // Drain strategy: one blocking recv with the 50 ms read
+            // timeout so we don't spin when idle, then (if we got
+            // something) flip to non-blocking ONCE and drain whatever
+            // else is already queued, then flip back to blocking.
+            //
+            // The previous revision toggled `set_nonblocking` on every
+            // iteration inside the drain loop, which meant two fcntl
+            // syscalls per received packet — ~2000/sec under a 1 kHz
+            // gaming mouse, entirely wasted. Toggling once per burst
+            // drops that to ~2 × (burst rate) = ~100–200/sec regardless
+            // of mouse rate, which is negligible.
+            let mut recv_result = socket.recv_from(&mut buf);
+            let mut nonblocking_mode = false;
 
             loop {
-                // First pass uses the blocking read with the 50 ms timeout
-                // so we don't spin the CPU when idle. Subsequent passes
-                // flip the socket non-blocking to drain whatever is
-                // already queued, then restore blocking mode. SO_RCVTIMEO
-                // is preserved across the toggle on macOS/Linux so we
-                // don't need to reinstall the read timeout.
-                if !first_pass {
-                    let _ = socket.set_nonblocking(true);
-                }
-                let recv_result = socket.recv_from(&mut buf);
-                if !first_pass {
-                    let _ = socket.set_nonblocking(false);
-                }
-                first_pass = false;
-
                 match recv_result {
                     Ok((len, _)) => {
+                        // We have at least one packet — if we haven't
+                        // already, flip the socket to non-blocking so the
+                        // follow-up drain recvs return WouldBlock
+                        // immediately instead of waiting 50 ms for packets
+                        // that may not come.
+                        if !nonblocking_mode {
+                            let _ = socket.set_nonblocking(true);
+                            nonblocking_mode = true;
+                        }
+
                         let msg = match protocol::deserialize(&buf[..len]) {
                             Ok(m) => m,
-                            Err(_) => continue,
+                            Err(_) => {
+                                recv_result = socket.recv_from(&mut buf);
+                                continue;
+                            }
                         };
 
                         match msg {
@@ -281,6 +292,9 @@ impl Client {
                             }
                             _ => {}
                         }
+
+                        // Grab the next packet for the drain iteration.
+                        recv_result = socket.recv_from(&mut buf);
                     }
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
@@ -295,6 +309,13 @@ impl Client {
                         break;
                     }
                 }
+            }
+
+            // Restore blocking mode for the next outer-loop recv. We only
+            // flipped it if we actually received at least one packet, so
+            // this is a no-op on idle iterations.
+            if nonblocking_mode {
+                let _ = socket.set_nonblocking(false);
             }
 
             // Flush the accumulated move as a single simulator call.

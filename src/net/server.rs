@@ -284,11 +284,11 @@ impl Server {
             macro_rules! flush_pending_move {
                 () => {
                     if have_pending_move {
-                        let ev = MouseEvent::now(
-                            pending_dx,
-                            pending_dy,
-                            MouseEventType::Move,
-                        );
+                        let ev = MouseEvent {
+                            dx: pending_dx,
+                            dy: pending_dy,
+                            event_type: MouseEventType::Move,
+                        };
                         protocol::serialize_into(&mut send_buf, &Message::Input(ev))?;
                         let _ = socket.send_to(&send_buf, client_addr);
                         state.last_event_ms.store(now_ms(), Ordering::SeqCst);
@@ -322,12 +322,16 @@ impl Server {
                             state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                         }
                     }
-                    CapturedInput::Mouse(event) => {
+                    CapturedInput::Mouse { event, abs_x, abs_y } => {
                         if !forwarding {
-                            // Edge detection path. One syscall per event
-                            // to read the real cursor position.
-                            let (cx, cy) =
-                                capture::get_cursor_position().unwrap_or((0.0, 0.0));
+                            // Edge detection path. The capture layer already
+                            // read the absolute cursor position from the HID
+                            // event, so we don't need a separate
+                            // `get_cursor_position()` syscall per event —
+                            // that used to be 1 kHz of wasted IPC to the
+                            // window server while the mouse was on the
+                            // server side.
+                            let (cx, cy) = (abs_x, abs_y);
                             if last_cursor_log.elapsed() > Duration::from_millis(1000) {
                                 log::info!(
                                     "cursor=({:.0},{:.0}) dx={:.1} dy={:.1} at_edge={}",

@@ -109,8 +109,27 @@ impl InputCapture for MacOsCapture {
                             as f64;
 
                         if let Some(evt_type) = map_event_type(event_type, event) {
-                            let mouse_event = MouseEvent::now(dx, dy, evt_type);
-                            let _ = sender.try_send(CapturedInput::Mouse(mouse_event));
+                            // Read the absolute cursor position directly
+                            // from the event. While forwarding is OFF (mouse
+                            // on server) this is the real cursor; the server
+                            // uses it for edge detection, sparing a per-event
+                            // CGEvent::new + location() IPC to the window
+                            // server. While forwarding is ON the OS freezes
+                            // the cursor so this value becomes stale, but
+                            // the server loop doesn't consult it in that
+                            // branch — it uses the accumulated virtual
+                            // cursor instead.
+                            let loc = event.location();
+                            let mouse_event = MouseEvent {
+                                dx,
+                                dy,
+                                event_type: evt_type,
+                            };
+                            let _ = sender.try_send(CapturedInput::Mouse {
+                                event: mouse_event,
+                                abs_x: loc.x,
+                                abs_y: loc.y,
+                            });
                         }
                     }
                 }

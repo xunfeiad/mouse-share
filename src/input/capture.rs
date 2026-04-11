@@ -7,9 +7,19 @@ use std::sync::Arc;
 /// Unified captured input — mouse or keyboard. Both share the same channel
 /// so the server event loop can apply the "only forward while mouse is on
 /// client" rule uniformly to both streams.
+///
+/// The mouse variant carries the absolute cursor position observed by the
+/// capture layer at event time. The server's edge-detection branch uses
+/// this directly instead of calling `get_cursor_position()` per event,
+/// which on macOS is an IPC to the window server — at 1 kHz event rates
+/// that was a measurable waste.
 #[derive(Debug, Clone)]
 pub enum CapturedInput {
-    Mouse(MouseEvent),
+    Mouse {
+        event: MouseEvent,
+        abs_x: f64,
+        abs_y: f64,
+    },
     Key(KeyEvent),
 }
 

@@ -168,10 +168,26 @@ unsafe extern "system" fn mouse_hook_proc(
     };
 
     if let Some(evt) = event_type {
-        let mouse_event = MouseEvent::now(dx, dy, evt);
+        let mouse_event = MouseEvent {
+            dx,
+            dy,
+            event_type: evt,
+        };
+        // Attach the absolute cursor position the hook saw. When
+        // suppression is OFF (mouse on server) this is the real cursor
+        // and the server uses it for edge detection, avoiding a
+        // per-event GetCursorPos syscall. Under suppression it reflects
+        // the post-recenter position, which the server ignores in the
+        // forwarding branch.
+        let abs_x = info.pt.x as f64;
+        let abs_y = info.pt.y as f64;
         HOOK_SENDER.with(|s| {
             if let Some(sender) = s.borrow().as_ref() {
-                let _ = sender.try_send(CapturedInput::Mouse(mouse_event));
+                let _ = sender.try_send(CapturedInput::Mouse {
+                    event: mouse_event,
+                    abs_x,
+                    abs_y,
+                });
             }
         });
     }

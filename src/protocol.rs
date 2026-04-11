@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -23,8 +22,6 @@ pub struct MouseEvent {
     pub dx: f64,
     pub dy: f64,
     pub event_type: MouseEventType,
-    /// Monotonic timestamp in microseconds
-    pub timestamp_us: u64,
 }
 
 /// A keyboard key press / release. Keycodes are platform-native:
@@ -61,21 +58,6 @@ pub enum Message {
     KeyInput(KeyEvent),
     /// Bidirectional keepalive
     Heartbeat,
-}
-
-impl MouseEvent {
-    pub fn now(dx: f64, dy: f64, event_type: MouseEventType) -> Self {
-        let timestamp_us = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-        Self {
-            dx,
-            dy,
-            event_type,
-            timestamp_us,
-        }
-    }
 }
 
 pub fn serialize(msg: &Message) -> anyhow::Result<Vec<u8>> {
