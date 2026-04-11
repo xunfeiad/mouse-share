@@ -1,7 +1,7 @@
 use crate::config::{Edge, ScreenConfig};
 use crate::input::capture::{self, CapturedInput};
 use crate::net::state::{now_ms, SharedState};
-use crate::protocol::{self, Message, ScreenInfo};
+use crate::protocol::{self, Message, MouseEvent, MouseEventType, ScreenInfo};
 use crate::screen::get_screen_info;
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver};
@@ -162,6 +162,12 @@ impl Server {
         }
     }
 
+    // The `flush_pending_move!` macro expands its resets in tail position at
+    // the end of each drain cycle, where the compiler correctly sees them
+    // as dead stores. They're load-bearing for the mid-cycle expansions
+    // (when a Button/Scroll/Return flushes accumulated Moves). Allow at
+    // the function level to silence the tail-position warnings.
+    #[allow(unused_assignments)]
     fn event_loop(
         &self,
         socket: UdpSocket,
@@ -180,6 +186,12 @@ impl Server {
         // mouse event allocates a fresh `Vec<u8>` from `protocol::serialize`.
         // At 500–1000 Hz that adds up — serialize_into reuses capacity.
         let mut send_buf: Vec<u8> = Vec::with_capacity(128);
+        // Reusable batch buffer for draining the capture channel. We drain
+        // everything currently queued each iteration so consecutive Moves
+        // can be coalesced into a single UDP packet. 128 is a generous
+        // upper bound on how many events can queue up between iterations
+        // even with a 1 kHz gaming mouse.
+        let mut event_batch: Vec<CapturedInput> = Vec::with_capacity(128);
         // Track virtual cursor position on the client screen
         let mut client_cursor_x: f64 = 0.0;
         let mut client_cursor_y: f64 = 0.0;
@@ -231,120 +243,21 @@ impl Server {
                 last_heartbeat = Instant::now();
             }
 
-            // Process captured input events
+            // Drain the capture channel: one blocking recv (1 ms timeout)
+            // plus any additional events already queued. This lets us
+            // coalesce consecutive Move events during forwarding into a
+            // single UDP packet, cutting the server→client packet rate
+            // from ~1 kHz down to the outer-loop iteration rate and giving
+            // the client far more headroom per event.
+            event_batch.clear();
             match receiver.recv_timeout(Duration::from_millis(1)) {
-                Ok(CapturedInput::Key(key_event)) => {
-                    // Only forward keys while the mouse is on the client.
-                    // When the mouse is on the server, the user's keyboard
-                    // belongs to local apps — we don't intercept it.
-                    if forwarding {
-                        last_forward_time = Instant::now();
-                        log::info!(
-                            "forwarding key: code={} down={}",
-                            key_event.keycode, key_event.down
-                        );
-                        protocol::serialize_into(
-                            &mut send_buf,
-                            &Message::KeyInput(key_event),
-                        )?;
-                        let _ = socket.send_to(&send_buf, client_addr);
-                        state.events_total.fetch_add(1, Ordering::Relaxed);
-                        state.last_event_ms.store(now_ms(), Ordering::SeqCst);
-                    }
-                }
-                Ok(CapturedInput::Mouse(event)) => {
-                    if !forwarding {
-                        // Check if cursor hit the edge
-                        let (cx, cy) = capture::get_cursor_position().unwrap_or((0.0, 0.0));
-                        // Throttled diagnostic: log cursor position once per second
-                        if last_cursor_log.elapsed() > Duration::from_millis(1000) {
-                            log::info!(
-                                "cursor=({:.0},{:.0}) dx={:.1} dy={:.1} at_edge={}",
-                                cx, cy, event.dx, event.dy, config.at_edge(cx, cy)
-                            );
-                            last_cursor_log = Instant::now();
+                Ok(first) => {
+                    event_batch.push(first);
+                    while event_batch.len() < event_batch.capacity() {
+                        match receiver.try_recv() {
+                            Ok(more) => event_batch.push(more),
+                            Err(_) => break,
                         }
-                        if config.at_edge(cx, cy) {
-                            forwarding = true;
-                            suppress.store(true, Ordering::SeqCst);
-                            state.mouse_on_peer.store(true, Ordering::SeqCst);
-                            if !cursor_hidden {
-                                capture::hide_local_cursor();
-                                cursor_hidden = true;
-                            }
-                            let (ex, ey) = config.entry_position(cx, cy);
-                            entry_x = ex;
-                            entry_y = ey;
-                            client_cursor_x = ex;
-                            client_cursor_y = ey;
-                            return_armed = false;
-                            last_forward_time = Instant::now();
-                            let enter_msg =
-                                protocol::serialize(&Message::Enter { x: ex, y: ey })?;
-                            socket.send_to(&enter_msg, client_addr)?;
-                            log::info!("Mouse entered client screen at ({:.0}, {:.0})", ex, ey);
-                            // Don't process this same event's delta — it was
-                            // the edge-hitting event itself. Wait for the next.
-                            continue;
-                        }
-                    }
-
-                    if forwarding {
-                        last_forward_time = Instant::now();
-
-                        // Update virtual cursor position on client
-                        client_cursor_x += event.dx;
-                        client_cursor_y += event.dy;
-
-                        // Check if cursor hit the return edge on client screen
-                        let client_screen = config.client_screen.as_ref()
-                            .unwrap_or(&config.server_screen);
-                        let cw = client_screen.width as f64;
-                        let ch = client_screen.height as f64;
-
-                        // Arm return only after cursor has moved far enough
-                        // from the entry point in the expected direction.
-                        if !return_armed {
-                            let moved_inside = match config.edge {
-                                Edge::Left => entry_x - client_cursor_x,
-                                Edge::Right => client_cursor_x - entry_x,
-                                Edge::Top => entry_y - client_cursor_y,
-                                Edge::Bottom => client_cursor_y - entry_y,
-                            };
-                            if moved_inside >= RETURN_ARM_DISTANCE {
-                                return_armed = true;
-                            }
-                        }
-
-                        let should_return = return_armed && match config.edge {
-                            Edge::Right => client_cursor_x <= 0.0,
-                            Edge::Left => client_cursor_x >= cw - 1.0,
-                            Edge::Bottom => client_cursor_y <= 0.0,
-                            Edge::Top => client_cursor_y >= ch - 1.0,
-                        };
-
-                        if should_return {
-                            forwarding = false;
-                            suppress.store(false, Ordering::SeqCst);
-                            state.mouse_on_peer.store(false, Ordering::SeqCst);
-                            if cursor_hidden {
-                                capture::show_local_cursor();
-                                cursor_hidden = false;
-                            }
-                            let leave_msg = protocol::serialize(&Message::Leave)?;
-                            socket.send_to(&leave_msg, client_addr)?;
-                            log::info!("Mouse returned to server screen");
-                            continue;
-                        }
-
-                        // Clamp cursor within client bounds
-                        client_cursor_x = client_cursor_x.clamp(0.0, cw - 1.0);
-                        client_cursor_y = client_cursor_y.clamp(0.0, ch - 1.0);
-
-                        protocol::serialize_into(&mut send_buf, &Message::Input(event))?;
-                        let _ = socket.send_to(&send_buf, client_addr);
-                        state.events_total.fetch_add(1, Ordering::Relaxed);
-                        state.last_event_ms.store(now_ms(), Ordering::SeqCst);
                     }
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -357,6 +270,191 @@ impl Server {
                     break;
                 }
             }
+
+            // Accumulator for coalesced Move deltas during forwarding.
+            // Flushed before any non-Move event, mode transition, or at
+            // the end of the drain cycle.
+            let mut pending_dx: f64 = 0.0;
+            let mut pending_dy: f64 = 0.0;
+            let mut have_pending_move = false;
+
+            // Helper macro to flush the accumulated Move into a single
+            // Input packet. Declared as a local closure would borrow
+            // send_buf / socket / state, so a macro keeps it ergonomic.
+            macro_rules! flush_pending_move {
+                () => {
+                    if have_pending_move {
+                        let ev = MouseEvent::now(
+                            pending_dx,
+                            pending_dy,
+                            MouseEventType::Move,
+                        );
+                        protocol::serialize_into(&mut send_buf, &Message::Input(ev))?;
+                        let _ = socket.send_to(&send_buf, client_addr);
+                        state.events_total.fetch_add(1, Ordering::Relaxed);
+                        state.last_event_ms.store(now_ms(), Ordering::SeqCst);
+                        pending_dx = 0.0;
+                        pending_dy = 0.0;
+                        have_pending_move = false;
+                    }
+                };
+            }
+
+            for captured in event_batch.drain(..) {
+                match captured {
+                    CapturedInput::Key(key_event) => {
+                        // Only forward keys while the mouse is on the
+                        // client. When the mouse is on the server, the
+                        // user's keyboard belongs to local apps.
+                        if forwarding {
+                            // Flush pending Moves first so key timing is
+                            // preserved relative to cursor position.
+                            flush_pending_move!();
+                            last_forward_time = Instant::now();
+                            log::info!(
+                                "forwarding key: code={} down={}",
+                                key_event.keycode, key_event.down
+                            );
+                            protocol::serialize_into(
+                                &mut send_buf,
+                                &Message::KeyInput(key_event),
+                            )?;
+                            let _ = socket.send_to(&send_buf, client_addr);
+                            state.events_total.fetch_add(1, Ordering::Relaxed);
+                            state.last_event_ms.store(now_ms(), Ordering::SeqCst);
+                        }
+                    }
+                    CapturedInput::Mouse(event) => {
+                        if !forwarding {
+                            // Edge detection path. One syscall per event
+                            // to read the real cursor position.
+                            let (cx, cy) =
+                                capture::get_cursor_position().unwrap_or((0.0, 0.0));
+                            if last_cursor_log.elapsed() > Duration::from_millis(1000) {
+                                log::info!(
+                                    "cursor=({:.0},{:.0}) dx={:.1} dy={:.1} at_edge={}",
+                                    cx, cy, event.dx, event.dy, config.at_edge(cx, cy)
+                                );
+                                last_cursor_log = Instant::now();
+                            }
+                            if config.at_edge(cx, cy) {
+                                forwarding = true;
+                                suppress.store(true, Ordering::SeqCst);
+                                state.mouse_on_peer.store(true, Ordering::SeqCst);
+                                if !cursor_hidden {
+                                    capture::hide_local_cursor();
+                                    cursor_hidden = true;
+                                }
+                                let (ex, ey) = config.entry_position(cx, cy);
+                                entry_x = ex;
+                                entry_y = ey;
+                                client_cursor_x = ex;
+                                client_cursor_y = ey;
+                                return_armed = false;
+                                last_forward_time = Instant::now();
+                                // Nothing to flush — we weren't forwarding.
+                                let enter_msg = protocol::serialize(&Message::Enter {
+                                    x: ex,
+                                    y: ey,
+                                })?;
+                                socket.send_to(&enter_msg, client_addr)?;
+                                log::info!(
+                                    "Mouse entered client screen at ({:.0}, {:.0})",
+                                    ex, ey
+                                );
+                                // The edge-hitting event itself is not
+                                // replayed as a delta — wait for the next.
+                                continue;
+                            }
+                        }
+
+                        if forwarding {
+                            last_forward_time = Instant::now();
+
+                            // Cursor tracking is still per-event so we
+                            // don't miss the return-edge check when the
+                            // cursor crosses it mid-batch.
+                            client_cursor_x += event.dx;
+                            client_cursor_y += event.dy;
+
+                            let client_screen = config
+                                .client_screen
+                                .as_ref()
+                                .unwrap_or(&config.server_screen);
+                            let cw = client_screen.width as f64;
+                            let ch = client_screen.height as f64;
+
+                            if !return_armed {
+                                let moved_inside = match config.edge {
+                                    Edge::Left => entry_x - client_cursor_x,
+                                    Edge::Right => client_cursor_x - entry_x,
+                                    Edge::Top => entry_y - client_cursor_y,
+                                    Edge::Bottom => client_cursor_y - entry_y,
+                                };
+                                if moved_inside >= RETURN_ARM_DISTANCE {
+                                    return_armed = true;
+                                }
+                            }
+
+                            let should_return = return_armed
+                                && match config.edge {
+                                    Edge::Right => client_cursor_x <= 0.0,
+                                    Edge::Left => client_cursor_x >= cw - 1.0,
+                                    Edge::Bottom => client_cursor_y <= 0.0,
+                                    Edge::Top => client_cursor_y >= ch - 1.0,
+                                };
+
+                            if should_return {
+                                // Flush any accumulated delta up to the
+                                // return point before we tell the client
+                                // to leave.
+                                flush_pending_move!();
+                                forwarding = false;
+                                suppress.store(false, Ordering::SeqCst);
+                                state.mouse_on_peer.store(false, Ordering::SeqCst);
+                                if cursor_hidden {
+                                    capture::show_local_cursor();
+                                    cursor_hidden = false;
+                                }
+                                let leave_msg = protocol::serialize(&Message::Leave)?;
+                                socket.send_to(&leave_msg, client_addr)?;
+                                log::info!("Mouse returned to server screen");
+                                continue;
+                            }
+
+                            client_cursor_x = client_cursor_x.clamp(0.0, cw - 1.0);
+                            client_cursor_y = client_cursor_y.clamp(0.0, ch - 1.0);
+
+                            match &event.event_type {
+                                MouseEventType::Move => {
+                                    // Accumulate — flushed later.
+                                    pending_dx += event.dx;
+                                    pending_dy += event.dy;
+                                    have_pending_move = true;
+                                }
+                                _ => {
+                                    // Button / Scroll — preserve ordering
+                                    // relative to moves.
+                                    flush_pending_move!();
+                                    protocol::serialize_into(
+                                        &mut send_buf,
+                                        &Message::Input(event),
+                                    )?;
+                                    let _ = socket.send_to(&send_buf, client_addr);
+                                    state.events_total.fetch_add(1, Ordering::Relaxed);
+                                    state
+                                        .last_event_ms
+                                        .store(now_ms(), Ordering::SeqCst);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // End of drain cycle: emit a single coalesced Move packet for
+            // whatever accumulated this iteration.
+            flush_pending_move!();
 
             // Check for incoming client messages (non-blocking)
             let mut buf = [0u8; 4096];

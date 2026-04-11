@@ -34,13 +34,30 @@ pub fn get_cursor_position() -> Result<(f64, f64)> {
 fn platform_get_cursor_position() -> Result<(f64, f64)> {
     use core_graphics::event::CGEvent;
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use std::cell::RefCell;
 
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("failed to create CGEventSource"))?;
-    let event = CGEvent::new(source)
-        .map_err(|_| anyhow::anyhow!("failed to create CGEvent"))?;
-    let pos = event.location();
-    Ok((pos.x, pos.y))
+    // Cache the CGEventSource per thread. Creating a fresh source costs
+    // hundreds of microseconds; re-using one (clone = CFRetain) is an atomic
+    // increment. This function is called per mouse event during edge
+    // detection while the mouse is on the server, so the savings add up.
+    thread_local! {
+        static SOURCE: RefCell<Option<CGEventSource>> = const { RefCell::new(None) };
+    }
+
+    SOURCE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(
+                CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                    .map_err(|_| anyhow::anyhow!("failed to create CGEventSource"))?,
+            );
+        }
+        let source = slot.as_ref().unwrap().clone();
+        let event = CGEvent::new(source)
+            .map_err(|_| anyhow::anyhow!("failed to create CGEvent"))?;
+        let pos = event.location();
+        Ok((pos.x, pos.y))
+    })
 }
 
 #[cfg(target_os = "windows")]

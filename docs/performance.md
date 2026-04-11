@@ -107,6 +107,109 @@ one allocator call per millisecond just for the wire buffer.
 buffer and writes into its existing capacity. Now the hot path does
 zero heap allocations per event.
 
+### 5. One UDP packet per captured event on the server
+
+Client-side Move coalescing helped, but the server was still emitting
+one UDP datagram per captured Move event (~1 kHz with a gaming mouse).
+Even though each `recv_from` + `deserialize` on the client is cheap in
+isolation, at that rate the per-packet kernel crossing and channel
+chatter eats real wall-clock time, and `serialize` + `send_to` on the
+server side scales the same way. The server was essentially fanning
+the raw mouse poll rate straight onto the wire.
+
+**Fix** — drain the capture channel per outer-loop iteration and
+coalesce consecutive Move events into a single `MouseEvent` before
+serialization. The server now:
+
+1. Blocks for ≤1 ms on `receiver.recv_timeout`.
+2. On a wakeup, drains all additional events already queued with
+   `receiver.try_recv` into a reusable `Vec<CapturedInput>` (capacity
+   128, a safe upper bound for one drain cycle at 1 kHz).
+3. Walks the batch, accumulating Move deltas into `pending_dx` /
+   `pending_dy`. A local `flush_pending_move!` macro emits the summed
+   Move as one packet.
+4. Non-Move events (Button, Scroll, Key, Enter, Leave, Return) call
+   `flush_pending_move!` *before* sending their own packet so ordering
+   is preserved: a click always lands at the right cursor position.
+
+Return-edge detection still runs per-event inside the drain — the
+virtual cursor `client_cursor_x/y` is updated on every Move so a
+return crossing in the middle of a batch isn't missed.
+
+```rust
+// Drain
+event_batch.clear();
+match receiver.recv_timeout(Duration::from_millis(1)) {
+    Ok(first) => {
+        event_batch.push(first);
+        while event_batch.len() < event_batch.capacity() {
+            match receiver.try_recv() {
+                Ok(more) => event_batch.push(more),
+                Err(_) => break,
+            }
+        }
+    }
+    _ => {}
+}
+
+// Coalesce
+let mut pending_dx = 0.0;
+let mut pending_dy = 0.0;
+let mut have_pending_move = false;
+
+macro_rules! flush_pending_move {
+    () => {
+        if have_pending_move {
+            let ev = MouseEvent::now(pending_dx, pending_dy, MouseEventType::Move);
+            protocol::serialize_into(&mut send_buf, &Message::Input(ev))?;
+            let _ = socket.send_to(&send_buf, client_addr);
+            pending_dx = 0.0;
+            pending_dy = 0.0;
+            have_pending_move = false;
+        }
+    };
+}
+
+for captured in event_batch.drain(..) {
+    // ... accumulate Move into pending, flush before Button/Scroll/Key/return
+}
+flush_pending_move!();  // tail flush
+```
+
+The packet rate cap is now set by the outer loop, not by the raw HID
+poll rate. With a 1 ms channel timeout the server emits at most
+~1000 Move packets/s, but in practice each iteration drains multiple
+events so the rate is much lower under fast motion — which is exactly
+when a backlog would form.
+
+### 6. Per-call `CGEventSource` in `get_cursor_position`
+
+The server's edge-detection path calls `capture::get_cursor_position()`
+on every mouse event while the mouse is on the *server*. The old macOS
+implementation created a fresh `CGEventSource` on every call — same
+~hundreds-of-microseconds cost as fix #1, just on the server side.
+
+**Fix** — `thread_local!` cache of `RefCell<Option<CGEventSource>>` so
+the source is created once per thread (only the event_loop thread
+calls this) and cloned cheaply on every call.
+
+```rust
+thread_local! {
+    static SOURCE: RefCell<Option<CGEventSource>> = const { RefCell::new(None) };
+}
+
+SOURCE.with(|cell| {
+    let mut slot = cell.borrow_mut();
+    if slot.is_none() {
+        *slot = Some(CGEventSource::new(CGEventSourceStateID::HIDSystemState)?);
+    }
+    let source = slot.as_ref().unwrap().clone();
+    let event = CGEvent::new(source)?;
+    let pos = event.location();
+    Ok((pos.x, pos.y))
+})
+```
+
 ## UDP socket buffers
 
 Both sides also call:
@@ -123,13 +226,15 @@ trivial memory and eliminates the drops.
 
 ## What each fix handles
 
-| Fix                     | Addresses                                 |
-|-------------------------|-------------------------------------------|
-| CGEventSource cache     | Per-event CPU cost on client              |
-| Associate once          | Per-event syscall / IPC cost on client    |
-| Move coalescing         | Backlog amplification under burst         |
-| serialize_into          | Allocator churn on server                 |
-| Socket buffers          | Packet drops under burst                  |
+| Fix                           | Addresses                                 |
+|-------------------------------|-------------------------------------------|
+| CGEventSource cache (client)  | Per-event CPU cost on client              |
+| Associate once                | Per-event syscall / IPC cost on client    |
+| Client Move coalescing        | Backlog amplification on the receiver     |
+| serialize_into                | Allocator churn on server                 |
+| Server Move coalescing        | UDP packet rate fanout from the sender    |
+| get_cursor_position cache     | Per-event CPU cost on server              |
+| Socket buffers                | Packet drops under burst                  |
 
 ## What was deliberately NOT changed
 
