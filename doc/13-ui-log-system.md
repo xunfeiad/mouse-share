@@ -18,10 +18,11 @@ TeeLogger (自定义 log::Log 实现)
                       UI 每帧调用 drain_since(last_seq)
                       只拉取新增条目，追加到本地缓存
                           ↓
-                      egui::ScrollArea 渲染本地缓存
+                      egui::ScrollArea::show_rows() 虚拟滚动
+                      只渲染可见的 ~15 行
 ```
 
-核心思路：**Tee（分流）+ 增量读取**——一条日志同时写到终端和内存缓冲区，UI 每帧只读取新增条目追加到本地 Vec，避免全量 clone。
+核心思路：**Tee（分流）+ 增量读取 + 虚拟滚动**——一条日志同时写到终端和内存缓冲区，UI 每帧只读取新增条目追加到本地 Vec（避免全量 clone），渲染时用 `show_rows()` 只布局可见行（避免 1000 行 widget 开销）。
 
 ---
 
@@ -293,28 +294,35 @@ fn log_tab(ui: &mut egui::Ui, app: &mut App) {
         log_chip(ui, &format!("Error {}", err_count), /* ... */);
     });
 
-    // ── 可滚动日志区域（自动滚到底部）──
+    // ── 虚���滚动日志区域 ──
+    // 用 show_rows() 替代 show()：egui 只回调可见行范围
+    // （260px / ~18px ≈ 15 行），其余行仅分配占位空间。
+    // 行高用 text_style_height() 动态获取，适配不同 DPI。
+    let row_height = ui.text_style_height(&egui::TextStyle::Body)
+        .max(14.0);
+    let total = lines.len();
+
     egui::ScrollArea::vertical()
         .max_height(260.0)
         .stick_to_bottom(true)   // ← 新日志到来时自动滚动
-        .show(ui, |ui| {
-            for line in lines {
-                render_log_line(ui, line);
+        .show_rows(ui, row_height, total, |ui, row_range| {
+            for i in row_range {
+                render_log_line(ui, &lines[i]);
             }
         });
 
     // ── 底部状态栏 ──
-    ui.label(format!("{} events", lines.len()));
+    ui.label(format!("{} events", total));
 }
 ```
 
 **性能对比**：
 
-| 指标 | 旧方案 (snapshot) | 新方案 (drain_since) |
-|------|-------------------|---------------------|
+| 指标 | 旧方案 (snapshot + show) | 新方案 (drain_since + show_rows) |
+|------|--------------------------|----------------------------------|
 | 每帧 clone 数 | 1000 条 String | 0~2 条 String |
+| 每帧 widget 数 | ~3000 (1000行 × 3个label) | ~45 (15 可见�� × 3) |
 | 每帧堆分配 | ~1000 次 | ~0 次（无新日志时） |
-| 60fps 下每秒 clone | 60,000 次 | ~120 次（日志频率） |
 | 锁持有时间 | ~1ms (memcpy 1000条) | ~1µs (scan + clone 几条) |
 
 ### 5.3 单行渲染
@@ -402,8 +410,9 @@ src/
 3. **在 `main()` 顶部安装**——`log_buffer::install();`
 4. **App 结构体加两个字段**——`log_cache: Vec<LogLine>` + `log_last_seq: u64`
 5. **UI 每帧调用 `drain_since(last_seq)`**——新增条目追加到 `log_cache`，落后时全量重建
-6. **用 `ScrollArea::stick_to_bottom(true)`** 实现自动滚到最新
-7. **按 level 着色**——Info 绿色、Warn 黄色、Error 红色的彩色标签
+6. **用 `ScrollArea::show_rows()` 虚拟滚动**——只渲染可见行，行高用 `ui.text_style_height()` 动态获取
+7. **`stick_to_bottom(true)`** 实现新日志自动滚到最新
+8. **按 level 着色**——Info 绿色、Warn 黄色、Error 红色的彩色标签
 
 无需修改任何已有的 `log::info!()` 调用——安装 TeeLogger 后所有日志自动进入缓冲区。
 
