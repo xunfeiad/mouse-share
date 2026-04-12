@@ -2451,22 +2451,35 @@ fn log_tab(ui: &mut Ui, app: &mut App) {
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(260.0)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    if lines.is_empty() {
-                        ui.label(
-                            RichText::new("—")
-                                .size(12.0)
-                                .color(theme::TEXT_SUBTLE),
-                        );
-                    } else {
-                        for line in lines {
-                            render_log_line(ui, line, s);
+            if lines.is_empty() {
+                ui.label(
+                    RichText::new("—")
+                        .size(12.0)
+                        .color(theme::TEXT_SUBTLE),
+                );
+            } else {
+                // Compute row height from the actual text style +
+                // spacing so virtual scrolling aligns correctly.
+                // log_entry uses 12pt as the tallest text; the Frame
+                // badge adds 2×1px inner margin. show_rows adds
+                // item_spacing.y between rows automatically, so we
+                // pass the height WITHOUT spacing.
+                let row_height = ui.text_style_height(&egui::TextStyle::Body)
+                    .max(14.0); // floor at 14px in case body font is tiny
+
+                // Virtual scrolling: egui only calls the closure with
+                // the visible row range, allocating placeholder space
+                // for the rest. Drops per-frame widget count from
+                // ~3000 to ~45.
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .stick_to_bottom(true)
+                    .show_rows(ui, row_height, total, |ui, row_range| {
+                        for i in row_range {
+                            render_log_line(ui, &lines[i], s);
                         }
-                    }
-                });
+                    });
+            }
         });
     ui.add_space(8.0);
     ui.horizontal(|ui| {
