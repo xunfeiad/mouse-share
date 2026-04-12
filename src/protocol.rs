@@ -8,20 +8,15 @@ pub enum MouseButton {
     Other(u8),
 }
 
+/// A mouse event. Each variant carries exactly the data it needs:
+/// - `Move` / `Scroll`: directional deltas.
+/// - `ButtonDown` / `ButtonUp`: which button changed state.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum MouseEventType {
-    Move,
+pub enum MouseEvent {
+    Move { dx: f64, dy: f64 },
     ButtonDown(MouseButton),
     ButtonUp(MouseButton),
     Scroll { dx: f64, dy: f64 },
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MouseEvent {
-    /// Relative movement delta
-    pub dx: f64,
-    pub dy: f64,
-    pub event_type: MouseEventType,
 }
 
 /// A keyboard key press / release. Keycodes are platform-native:

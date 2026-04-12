@@ -6,9 +6,21 @@ pub fn get_screen_info() -> Result<ScreenInfo> {
     {
         use core_graphics::display::CGDisplay;
         let display = CGDisplay::main();
+        // Use CGDisplayBounds which returns in the **global display coordinate
+        // space** (points) — the same coordinate system used by
+        // CGEvent::location(). CGDisplayPixelsWide/High can differ on Retina
+        // displays depending on the scaling mode, which would make at_edge()
+        // and entry_position() use the wrong frame of reference.
+        let bounds = display.bounds();
+        let w = bounds.size.width as u32;
+        let h = bounds.size.height as u32;
+        log::info!(
+            "Screen info: bounds={}x{} pixels={}x{}",
+            w, h, display.pixels_wide(), display.pixels_high()
+        );
         Ok(ScreenInfo {
-            width: display.pixels_wide() as u32,
-            height: display.pixels_high() as u32,
+            width: w,
+            height: h,
         })
     }
     #[cfg(target_os = "windows")]

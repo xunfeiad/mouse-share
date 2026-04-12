@@ -1,6 +1,6 @@
 use crate::input::{capture, simulate};
 use crate::net::state::{now_ms, SharedState};
-use crate::protocol::{self, Message, MouseEventType};
+use crate::protocol::{self, Message, MouseEvent};
 use crate::screen::{get_display_refresh_hz, get_screen_info};
 use anyhow::Result;
 use std::net::{SocketAddr, UdpSocket};
@@ -243,18 +243,15 @@ impl Client {
                             }
                             Message::Input(event) if active => {
                                 state.last_event_ms.store(now_ms(), Ordering::SeqCst);
-                                match &event.event_type {
-                                    MouseEventType::Move => {
-                                        sim_x += event.dx;
-                                        sim_y += event.dy;
-                                        pending_dx += event.dx;
-                                        pending_dy += event.dy;
+                                match event {
+                                    MouseEvent::Move { dx, dy } => {
+                                        sim_x += dx;
+                                        sim_y += dy;
+                                        pending_dx += dx;
+                                        pending_dy += dy;
                                         have_move = true;
                                     }
-                                    // Clicks/scrolls must stay ordered
-                                    // with respect to moves — flush any
-                                    // accumulated delta before applying.
-                                    MouseEventType::ButtonDown(btn) => {
+                                    MouseEvent::ButtonDown(btn) => {
                                         if have_move {
                                             let _ = simulator
                                                 .move_relative(pending_dx, pending_dy);
@@ -262,11 +259,11 @@ impl Client {
                                             pending_dy = 0.0;
                                             have_move = false;
                                         }
-                                        if let Err(e) = simulator.button_down(*btn) {
+                                        if let Err(e) = simulator.button_down(btn) {
                                             log::error!("Simulation error: {}", e);
                                         }
                                     }
-                                    MouseEventType::ButtonUp(btn) => {
+                                    MouseEvent::ButtonUp(btn) => {
                                         if have_move {
                                             let _ = simulator
                                                 .move_relative(pending_dx, pending_dy);
@@ -274,15 +271,11 @@ impl Client {
                                             pending_dy = 0.0;
                                             have_move = false;
                                         }
-                                        if let Err(e) = simulator.button_up(*btn) {
+                                        if let Err(e) = simulator.button_up(btn) {
                                             log::error!("Simulation error: {}", e);
                                         }
                                     }
-                                    MouseEventType::Scroll { dx, dy } => {
-                                        // Scroll applies at the current
-                                        // cursor position — flush pending
-                                        // moves first so the scroll lands
-                                        // on the right target.
+                                    MouseEvent::Scroll { dx, dy } => {
                                         if have_move {
                                             let _ = simulator
                                                 .move_relative(pending_dx, pending_dy);
@@ -290,7 +283,7 @@ impl Client {
                                             pending_dy = 0.0;
                                             have_move = false;
                                         }
-                                        if let Err(e) = simulator.scroll(*dx, *dy) {
+                                        if let Err(e) = simulator.scroll(dx, dy) {
                                             log::error!("Simulation error: {}", e);
                                         }
                                     }

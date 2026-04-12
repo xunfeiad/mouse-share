@@ -1,4 +1,4 @@
-use crate::protocol::{KeyEvent, MouseButton, MouseEvent, MouseEventType};
+use crate::protocol::{KeyEvent, MouseButton, MouseEvent};
 use anyhow::Result;
 use core_foundation::runloop::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopRunResult,
@@ -108,23 +108,8 @@ impl InputCapture for MacOsCapture {
                             .get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y)
                             as f64;
 
-                        if let Some(evt_type) = map_event_type(event_type, event) {
-                            // Read the absolute cursor position directly
-                            // from the event. While forwarding is OFF (mouse
-                            // on server) this is the real cursor; the server
-                            // uses it for edge detection, sparing a per-event
-                            // CGEvent::new + location() IPC to the window
-                            // server. While forwarding is ON the OS freezes
-                            // the cursor so this value becomes stale, but
-                            // the server loop doesn't consult it in that
-                            // branch — it uses the accumulated virtual
-                            // cursor instead.
+                        if let Some(mouse_event) = map_event(event_type, event, dx, dy) {
                             let loc = event.location();
-                            let mouse_event = MouseEvent {
-                                dx,
-                                dy,
-                                event_type: evt_type,
-                            };
                             let _ = sender.try_send(CapturedInput::Mouse {
                                 event: mouse_event,
                                 abs_x: loc.x,
@@ -232,17 +217,17 @@ impl InputCapture for MacOsCapture {
     }
 }
 
-fn map_event_type(event_type: CGEventType, event: &CGEvent) -> Option<MouseEventType> {
+fn map_event(event_type: CGEventType, event: &CGEvent, dx: f64, dy: f64) -> Option<MouseEvent> {
     match event_type {
         CGEventType::MouseMoved
         | CGEventType::LeftMouseDragged
         | CGEventType::RightMouseDragged
-        | CGEventType::OtherMouseDragged => Some(MouseEventType::Move),
+        | CGEventType::OtherMouseDragged => Some(MouseEvent::Move { dx, dy }),
 
-        CGEventType::LeftMouseDown => Some(MouseEventType::ButtonDown(MouseButton::Left)),
-        CGEventType::LeftMouseUp => Some(MouseEventType::ButtonUp(MouseButton::Left)),
-        CGEventType::RightMouseDown => Some(MouseEventType::ButtonDown(MouseButton::Right)),
-        CGEventType::RightMouseUp => Some(MouseEventType::ButtonUp(MouseButton::Right)),
+        CGEventType::LeftMouseDown => Some(MouseEvent::ButtonDown(MouseButton::Left)),
+        CGEventType::LeftMouseUp => Some(MouseEvent::ButtonUp(MouseButton::Left)),
+        CGEventType::RightMouseDown => Some(MouseEvent::ButtonDown(MouseButton::Right)),
+        CGEventType::RightMouseUp => Some(MouseEvent::ButtonUp(MouseButton::Right)),
 
         CGEventType::OtherMouseDown => {
             let btn_num =
@@ -251,7 +236,7 @@ fn map_event_type(event_type: CGEventType, event: &CGEvent) -> Option<MouseEvent
                 2 => MouseButton::Middle,
                 n => MouseButton::Other(n as u8),
             };
-            Some(MouseEventType::ButtonDown(button))
+            Some(MouseEvent::ButtonDown(button))
         }
         CGEventType::OtherMouseUp => {
             let btn_num =
@@ -260,7 +245,7 @@ fn map_event_type(event_type: CGEventType, event: &CGEvent) -> Option<MouseEvent
                 2 => MouseButton::Middle,
                 n => MouseButton::Other(n as u8),
             };
-            Some(MouseEventType::ButtonUp(button))
+            Some(MouseEvent::ButtonUp(button))
         }
 
         CGEventType::ScrollWheel => {
@@ -270,7 +255,7 @@ fn map_event_type(event_type: CGEventType, event: &CGEvent) -> Option<MouseEvent
             let scroll_dx = event
                 .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
                 as f64;
-            Some(MouseEventType::Scroll {
+            Some(MouseEvent::Scroll {
                 dx: scroll_dx,
                 dy: scroll_dy,
             })

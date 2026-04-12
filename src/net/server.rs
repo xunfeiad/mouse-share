@@ -1,7 +1,7 @@
 use crate::config::{Edge, ScreenConfig};
 use crate::input::capture::{self, CapturedInput};
 use crate::net::state::{now_ms, SharedState};
-use crate::protocol::{self, Message, MouseEvent, MouseEventType, ScreenInfo};
+use crate::protocol::{self, Message, MouseEvent, ScreenInfo};
 use crate::screen::get_screen_info;
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver};
@@ -284,10 +284,9 @@ impl Server {
             macro_rules! flush_pending_move {
                 () => {
                     if have_pending_move {
-                        let ev = MouseEvent {
+                        let ev = MouseEvent::Move {
                             dx: pending_dx,
                             dy: pending_dy,
-                            event_type: MouseEventType::Move,
                         };
                         protocol::serialize_into(&mut send_buf, &Message::Input(ev))?;
                         let _ = socket.send_to(&send_buf, client_addr);
@@ -333,9 +332,13 @@ impl Server {
                             // server side.
                             let (cx, cy) = (abs_x, abs_y);
                             if last_cursor_log.elapsed() > Duration::from_millis(1000) {
+                                let (edx, edy) = match &event {
+                                    MouseEvent::Move { dx, dy } => (*dx, *dy),
+                                    _ => (0.0, 0.0),
+                                };
                                 log::info!(
                                     "cursor=({:.0},{:.0}) dx={:.1} dy={:.1} at_edge={}",
-                                    cx, cy, event.dx, event.dy, config.at_edge(cx, cy)
+                                    cx, cy, edx, edy, config.at_edge(cx, cy)
                                 );
                                 last_cursor_log = Instant::now();
                             }
@@ -361,8 +364,14 @@ impl Server {
                                 })?;
                                 socket.send_to(&enter_msg, client_addr)?;
                                 log::info!(
-                                    "Mouse entered client screen at ({:.0}, {:.0})",
-                                    ex, ey
+                                    "Mouse entered client: cursor=({:.0},{:.0}) → entry=({:.0},{:.0}) \
+                                     server={}x{} client={} edge={:?}",
+                                    cx, cy, ex, ey,
+                                    config.server_screen.width, config.server_screen.height,
+                                    config.client_screen.as_ref()
+                                        .map(|s| format!("{}x{}", s.width, s.height))
+                                        .unwrap_or_else(|| "none".into()),
+                                    config.edge
                                 );
                                 // The edge-hitting event itself is not
                                 // replayed as a delta — wait for the next.
@@ -373,11 +382,13 @@ impl Server {
                         if forwarding {
                             last_forward_time = Instant::now();
 
-                            // Cursor tracking is still per-event so we
-                            // don't miss the return-edge check when the
-                            // cursor crosses it mid-batch.
-                            client_cursor_x += event.dx;
-                            client_cursor_y += event.dy;
+                            // Cursor tracking: only Move events carry
+                            // positional deltas. Button/Scroll events don't
+                            // shift the cursor.
+                            if let MouseEvent::Move { dx, dy } = &event {
+                                client_cursor_x += dx;
+                                client_cursor_y += dy;
+                            }
 
                             let client_screen = config
                                 .client_screen
@@ -427,11 +438,11 @@ impl Server {
                             client_cursor_x = client_cursor_x.clamp(0.0, cw - 1.0);
                             client_cursor_y = client_cursor_y.clamp(0.0, ch - 1.0);
 
-                            match &event.event_type {
-                                MouseEventType::Move => {
+                            match &event {
+                                MouseEvent::Move { dx, dy } => {
                                     // Accumulate — flushed later.
-                                    pending_dx += event.dx;
-                                    pending_dy += event.dy;
+                                    pending_dx += dx;
+                                    pending_dy += dy;
                                     have_pending_move = true;
                                 }
                                 _ => {

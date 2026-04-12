@@ -1,4 +1,4 @@
-use crate::protocol::{KeyEvent, MouseButton, MouseEvent, MouseEventType};
+use crate::protocol::{KeyEvent, MouseButton, MouseEvent};
 use anyhow::Result;
 use crossbeam_channel::Sender;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,51 +140,40 @@ unsafe extern "system" fn mouse_hook_proc(
     LAST_POS.with(|p| p.set(Some((info.pt.x, info.pt.y))));
 
     let w = wparam.0 as u32;
-    let event_type = match w {
-        x if x == WM_MOUSEMOVE => Some(MouseEventType::Move),
-        x if x == WM_LBUTTONDOWN => Some(MouseEventType::ButtonDown(MouseButton::Left)),
-        x if x == WM_LBUTTONUP => Some(MouseEventType::ButtonUp(MouseButton::Left)),
-        x if x == WM_RBUTTONDOWN => Some(MouseEventType::ButtonDown(MouseButton::Right)),
-        x if x == WM_RBUTTONUP => Some(MouseEventType::ButtonUp(MouseButton::Right)),
-        x if x == WM_MBUTTONDOWN => Some(MouseEventType::ButtonDown(MouseButton::Middle)),
-        x if x == WM_MBUTTONUP => Some(MouseEventType::ButtonUp(MouseButton::Middle)),
+    let mouse_event = match w {
+        x if x == WM_MOUSEMOVE => Some(MouseEvent::Move { dx, dy }),
+        x if x == WM_LBUTTONDOWN => Some(MouseEvent::ButtonDown(MouseButton::Left)),
+        x if x == WM_LBUTTONUP => Some(MouseEvent::ButtonUp(MouseButton::Left)),
+        x if x == WM_RBUTTONDOWN => Some(MouseEvent::ButtonDown(MouseButton::Right)),
+        x if x == WM_RBUTTONUP => Some(MouseEvent::ButtonUp(MouseButton::Right)),
+        x if x == WM_MBUTTONDOWN => Some(MouseEvent::ButtonDown(MouseButton::Middle)),
+        x if x == WM_MBUTTONUP => Some(MouseEvent::ButtonUp(MouseButton::Middle)),
         x if x == WM_XBUTTONDOWN => {
             let xbutton = ((info.mouseData >> 16) & 0xFFFF) as u8;
-            Some(MouseEventType::ButtonDown(MouseButton::Other(xbutton)))
+            Some(MouseEvent::ButtonDown(MouseButton::Other(xbutton)))
         }
         x if x == WM_XBUTTONUP => {
             let xbutton = ((info.mouseData >> 16) & 0xFFFF) as u8;
-            Some(MouseEventType::ButtonUp(MouseButton::Other(xbutton)))
+            Some(MouseEvent::ButtonUp(MouseButton::Other(xbutton)))
         }
         x if x == WM_MOUSEWHEEL => {
             let delta = (info.mouseData as i32 >> 16) as f64 / 120.0;
-            Some(MouseEventType::Scroll { dx: 0.0, dy: delta })
+            Some(MouseEvent::Scroll { dx: 0.0, dy: delta })
         }
         x if x == WM_MOUSEHWHEEL => {
             let delta = (info.mouseData as i32 >> 16) as f64 / 120.0;
-            Some(MouseEventType::Scroll { dx: delta, dy: 0.0 })
+            Some(MouseEvent::Scroll { dx: delta, dy: 0.0 })
         }
         _ => None,
     };
 
-    if let Some(evt) = event_type {
-        let mouse_event = MouseEvent {
-            dx,
-            dy,
-            event_type: evt,
-        };
-        // Attach the absolute cursor position the hook saw. When
-        // suppression is OFF (mouse on server) this is the real cursor
-        // and the server uses it for edge detection, avoiding a
-        // per-event GetCursorPos syscall. Under suppression it reflects
-        // the post-recenter position, which the server ignores in the
-        // forwarding branch.
+    if let Some(evt) = mouse_event {
         let abs_x = info.pt.x as f64;
         let abs_y = info.pt.y as f64;
         HOOK_SENDER.with(|s| {
             if let Some(sender) = s.borrow().as_ref() {
                 let _ = sender.try_send(CapturedInput::Mouse {
-                    event: mouse_event,
+                    event: evt,
                     abs_x,
                     abs_y,
                 });
