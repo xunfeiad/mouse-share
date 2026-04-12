@@ -22,7 +22,7 @@ use eframe::egui::{
 use mouse_share::{
     config as msc,
     input::capture as input_capture,
-    log_buffer::{self, LogLine},
+    log_buffer::{self, LogLine, LogReceiver},
     net::{client::Client as BeClient, server::Server as BeServer, SharedState},
 };
 use std::sync::atomic::Ordering;
@@ -38,7 +38,7 @@ fn main() -> eframe::Result<()> {
     // Install the tee logger so env_logger output AND the in-memory ring
     // buffer (for the Log tab) both receive every record. Safe to call more
     // than once — subsequent calls are no-ops.
-    let _ = log_buffer::install();
+    log_buffer::install();
 
     // Promote to a foreground app so CGDisplayHideCursor takes effect when
     // the server hides the local cursor. Without this the .app bundle still
@@ -743,11 +743,11 @@ struct App {
     /// Dev switcher visibility (set by `MOUSE_SHARE_UI_DEV=1`).
     dev_mode: bool,
 
-    // --- Log cache (incremental reads) ---
-    /// Local copy of log lines, incrementally updated via `drain_since`.
-    log_cache: Vec<log_buffer::LogLine>,
-    /// Sequence number of the last entry in `log_cache`.
-    log_last_seq: u64,
+    // --- Log (channel-based) ---
+    /// Receiver half of the tokio::mpsc log channel. Taken once at startup.
+    log_rx: Option<LogReceiver>,
+    /// Local log storage, owned exclusively by the UI thread.
+    log_cache: Vec<LogLine>,
 }
 
 impl App {
@@ -975,8 +975,8 @@ impl Default for App {
             dev_mode: std::env::var("MOUSE_SHARE_UI_DEV")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            log_rx: log_buffer::take_receiver(),
             log_cache: Vec::new(),
-            log_last_seq: 0,
         };
         // Dev hook: start in a specific visual state for screenshotting.
         if let Ok(s) = std::env::var("MOUSE_SHARE_UI_STATE") {
@@ -2382,22 +2382,15 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
 fn log_tab(ui: &mut Ui, app: &mut App) {
     let s = app.s();
 
-    // Incremental read: only clone lines we haven't seen yet.
-    let result = log_buffer::global().drain_since(app.log_last_seq);
-    if !result.lines.is_empty() {
-        // If our cache fell behind the ring buffer (entries evicted),
-        // rebuild from scratch.
-        if app.log_last_seq < result.oldest_seq {
-            app.log_cache = result.lines;
-        } else {
-            app.log_cache.extend(result.lines);
-        }
-        // Trim local cache to match the ring buffer capacity.
-        const LOG_CAPACITY: usize = 1000;
-        if app.log_cache.len() > LOG_CAPACITY {
-            app.log_cache.drain(..app.log_cache.len() - LOG_CAPACITY);
-        }
-        app.log_last_seq = result.newest_seq;
+    // Drain new log lines from the channel into our local cache.
+    // try_recv is non-blocking — moves messages without cloning.
+    if let Some(rx) = &mut app.log_rx {
+        rx.drain(&mut app.log_cache);
+    }
+    // Cap local storage to 1000 entries.
+    const LOG_CAPACITY: usize = 1000;
+    if app.log_cache.len() > LOG_CAPACITY {
+        app.log_cache.drain(..app.log_cache.len() - LOG_CAPACITY);
     }
     let lines = &app.log_cache;
 

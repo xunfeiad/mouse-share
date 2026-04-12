@@ -31,7 +31,7 @@ enum Commands {
 fn main() -> anyhow::Result<()> {
     // Install the tee logger so both stderr (env_logger) and the in-memory
     // ring buffer (for the GUI Log tab) see every record.
-    let _ = log_buffer::install();
+    log_buffer::install();
 
     let cli = Cli::parse();
 

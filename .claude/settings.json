@@ -10,7 +10,9 @@
       "Bash(git push:*)",
       "Bash(cargo check:*)",
       "Bash(rustup target:*)",
-      "WebFetch(domain:docs.rs)"
+      "WebFetch(domain:docs.rs)",
+      "Read(//Users/xunfei/**)",
+      "Bash(git tag:*)"
     ]
   }
 }

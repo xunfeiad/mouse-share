@@ -1,215 +1,65 @@
-//! A fixed-size ring-buffer `log::Log` implementation so the GUI can render
-//! the recent log stream in its Log tab. It also forwards every record to an
-//! inner `env_logger` so the terminal output is unchanged.
+//! A `log::Log` implementation backed by `tokio::mpsc::channel(1000)`.
 //!
-//! The buffer is pre-allocated once at startup and never reallocates. Writes
-//! overwrite the oldest slot in O(1) constant time — no `pop_front`, no
-//! `realloc`, no jitter. The UI reads new entries incrementally via
-//! `drain_since(seq)`, cloning only the lines that arrived since its last
-//! read (typically 0–2 per frame).
+//! Logger threads call `try_send()` (lock-free CAS) to push log lines into
+//! the channel. The UI thread calls `drain()` to batch-receive all pending
+//! messages into its own `Vec` — no shared Mutex, no ring buffer scanning,
+//! no seq tracking. The channel's bounded capacity (1000) provides natural
+//! back-pressure: if the UI falls behind, the oldest unsent messages are
+//! dropped by `try_send` returning `Full`.
+//!
+//! This replaces the previous `Mutex<Ring>` + `drain_since(seq)` design.
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use std::sync::{Arc, Mutex, OnceLock};
-
-/// How many records to keep in memory. ~2 KB per line × 1000 ≈ 2 MB worst
-/// case, which is fine for a long-running desktop session.
-const CAPACITY: usize = 1000;
+use std::sync::OnceLock;
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
 pub struct LogLine {
-    /// Monotonic sequence number, assigned on push. The UI uses this to
-    /// request only lines it hasn't seen yet.
-    pub seq: u64,
     /// Unix millis when the record was captured.
     pub ts_ms: u64,
     pub level: Level,
     pub message: String,
 }
 
-/// Fixed-size ring buffer. Pre-allocates `CAPACITY` slots once; subsequent
-/// writes overwrite the oldest slot via a wrapping write cursor — zero
-/// reallocation, O(1) constant push, no jitter.
-///
-/// Cloneable (`Arc` internally) so both the UI and the logger can hold
-/// references.
+/// The sender half, held by `TeeLogger`. Cloneable so the global logger
+/// (which must be `Send + Sync + 'static`) can hand out copies.
 #[derive(Clone)]
-pub struct LogBuffer {
-    inner: Arc<Mutex<Ring>>,
+struct LogSender {
+    tx: mpsc::Sender<LogLine>,
 }
 
-/// The actual ring storage. `slots` is allocated once and never resized.
-struct Ring {
-    /// Pre-allocated storage. Slots `0..len` contain valid entries;
-    /// `write_idx` is where the next entry will be written.
-    slots: Box<[Option<LogLine>]>,
-    /// Next position to write (wraps around via `% CAPACITY`).
-    write_idx: usize,
-    /// Number of valid entries, `0..=CAPACITY`.
-    len: usize,
-    /// Next sequence number to assign. Strictly increasing, never resets.
-    next_seq: u64,
+/// The receiver half, held by the UI. NOT Clone — exactly one consumer.
+pub struct LogReceiver {
+    rx: mpsc::Receiver<LogLine>,
 }
 
-impl Ring {
-    fn new() -> Self {
-        // Pre-allocate all slots up front. After this, the buffer never
-        // touches the allocator again (aside from the String inside each
-        // LogLine, which is unavoidable).
-        let slots: Vec<Option<LogLine>> = (0..CAPACITY).map(|_| None).collect();
-        Self {
-            slots: slots.into_boxed_slice(),
-            write_idx: 0,
-            len: 0,
-            next_seq: 1,
-        }
-    }
-
-    fn push(&mut self, ts_ms: u64, level: Level, message: String) {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-
-        // Overwrite the slot at write_idx. If the slot already held a
-        // LogLine, its String is dropped here — no shifting, no memcpy.
-        self.slots[self.write_idx] = Some(LogLine {
-            seq,
-            ts_ms,
-            level,
-            message,
-        });
-        self.write_idx = (self.write_idx + 1) % CAPACITY;
-        if self.len < CAPACITY {
-            self.len += 1;
-        }
-    }
-
-    /// Index of the oldest valid entry.
-    fn oldest_idx(&self) -> usize {
-        if self.len < CAPACITY {
-            0
-        } else {
-            self.write_idx // write_idx points at the oldest when full
-        }
-    }
-
-    /// Iterate entries from oldest to newest.
-    fn iter(&self) -> RingIter<'_> {
-        RingIter {
-            ring: self,
-            pos: 0,
-            remaining: self.len,
+impl LogReceiver {
+    /// Drain all pending log lines from the channel into `out`.
+    /// Non-blocking: returns immediately when the channel is empty.
+    /// Typical per-frame cost: 0–2 moves, zero allocation (appends to
+    /// caller's existing Vec).
+    pub fn drain(&mut self, out: &mut Vec<LogLine>) {
+        while let Ok(line) = self.rx.try_recv() {
+            out.push(line);
         }
     }
 }
 
-struct RingIter<'a> {
-    ring: &'a Ring,
-    pos: usize,   // how many items we've yielded
-    remaining: usize,
-}
-
-impl<'a> Iterator for RingIter<'a> {
-    type Item = &'a LogLine;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let idx = (self.ring.oldest_idx() + self.pos) % CAPACITY;
-        self.pos += 1;
-        self.remaining -= 1;
-        self.ring.slots[idx].as_ref()
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl Default for LogBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl LogBuffer {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Ring::new())),
-        }
-    }
-
-    pub fn push(&self, ts_ms: u64, level: Level, message: String) {
-        self.inner.lock().unwrap().push(ts_ms, level, message);
-    }
-
-    /// Return only the lines with `seq > after_seq`. The UI calls this
-    /// once per frame with its last-seen sequence number. Typical cost:
-    /// 0–2 clones per frame instead of 1000.
-    ///
-    /// Also returns the sequence number of the oldest entry still in the
-    /// buffer (`oldest_seq`). If `after_seq < oldest_seq`, some entries
-    /// were evicted since the last read — the caller should rebuild its
-    /// cache from the returned lines (they represent the full tail of
-    /// the buffer that's still available).
-    pub fn drain_since(&self, after_seq: u64) -> DrainResult {
-        let ring = self.inner.lock().unwrap();
-        if ring.len == 0 {
-            return DrainResult {
-                lines: Vec::new(),
-                oldest_seq: 0,
-                newest_seq: 0,
-            };
-        }
-
-        let oldest_seq = ring.iter().next().map(|l| l.seq).unwrap_or(0);
-        let newest_seq = ring.next_seq - 1;
-
-        // Fast path: caller is up to date.
-        if after_seq >= newest_seq {
-            return DrainResult {
-                lines: Vec::new(),
-                oldest_seq,
-                newest_seq,
-            };
-        }
-
-        // If caller is behind the oldest entry, return everything so
-        // they can rebuild their local cache.
-        let effective_after = if after_seq < oldest_seq {
-            0
-        } else {
-            after_seq
-        };
-
-        let lines: Vec<LogLine> = ring
-            .iter()
-            .filter(|l| l.seq > effective_after)
-            .cloned()
-            .collect();
-
-        DrainResult {
-            lines,
-            oldest_seq,
-            newest_seq,
-        }
-    }
-}
-
-pub struct DrainResult {
-    pub lines: Vec<LogLine>,
-    /// Seq of the oldest entry still in the buffer. If caller's last-seen
-    /// seq is below this, entries were lost to ring eviction.
-    pub oldest_seq: u64,
-    /// Seq of the newest entry in the buffer.
-    pub newest_seq: u64,
+/// Create the channel pair. Called once at startup.
+fn create_channel() -> (LogSender, LogReceiver) {
+    let (tx, rx) = mpsc::channel(1000);
+    (LogSender { tx }, LogReceiver { rx })
 }
 
 /// A `log::Log` implementation that writes to both `env_logger` (for
-/// stderr) and an in-memory ring buffer (for the GUI).
+/// stderr) and a `tokio::mpsc` channel (for the GUI).
 struct TeeLogger {
     inner: env_logger::Logger,
-    buffer: LogBuffer,
+    sender: LogSender,
 }
+
+// Safety: env_logger::Logger is Send+Sync, mpsc::Sender is Send+Sync.
+unsafe impl Sync for TeeLogger {}
 
 impl Log for TeeLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
@@ -221,11 +71,15 @@ impl Log for TeeLogger {
             return;
         }
         self.inner.log(record);
-        self.buffer.push(
-            now_ms(),
-            record.level(),
-            record.args().to_string(),
-        );
+        // try_send is non-blocking. If the channel is full (UI not
+        // draining fast enough), we silently drop the line — this is
+        // the back-pressure policy. No lock, no allocation beyond the
+        // String that record.args().to_string() already requires.
+        let _ = self.sender.tx.try_send(LogLine {
+            ts_ms: now_ms(),
+            level: record.level(),
+            message: record.args().to_string(),
+        });
     }
 
     fn flush(&self) {
@@ -233,49 +87,44 @@ impl Log for TeeLogger {
     }
 }
 
-/// Global singleton so the UI can access the shared log buffer without
-/// plumbing it through every callsite.
-static GLOBAL: OnceLock<LogBuffer> = OnceLock::new();
+/// Global singleton for the receiver. The UI takes it once via `take_receiver()`.
+static RECEIVER: OnceLock<std::sync::Mutex<Option<LogReceiver>>> = OnceLock::new();
 
 /// Install the tee logger as the global `log` backend. Safe to call more
-/// than once — subsequent calls are no-ops. Returns the shared ring buffer.
-pub fn install() -> LogBuffer {
-    if let Some(existing) = GLOBAL.get() {
-        return existing.clone();
-    }
+/// than once — subsequent calls are no-ops.
+pub fn install() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let (sender, receiver) = create_channel();
 
-    let buffer = LogBuffer::new();
-    let inner = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .format_timestamp_millis()
-    .build();
-    let filter = inner.filter();
+        // Stash the receiver for the UI to claim later.
+        let _ = RECEIVER.set(std::sync::Mutex::new(Some(receiver)));
 
-    let tee = TeeLogger {
-        inner,
-        buffer: buffer.clone(),
-    };
+        let inner = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info"),
+        )
+        .format_timestamp_millis()
+        .build();
+        let filter = inner.filter();
 
-    if log::set_boxed_logger(Box::new(tee)).is_ok() {
-        log::set_max_level(filter);
-    } else {
-        // Another logger was installed before us — fall back to the
-        // buffer-only logger without the env_logger forward.
-        log::set_max_level(LevelFilter::Info);
-    }
+        let tee = TeeLogger { inner, sender };
 
-    let _ = GLOBAL.set(buffer.clone());
-    buffer
+        if log::set_boxed_logger(Box::new(tee)).is_ok() {
+            log::set_max_level(filter);
+        } else {
+            log::set_max_level(LevelFilter::Info);
+        }
+    });
 }
 
-/// Fetch the global log buffer, installing the logger on first call.
-pub fn global() -> LogBuffer {
-    if let Some(existing) = GLOBAL.get() {
-        existing.clone()
-    } else {
-        install()
-    }
+/// Take the log receiver. Returns `Some` on the first call, `None` after
+/// that (there is exactly one consumer). The UI calls this at startup.
+pub fn take_receiver() -> Option<LogReceiver> {
+    install(); // ensure logger is installed
+    RECEIVER
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|mut guard| guard.take())
 }
 
 fn now_ms() -> u64 {
