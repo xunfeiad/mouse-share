@@ -742,6 +742,12 @@ struct App {
     pending_action: Option<Action>,
     /// Dev switcher visibility (set by `MOUSE_SHARE_UI_DEV=1`).
     dev_mode: bool,
+
+    // --- Log cache (incremental reads) ---
+    /// Local copy of log lines, incrementally updated via `drain_since`.
+    log_cache: Vec<log_buffer::LogLine>,
+    /// Sequence number of the last entry in `log_cache`.
+    log_last_seq: u64,
 }
 
 impl App {
@@ -969,6 +975,8 @@ impl Default for App {
             dev_mode: std::env::var("MOUSE_SHARE_UI_DEV")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            log_cache: Vec::new(),
+            log_last_seq: 0,
         };
         // Dev hook: start in a specific visual state for screenshotting.
         if let Ok(s) = std::env::var("MOUSE_SHARE_UI_STATE") {
@@ -2373,13 +2381,31 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
 
 fn log_tab(ui: &mut Ui, app: &mut App) {
     let s = app.s();
-    let lines = log_buffer::global().snapshot();
+
+    // Incremental read: only clone lines we haven't seen yet.
+    let result = log_buffer::global().drain_since(app.log_last_seq);
+    if !result.lines.is_empty() {
+        // If our cache fell behind the ring buffer (entries evicted),
+        // rebuild from scratch.
+        if app.log_last_seq < result.oldest_seq {
+            app.log_cache = result.lines;
+        } else {
+            app.log_cache.extend(result.lines);
+        }
+        // Trim local cache to match the ring buffer capacity.
+        const LOG_CAPACITY: usize = 1000;
+        if app.log_cache.len() > LOG_CAPACITY {
+            app.log_cache.drain(..app.log_cache.len() - LOG_CAPACITY);
+        }
+        app.log_last_seq = result.newest_seq;
+    }
+    let lines = &app.log_cache;
 
     // Counts per level, used for the filter chips.
     let mut info_count = 0usize;
     let mut warn_count = 0usize;
     let mut err_count = 0usize;
-    for l in &lines {
+    for l in lines {
         match l.level {
             log::Level::Info | log::Level::Debug | log::Level::Trace => info_count += 1,
             log::Level::Warn => warn_count += 1,
@@ -2436,7 +2462,7 @@ fn log_tab(ui: &mut Ui, app: &mut App) {
                                 .color(theme::TEXT_SUBTLE),
                         );
                     } else {
-                        for line in &lines {
+                        for line in lines {
                             render_log_line(ui, line, s);
                         }
                     }
