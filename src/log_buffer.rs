@@ -1,14 +1,14 @@
-//! A ring-buffer `log::Log` implementation so the GUI can render the recent
-//! log stream in its Log tab. It also forwards every record to an inner
-//! `env_logger` so the terminal output is unchanged.
+//! A fixed-size ring-buffer `log::Log` implementation so the GUI can render
+//! the recent log stream in its Log tab. It also forwards every record to an
+//! inner `env_logger` so the terminal output is unchanged.
 //!
-//! The UI reads new entries incrementally via `drain_since(seq)` — each
-//! frame only clones the lines that arrived since the last read, which is
-//! typically 0–2 lines at 60 fps. The old `snapshot()` approach cloned all
-//! 1000 lines every frame regardless.
+//! The buffer is pre-allocated once at startup and never reallocates. Writes
+//! overwrite the oldest slot in O(1) constant time — no `pop_front`, no
+//! `realloc`, no jitter. The UI reads new entries incrementally via
+//! `drain_since(seq)`, cloning only the lines that arrived since its last
+//! read (typically 0–2 per frame).
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// How many records to keep in memory. ~2 KB per line × 1000 ≈ 2 MB worst
@@ -26,17 +26,103 @@ pub struct LogLine {
     pub message: String,
 }
 
-/// In-memory ring buffer. Cloneable (`Arc` internally) so both the UI and
-/// the logger can hold references.
+/// Fixed-size ring buffer. Pre-allocates `CAPACITY` slots once; subsequent
+/// writes overwrite the oldest slot via a wrapping write cursor — zero
+/// reallocation, O(1) constant push, no jitter.
+///
+/// Cloneable (`Arc` internally) so both the UI and the logger can hold
+/// references.
 #[derive(Clone)]
 pub struct LogBuffer {
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<Mutex<Ring>>,
 }
 
-struct Inner {
-    buf: VecDeque<LogLine>,
+/// The actual ring storage. `slots` is allocated once and never resized.
+struct Ring {
+    /// Pre-allocated storage. Slots `0..len` contain valid entries;
+    /// `write_idx` is where the next entry will be written.
+    slots: Box<[Option<LogLine>]>,
+    /// Next position to write (wraps around via `% CAPACITY`).
+    write_idx: usize,
+    /// Number of valid entries, `0..=CAPACITY`.
+    len: usize,
     /// Next sequence number to assign. Strictly increasing, never resets.
     next_seq: u64,
+}
+
+impl Ring {
+    fn new() -> Self {
+        // Pre-allocate all slots up front. After this, the buffer never
+        // touches the allocator again (aside from the String inside each
+        // LogLine, which is unavoidable).
+        let slots: Vec<Option<LogLine>> = (0..CAPACITY).map(|_| None).collect();
+        Self {
+            slots: slots.into_boxed_slice(),
+            write_idx: 0,
+            len: 0,
+            next_seq: 1,
+        }
+    }
+
+    fn push(&mut self, ts_ms: u64, level: Level, message: String) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+
+        // Overwrite the slot at write_idx. If the slot already held a
+        // LogLine, its String is dropped here — no shifting, no memcpy.
+        self.slots[self.write_idx] = Some(LogLine {
+            seq,
+            ts_ms,
+            level,
+            message,
+        });
+        self.write_idx = (self.write_idx + 1) % CAPACITY;
+        if self.len < CAPACITY {
+            self.len += 1;
+        }
+    }
+
+    /// Index of the oldest valid entry.
+    fn oldest_idx(&self) -> usize {
+        if self.len < CAPACITY {
+            0
+        } else {
+            self.write_idx // write_idx points at the oldest when full
+        }
+    }
+
+    /// Iterate entries from oldest to newest.
+    fn iter(&self) -> RingIter<'_> {
+        RingIter {
+            ring: self,
+            pos: 0,
+            remaining: self.len,
+        }
+    }
+}
+
+struct RingIter<'a> {
+    ring: &'a Ring,
+    pos: usize,   // how many items we've yielded
+    remaining: usize,
+}
+
+impl<'a> Iterator for RingIter<'a> {
+    type Item = &'a LogLine;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let idx = (self.ring.oldest_idx() + self.pos) % CAPACITY;
+        self.pos += 1;
+        self.remaining -= 1;
+        self.ring.slots[idx].as_ref()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
 
 impl Default for LogBuffer {
@@ -48,26 +134,12 @@ impl Default for LogBuffer {
 impl LogBuffer {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner {
-                buf: VecDeque::with_capacity(CAPACITY),
-                next_seq: 1,
-            })),
+            inner: Arc::new(Mutex::new(Ring::new())),
         }
     }
 
     pub fn push(&self, ts_ms: u64, level: Level, message: String) {
-        let mut inner = self.inner.lock().unwrap();
-        let seq = inner.next_seq;
-        inner.next_seq += 1;
-        if inner.buf.len() == CAPACITY {
-            inner.buf.pop_front();
-        }
-        inner.buf.push_back(LogLine {
-            seq,
-            ts_ms,
-            level,
-            message,
-        });
+        self.inner.lock().unwrap().push(ts_ms, level, message);
     }
 
     /// Return only the lines with `seq > after_seq`. The UI calls this
@@ -80,27 +152,41 @@ impl LogBuffer {
     /// cache from the returned lines (they represent the full tail of
     /// the buffer that's still available).
     pub fn drain_since(&self, after_seq: u64) -> DrainResult {
-        let inner = self.inner.lock().unwrap();
-        if inner.buf.is_empty() {
+        let ring = self.inner.lock().unwrap();
+        if ring.len == 0 {
             return DrainResult {
                 lines: Vec::new(),
                 oldest_seq: 0,
                 newest_seq: 0,
             };
         }
-        let oldest_seq = inner.buf.front().unwrap().seq;
-        let newest_seq = inner.buf.back().unwrap().seq;
 
-        // If caller is behind the oldest entry, return everything so they
-        // can rebuild their local cache.
+        let mut iter = ring.iter();
+        let oldest_seq = iter.next().map(|l| l.seq).unwrap_or(0);
+        // We consumed one item from iter; we need to check it too,
+        // so collect from the ring's iter directly instead.
+        drop(iter);
+
+        let newest_seq = ring.next_seq - 1;
+
+        // Fast path: caller is up to date.
+        if after_seq >= newest_seq {
+            return DrainResult {
+                lines: Vec::new(),
+                oldest_seq,
+                newest_seq,
+            };
+        }
+
+        // If caller is behind the oldest entry, return everything so
+        // they can rebuild their local cache.
         let effective_after = if after_seq < oldest_seq {
             0
         } else {
             after_seq
         };
 
-        let lines: Vec<LogLine> = inner
-            .buf
+        let lines: Vec<LogLine> = ring
             .iter()
             .filter(|l| l.seq > effective_after)
             .cloned()
