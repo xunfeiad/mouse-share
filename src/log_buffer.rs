@@ -161,12 +161,7 @@ impl LogBuffer {
             };
         }
 
-        let mut iter = ring.iter();
-        let oldest_seq = iter.next().map(|l| l.seq).unwrap_or(0);
-        // We consumed one item from iter; we need to check it too,
-        // so collect from the ring's iter directly instead.
-        drop(iter);
-
+        let oldest_seq = ring.iter().next().map(|l| l.seq).unwrap_or(0);
         let newest_seq = ring.next_seq - 1;
 
         // Fast path: caller is up to date.
