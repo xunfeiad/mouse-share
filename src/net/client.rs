@@ -121,11 +121,20 @@ impl Client {
                 break 'evt Ok(());
             }
 
-            // Send heartbeat
+            // Send heartbeat + check server liveness (once per second)
             if last_heartbeat.elapsed() > Duration::from_secs(1) {
                 let hb = protocol::serialize(&Message::Heartbeat)?;
                 let _ = socket.send_to(&hb, &self.server_addr);
                 last_heartbeat = Instant::now();
+
+                // If no heartbeat received from server for >5 s, presume
+                // it's offline and stop gracefully.
+                let last_hb = state.last_heartbeat_ms.load(Ordering::SeqCst);
+                if last_hb > 0 && now_ms() - last_hb > 5000 {
+                    log::warn!("No heartbeat from server for >5 s, disconnecting");
+                    state.set_error("Server offline (heartbeat timeout)".to_string());
+                    break 'evt Ok(());
+                }
             }
 
             // Accumulate Move deltas across every packet we can drain in
