@@ -213,6 +213,18 @@ pub fn hide_local_cursor() {
 /// show_cursor after startup will unstick it instead of requiring a
 /// logout.
 pub fn show_local_cursor() {
+    show_local_cursor_inner(true);
+}
+
+/// Show the cursor without restoring to the previously saved position.
+/// Used by the client Enter path where we're about to warp to the entry
+/// point — restoring to the stale position from the last hide would
+/// override the warp.
+pub fn show_local_cursor_no_restore() {
+    show_local_cursor_inner(false);
+}
+
+fn show_local_cursor_inner(restore_position: bool) {
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGDisplay;
@@ -234,13 +246,14 @@ pub fn show_local_cursor() {
         // Restore the cursor to where it physically was before the
         // matching `hide_local_cursor` call — otherwise the user sees
         // the cursor jump to (1,1) when control returns to the server,
-        // which is jarring. If we have no saved position (first-ever
-        // show, or hide failed to sample it), leave the cursor
-        // wherever it currently is.
+        // which is jarring. Skipped when `restore_position` is false
+        // (client Enter path — the caller will warp to the entry point).
         let saved = CURSOR_RESTORE_POS.lock().ok().and_then(|mut g| g.take());
-        if let Some((x, y)) = saved {
-            if let Err(e) = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x, y)) {
-                log::warn!("post-show restore warp failed: {:?}", e);
+        if restore_position {
+            if let Some((x, y)) = saved {
+                if let Err(e) = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x, y)) {
+                    log::warn!("post-show restore warp failed: {:?}", e);
+                }
             }
         }
 

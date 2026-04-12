@@ -203,11 +203,15 @@ impl Client {
                                 state.mouse_on_peer.store(true, Ordering::SeqCst);
                                 sim_x = x;
                                 sim_y = y;
+                                log::info!("Mouse entered at ({:.0}, {:.0})", x, y);
                                 if cursor_hidden {
-                                    capture::show_local_cursor();
+                                    // Show cursor WITHOUT restoring the saved
+                                    // position — we're about to warp to the
+                                    // entry point, so the restore would fight
+                                    // with move_to.
+                                    capture::show_local_cursor_no_restore();
                                     cursor_hidden = false;
                                 }
-                                log::info!("Mouse entered at ({:.0}, {:.0})", x, y);
                                 if let Err(e) = simulator.move_to(x, y) {
                                     log::error!("Failed to move cursor: {}", e);
                                 }
