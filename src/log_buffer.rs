@@ -1,14 +1,17 @@
-//! A ring-buffer `log::Log` implementation so the GUI can render the recent
-//! log stream in its Log tab. It also forwards every record to an inner
-//! `env_logger` so the terminal output is unchanged.
+//! A `log::Log` implementation backed by `tokio::mpsc::channel(1000)`.
+//!
+//! Logger threads call `try_send()` (lock-free CAS) to push log lines into
+//! the channel. The UI thread calls `drain()` to batch-receive all pending
+//! messages into its own `Vec` — no shared Mutex, no ring buffer scanning,
+//! no seq tracking. The channel's bounded capacity (1000) provides natural
+//! back-pressure: if the UI falls behind, the oldest unsent messages are
+//! dropped by `try_send` returning `Full`.
+//!
+//! This replaces the previous `Mutex<Ring>` + `drain_since(seq)` design.
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, OnceLock};
-
-/// How many records to keep in memory. ~2 KB per line × 1000 ≈ 2 MB worst
-/// case, which is fine for a long-running desktop session.
-const CAPACITY: usize = 1000;
+use std::sync::OnceLock;
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
 pub struct LogLine {
@@ -18,42 +21,45 @@ pub struct LogLine {
     pub message: String,
 }
 
-/// In-memory ring buffer. Cloneable (`Arc` internally) so both the UI and
-/// the logger can hold references.
-#[derive(Clone, Default)]
-pub struct LogBuffer {
-    inner: Arc<Mutex<VecDeque<LogLine>>>,
+/// The sender half, held by `TeeLogger`. Cloneable so the global logger
+/// (which must be `Send + Sync + 'static`) can hand out copies.
+#[derive(Clone)]
+struct LogSender {
+    tx: mpsc::Sender<LogLine>,
 }
 
-impl LogBuffer {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(VecDeque::with_capacity(CAPACITY))),
+/// The receiver half, held by the UI. NOT Clone — exactly one consumer.
+pub struct LogReceiver {
+    rx: mpsc::Receiver<LogLine>,
+}
+
+impl LogReceiver {
+    /// Drain all pending log lines from the channel into `out`.
+    /// Non-blocking: returns immediately when the channel is empty.
+    /// Typical per-frame cost: 0–2 moves, zero allocation (appends to
+    /// caller's existing Vec).
+    pub fn drain(&mut self, out: &mut Vec<LogLine>) {
+        while let Ok(line) = self.rx.try_recv() {
+            out.push(line);
         }
     }
+}
 
-    pub fn push(&self, line: LogLine) {
-        let mut buf = self.inner.lock().unwrap();
-        if buf.len() == CAPACITY {
-            buf.pop_front();
-        }
-        buf.push_back(line);
-    }
-
-    /// Snapshot the current buffer as a `Vec`. Called by the UI on each
-    /// repaint — cost is linear in buffer length, which is capped.
-    pub fn snapshot(&self) -> Vec<LogLine> {
-        let buf = self.inner.lock().unwrap();
-        buf.iter().cloned().collect()
-    }
+/// Create the channel pair. Called once at startup.
+fn create_channel() -> (LogSender, LogReceiver) {
+    let (tx, rx) = mpsc::channel(1000);
+    (LogSender { tx }, LogReceiver { rx })
 }
 
 /// A `log::Log` implementation that writes to both `env_logger` (for
-/// stderr) and an in-memory ring buffer (for the GUI).
+/// stderr) and a `tokio::mpsc` channel (for the GUI).
 struct TeeLogger {
     inner: env_logger::Logger,
-    buffer: LogBuffer,
+    sender: LogSender,
 }
+
+// Safety: env_logger::Logger is Send+Sync, mpsc::Sender is Send+Sync.
+unsafe impl Sync for TeeLogger {}
 
 impl Log for TeeLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
@@ -65,7 +71,11 @@ impl Log for TeeLogger {
             return;
         }
         self.inner.log(record);
-        self.buffer.push(LogLine {
+        // try_send is non-blocking. If the channel is full (UI not
+        // draining fast enough), we silently drop the line — this is
+        // the back-pressure policy. No lock, no allocation beyond the
+        // String that record.args().to_string() already requires.
+        let _ = self.sender.tx.try_send(LogLine {
             ts_ms: now_ms(),
             level: record.level(),
             message: record.args().to_string(),
@@ -77,49 +87,44 @@ impl Log for TeeLogger {
     }
 }
 
-/// Global singleton so the UI can access the shared log buffer without
-/// plumbing it through every callsite.
-static GLOBAL: OnceLock<LogBuffer> = OnceLock::new();
+/// Global singleton for the receiver. The UI takes it once via `take_receiver()`.
+static RECEIVER: OnceLock<std::sync::Mutex<Option<LogReceiver>>> = OnceLock::new();
 
 /// Install the tee logger as the global `log` backend. Safe to call more
-/// than once — subsequent calls are no-ops. Returns the shared ring buffer.
-pub fn install() -> LogBuffer {
-    if let Some(existing) = GLOBAL.get() {
-        return existing.clone();
-    }
+/// than once — subsequent calls are no-ops.
+pub fn install() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let (sender, receiver) = create_channel();
 
-    let buffer = LogBuffer::new();
-    let inner = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .format_timestamp_millis()
-    .build();
-    let filter = inner.filter();
+        // Stash the receiver for the UI to claim later.
+        let _ = RECEIVER.set(std::sync::Mutex::new(Some(receiver)));
 
-    let tee = TeeLogger {
-        inner,
-        buffer: buffer.clone(),
-    };
+        let inner = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or("info"),
+        )
+        .format_timestamp_millis()
+        .build();
+        let filter = inner.filter();
 
-    if log::set_boxed_logger(Box::new(tee)).is_ok() {
-        log::set_max_level(filter);
-    } else {
-        // Another logger was installed before us — fall back to the
-        // buffer-only logger without the env_logger forward.
-        log::set_max_level(LevelFilter::Info);
-    }
+        let tee = TeeLogger { inner, sender };
 
-    let _ = GLOBAL.set(buffer.clone());
-    buffer
+        if log::set_boxed_logger(Box::new(tee)).is_ok() {
+            log::set_max_level(filter);
+        } else {
+            log::set_max_level(LevelFilter::Info);
+        }
+    });
 }
 
-/// Fetch the global log buffer, installing the logger on first call.
-pub fn global() -> LogBuffer {
-    if let Some(existing) = GLOBAL.get() {
-        existing.clone()
-    } else {
-        install()
-    }
+/// Take the log receiver. Returns `Some` on the first call, `None` after
+/// that (there is exactly one consumer). The UI calls this at startup.
+pub fn take_receiver() -> Option<LogReceiver> {
+    install(); // ensure logger is installed
+    RECEIVER
+        .get()
+        .and_then(|m| m.lock().ok())
+        .and_then(|mut guard| guard.take())
 }
 
 fn now_ms() -> u64 {
