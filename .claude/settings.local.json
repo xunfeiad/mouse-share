@@ -19,7 +19,12 @@
       "Bash(ls -lt ~/Downloads/*.png)",
       "Bash(kill 71355)",
       "Bash(kill 82875)",
-      "Bash(pkill -f mouse-share-ui)"
+      "Bash(pkill -f mouse-share-ui)",
+      "Bash(MOUSE_SHARE_UI_LANG=zh timeout 2 ./target/release/mouse-share-ui)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(RUST_LOG=info timeout 2 \"dist/mouse share.app/Contents/MacOS/mouse-share\" server --port 45999)",
+      "Bash(find ~/.cargo/registry/src -maxdepth 4 -type d -name core-graphics-0.24*)",
+      "Bash(find /Users/xunfei/.cargo/registry/src -maxdepth 4 -type d -name foreign-types*)"
     ]
   }
 }

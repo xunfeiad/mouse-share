@@ -22,7 +22,7 @@ use eframe::egui::{
 use mouse_share::{
     config as msc,
     input::capture as input_capture,
-    log_buffer::{self, LogLine},
+    log_buffer::{self, LogLine, LogReceiver},
     net::{client::Client as BeClient, server::Server as BeServer, SharedState},
 };
 use std::sync::atomic::Ordering;
@@ -38,13 +38,16 @@ fn main() -> eframe::Result<()> {
     // Install the tee logger so env_logger output AND the in-memory ring
     // buffer (for the Log tab) both receive every record. Safe to call more
     // than once — subsequent calls are no-ops.
-    let _ = log_buffer::install();
+    log_buffer::install();
 
     // Promote to a foreground app so CGDisplayHideCursor takes effect when
     // the server hides the local cursor. Without this the .app bundle still
     // works, but bare `cargo run` from a terminal would be a background
     // process and silently no-op the hide.
     input_capture::promote_to_foreground_app();
+    // Defensive unstick in case a previous run crashed with the cursor
+    // hidden or mouse/cursor association off. No-op on a healthy system.
+    input_capture::restore_cursor_state_on_startup();
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -163,7 +166,6 @@ struct Strings {
 
     // Server / connected
     pill_connected: &'static str,
-    label_events: &'static str,
     label_up: &'static str,
     toggle_clipboard_sync: &'static str,
     toggle_keyboard_fwd: &'static str,
@@ -214,7 +216,6 @@ struct Strings {
     pill_connecting: &'static str,
     text_attempt: &'static str,
     status_retry: &'static str,
-    btn_cancel: &'static str,
 
     // Client / mouse on server
     label_mouse_here: &'static str,
@@ -295,7 +296,6 @@ const EN: Strings = Strings {
     btn_stop_server: "Stop server",
 
     pill_connected: "Connected",
-    label_events: "Events",
     label_up: "Up",
     toggle_clipboard_sync: "Clipboard sync",
     toggle_keyboard_fwd: "Keyboard fwd",
@@ -341,7 +341,6 @@ const EN: Strings = Strings {
     pill_connecting: "Connecting",
     text_attempt: "attempt 3/10",
     status_retry: "Retry",
-    btn_cancel: "Cancel",
 
     label_mouse_here: "Mouse here",
     label_standby: "Standby",
@@ -417,7 +416,6 @@ const ZH: Strings = Strings {
     btn_stop_server: "停止服务",
 
     pill_connected: "已连接",
-    label_events: "事件数",
     label_up: "时长",
     toggle_clipboard_sync: "剪贴板同步",
     toggle_keyboard_fwd: "转发键盘",
@@ -463,7 +461,6 @@ const ZH: Strings = Strings {
     pill_connecting: "连接中",
     text_attempt: "尝试 3/10",
     status_retry: "重试",
-    btn_cancel: "取消",
 
     label_mouse_here: "鼠标在此",
     label_standby: "待机",
@@ -745,6 +742,12 @@ struct App {
     pending_action: Option<Action>,
     /// Dev switcher visibility (set by `MOUSE_SHARE_UI_DEV=1`).
     dev_mode: bool,
+
+    // --- Log (channel-based) ---
+    /// Receiver half of the tokio::mpsc log channel. Taken once at startup.
+    log_rx: Option<LogReceiver>,
+    /// Local log storage, owned exclusively by the UI thread.
+    log_cache: Vec<LogLine>,
 }
 
 impl App {
@@ -934,14 +937,6 @@ impl App {
         format_duration(secs)
     }
 
-    fn events_display(&self) -> String {
-        let n = self.shared.events_total.load(Ordering::SeqCst);
-        if n >= 1000 {
-            format!("{:.1}k", n as f64 / 1000.0)
-        } else {
-            n.to_string()
-        }
-    }
 }
 
 fn format_duration(secs: u64) -> String {
@@ -980,6 +975,8 @@ impl Default for App {
             dev_mode: std::env::var("MOUSE_SHARE_UI_DEV")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            log_rx: log_buffer::take_receiver(),
+            log_cache: Vec::new(),
         };
         // Dev hook: start in a specific visual state for screenshotting.
         if let Ok(s) = std::env::var("MOUSE_SHARE_UI_STATE") {
@@ -1076,22 +1073,111 @@ fn card(ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
 
 fn title_bar(ui: &mut Ui, title: &str) {
     ui.horizontal(|ui| {
-        // Traffic lights — ghost/muted style to match mockup
+        // Traffic lights — functional close/minimize/maximize buttons.
+        // The eframe window is created with `with_decorations(false)` so the
+        // real macOS traffic lights aren't drawn; we paint our own and wire
+        // them to ViewportCommand so minimize/maximize/close actually work.
         let (rect, _) = ui.allocate_exact_size(Vec2::new(52.0, 14.0), Sense::hover());
         let y = rect.center().y;
         let colors = [theme::TL_RED, theme::TL_YELLOW, theme::TL_GREEN];
+        // Hover any dot → all three show their glyph (matches macOS).
+        let any_hover = (0..3).any(|i| {
+            let x = rect.left() + 7.0 + i as f32 * 16.0;
+            let hit = Rect::from_center_size(egui::pos2(x, y), Vec2::splat(14.0));
+            ui.rect_contains_pointer(hit)
+        });
         for (i, c) in colors.iter().enumerate() {
             let x = rect.left() + 7.0 + i as f32 * 16.0;
+            let center = egui::pos2(x, y);
+            let hit = Rect::from_center_size(center, Vec2::splat(14.0));
+            let resp = ui
+                .interact(hit, ui.id().with(("tl", i)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.clicked() {
+                match i {
+                    0 => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    1 => ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    _ => {
+                        // Toggle maximize. egui tracks this via ViewportInfo.
+                        let is_max = ui
+                            .ctx()
+                            .input(|i| i.viewport().maximized.unwrap_or(false));
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                    }
+                }
+            }
             ui.painter().circle(
-                egui::pos2(x, y),
+                center,
                 5.5,
                 *c,
                 Stroke::new(1.0, theme::TL_STROKE),
             );
+            // On hover, overlay the macOS-style glyph: × / − / +
+            if any_hover {
+                let glyph_color = Color32::from_rgba_unmultiplied(0, 0, 0, 180);
+                let p = ui.painter();
+                match i {
+                    0 => {
+                        // ×
+                        let d = 2.5;
+                        p.line_segment(
+                            [egui::pos2(x - d, y - d), egui::pos2(x + d, y + d)],
+                            Stroke::new(1.2, glyph_color),
+                        );
+                        p.line_segment(
+                            [egui::pos2(x - d, y + d), egui::pos2(x + d, y - d)],
+                            Stroke::new(1.2, glyph_color),
+                        );
+                    }
+                    1 => {
+                        // −
+                        p.line_segment(
+                            [egui::pos2(x - 3.0, y), egui::pos2(x + 3.0, y)],
+                            Stroke::new(1.4, glyph_color),
+                        );
+                    }
+                    _ => {
+                        // + (simple zoom indicator)
+                        p.line_segment(
+                            [egui::pos2(x - 2.8, y), egui::pos2(x + 2.8, y)],
+                            Stroke::new(1.2, glyph_color),
+                        );
+                        p.line_segment(
+                            [egui::pos2(x, y - 2.8), egui::pos2(x, y + 2.8)],
+                            Stroke::new(1.2, glyph_color),
+                        );
+                    }
+                }
+            }
         }
-        // Centered title
+
+        // Centered icon + title. Compute the combined width so the pair
+        // stays visually centered in the available space, accounting for
+        // the traffic-light block on the left.
+        let title_font = FontId::new(13.0, egui::FontFamily::Proportional);
+        let title_w = ui.fonts(|f| {
+            f.layout_no_wrap(title.into(), title_font.clone(), theme::TEXT_MUTED)
+                .size()
+                .x
+        });
+        const ICON_W: f32 = 16.0;
+        const GAP: f32 = 7.0;
+        let total_w = ICON_W + GAP + title_w;
         let avail = ui.available_width();
-        ui.add_space((avail - ui.fonts(|f| f.layout_no_wrap(title.into(), FontId::new(13.0, egui::FontFamily::Proportional), theme::TEXT_MUTED)).size().x) / 2.0 - 26.0);
+        ui.add_space(((avail - total_w) / 2.0 - 26.0).max(0.0));
+
+        // App icon — classic NW-pointing mouse cursor silhouette in
+        // primary green. Directly communicates "mouse" which is in the
+        // product name and scales cleanly at small sizes because it's
+        // a single filled polygon rather than multiple tiny strokes.
+        let (icon_rect, _) =
+            ui.allocate_exact_size(Vec2::new(ICON_W, 16.0), Sense::hover());
+        draw_app_icon(ui.painter(), icon_rect);
+        ui.add_space(GAP - ui.spacing().item_spacing.x);
+
         ui.label(
             RichText::new(title)
                 .size(13.0)
@@ -1099,6 +1185,54 @@ fn title_bar(ui: &mut Ui, title: &str) {
         );
     });
     ui.add_space(12.0);
+}
+
+/// Draw the mouse-share app icon: a filled mouse-cursor (pointer arrow)
+/// silhouette. Vector-drawn so it scales cleanly and doesn't need a
+/// bundled image asset.
+///
+/// Why this shape and not "two screens + arrow": the earlier stroked
+/// two-rects-and-an-arrow rendering collapsed into an unreadable blob at
+/// 18×18 px because a 1.4 px stroke on a 6.5×5 rect leaves almost no
+/// interior, and the arrowhead strokes merged with the rectangles. A
+/// single filled polygon has no such problem — it renders crisply at
+/// small sizes.
+fn draw_app_icon(painter: &eframe::egui::Painter, rect: Rect) {
+    use eframe::egui::Pos2;
+
+    let color = theme::PRIMARY;
+
+    // Normalized cursor shape in a 0..10 × 0..14 box. These points trace
+    // the classic NW-pointing pointer: tip at top-left, a long diagonal
+    // right edge, a short notch inward, a vertical tail, a small notch
+    // back out, and the left edge closing up to the tip. Order matters —
+    // must form a simple (non-self-intersecting) polygon for fills to
+    // render correctly.
+    let norm: [(f32, f32); 7] = [
+        (0.0, 0.0),   // tip
+        (0.0, 10.5),  // bottom of left edge
+        (2.8, 8.0),   // inward notch (heel of the arrow)
+        (5.0, 12.5),  // tail bottom-left
+        (6.5, 11.8),  // tail bottom-right
+        (4.3, 7.3),   // inward notch on the right
+        (8.0, 6.5),   // rightmost point of the arrowhead
+    ];
+
+    // Fit the normalized shape into `rect` while preserving aspect ratio.
+    // The normalized box is 8×12.5, so the cursor is taller than wide —
+    // we pad horizontally to keep it centered.
+    let scale = (rect.height() / 14.0).min(rect.width() / 10.0);
+    let draw_w = 10.0 * scale;
+    let draw_h = 14.0 * scale;
+    let ox = rect.center().x - draw_w / 2.0;
+    let oy = rect.center().y - draw_h / 2.0;
+
+    let points: Vec<Pos2> = norm
+        .iter()
+        .map(|(x, y)| Pos2::new(ox + x * scale, oy + y * scale))
+        .collect();
+
+    painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
 }
 
 fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
@@ -1118,7 +1252,8 @@ fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
             };
             let text = RichText::new(label).size(14.0).color(color);
             let resp = ui
-                .add(egui::Label::new(text).sense(Sense::click()));
+                .add(egui::Label::new(text).sense(Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
             if resp.clicked() {
                 *tab = t;
             }
@@ -1184,43 +1319,176 @@ fn field_pair(ui: &mut Ui, l1: &str, v1: &str, l2: &str, v2: &str) {
     });
 }
 
-fn field_quad(ui: &mut Ui, labels: [(&str, &str); 4]) {
-    ui.columns(4, |cols| {
+fn field_trio(ui: &mut Ui, labels: [(&str, &str); 3]) {
+    ui.columns(3, |cols| {
         for (i, (l, v)) in labels.iter().enumerate() {
             field(&mut cols[i], l, v);
         }
     });
 }
 
+/// Full-width button with custom paint. `egui::Button::new(text).min_size(...)`
+/// left-aligns its text when the button is wider than the text — users
+/// reported "the button text is stuck to the left". We paint the rect and
+/// text manually so the text lands at `Align2::CENTER_CENTER` regardless of
+/// width, and we get a single code path for hover / pressed states shared
+/// by every flat button in the UI.
+fn paint_button(
+    ui: &mut Ui,
+    text: &str,
+    fill: Color32,
+    hover_fill: Color32,
+    press_fill: Color32,
+    border: Stroke,
+    text_color: Color32,
+    strong: bool,
+) -> Response {
+    use eframe::egui::{Align2, FontFamily};
+
+    let size = Vec2::new(ui.available_width(), 36.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    let bg = if resp.is_pointer_button_down_on() {
+        press_fill
+    } else if resp.hovered() {
+        hover_fill
+    } else {
+        fill
+    };
+    let painter = ui.painter();
+    painter.rect(rect, Rounding::same(10.0), bg, border);
+
+    // egui's default proportional font has no separate "bold" face, so
+    // `RichText::strong()` just tints darker. For our custom-painted
+    // buttons we approximate bold by over-painting at a 0.5 px offset —
+    // the rasterizer antialiasing thickens the strokes.
+    let font = FontId::new(13.0, FontFamily::Proportional);
+    let center = rect.center();
+    painter.text(center, Align2::CENTER_CENTER, text, font.clone(), text_color);
+    if strong {
+        painter.text(
+            center + Vec2::new(0.5, 0.0),
+            Align2::CENTER_CENTER,
+            text,
+            font,
+            text_color,
+        );
+    }
+    resp
+}
+
 fn primary_button(ui: &mut Ui, text: &str) -> Response {
-    let btn = egui::Button::new(
-        RichText::new(text).size(13.0).color(Color32::WHITE).strong(),
+    paint_button(
+        ui,
+        text,
+        theme::PRIMARY,
+        Color32::from_rgb(58, 168, 116),
+        Color32::from_rgb(36, 132, 86),
+        Stroke::NONE,
+        Color32::WHITE,
+        true,
     )
-    .fill(theme::PRIMARY)
-    .stroke(Stroke::NONE)
-    .rounding(Rounding::same(10.0))
-    .min_size(Vec2::new(ui.available_width(), 36.0));
-    ui.add(btn)
 }
 
 fn danger_button(ui: &mut Ui, text: &str) -> Response {
-    let btn = egui::Button::new(
-        RichText::new(text).size(13.0).color(theme::DANGER).strong(),
+    paint_button(
+        ui,
+        text,
+        theme::CARD_BG,
+        theme::DANGER_SOFT,
+        Color32::from_rgb(250, 220, 222),
+        Stroke::new(1.0, theme::DANGER_SOFT_BORDER),
+        theme::DANGER,
+        true,
     )
-    .fill(theme::CARD_BG)
-    .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
-    .rounding(Rounding::same(10.0))
-    .min_size(Vec2::new(ui.available_width(), 36.0));
-    ui.add(btn)
 }
 
 fn ghost_button(ui: &mut Ui, text: &str) -> Response {
-    let btn = egui::Button::new(RichText::new(text).size(13.0).color(theme::TEXT))
-        .fill(theme::CARD_BG)
-        .stroke(Stroke::new(1.0, theme::CARD_BORDER))
-        .rounding(Rounding::same(10.0))
-        .min_size(Vec2::new(ui.available_width(), 36.0));
-    ui.add(btn)
+    paint_button(
+        ui,
+        text,
+        theme::CARD_BG,
+        theme::FIELD_BG,
+        theme::FIELD_BORDER,
+        Stroke::new(1.0, theme::CARD_BORDER),
+        theme::TEXT,
+        false,
+    )
+}
+
+/// Solid-red "Stop server" button with a pulsing white dot on the left
+/// indicating the service is actively running. Used when a session is live
+/// — the dot's pulse gives a subtle heartbeat cue so the user can tell at
+/// a glance that the backend is alive even when there's no visible
+/// activity (e.g. no events flowing at the moment).
+///
+/// The pulse is driven directly off `ctx.input(|i| i.time)` rather than a
+/// stored phase, so the animation stays smooth across repaints. We request
+/// a short follow-up repaint (~33 ms → ~30 fps) so the pulse keeps ticking
+/// even when the rest of the UI is idle.
+fn stop_running_button(ui: &mut Ui, text: &str) -> Response {
+    use eframe::egui::{Align2, FontFamily, Pos2};
+
+    let size = Vec2::new(ui.available_width(), 36.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    // Drive pulse off wall-clock. 1.2 s period is slow enough to read as
+    // a heartbeat rather than strobing, fast enough to feel alive.
+    let time = ui.ctx().input(|i| i.time);
+    let pulse = ((time * std::f64::consts::TAU / 1.2).sin() * 0.5 + 0.5) as f32;
+    // Keep the animation moving even during otherwise-idle frames.
+    ui.ctx().request_repaint_after(Duration::from_millis(33));
+
+    // Base fill darkens slightly on hover / press so the button still
+    // feels interactive despite the custom paint.
+    let base_fill = if resp.is_pointer_button_down_on() {
+        Color32::from_rgb(180, 30, 42)
+    } else if resp.hovered() {
+        Color32::from_rgb(226, 52, 64)
+    } else {
+        theme::DANGER
+    };
+
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        Rounding::same(10.0),
+        base_fill,
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
+    );
+
+    // Pulsing dot on the left. Radius breathes between 3.5 and 5.5 px;
+    // alpha breathes in lockstep so the dot feels like it's glowing rather
+    // than just expanding.
+    let dot_center = Pos2::new(rect.left() + 16.0, rect.center().y);
+    let dot_radius = 3.5 + pulse * 2.0;
+    let dot_alpha = 140 + (pulse * 115.0) as u8;
+    let dot_color = Color32::from_rgba_unmultiplied(255, 255, 255, dot_alpha);
+    painter.circle_filled(dot_center, dot_radius, dot_color);
+    // Soft outer ring for the "running" glow effect.
+    let ring_alpha = ((1.0 - pulse) * 90.0) as u8;
+    if ring_alpha > 0 {
+        painter.circle_stroke(
+            dot_center,
+            dot_radius + 2.0 + pulse * 2.5,
+            Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, ring_alpha),
+            ),
+        );
+    }
+
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::new(13.0, FontFamily::Proportional),
+        Color32::WHITE,
+    );
+
+    resp
 }
 
 /// Draw a "screen" card — a rectangle with resolution text, used in the
@@ -1343,6 +1611,7 @@ fn toggle(ui: &mut Ui, label: &str, value: &mut bool) {
 fn toggle_switch(ui: &mut Ui, on: &mut bool) -> Response {
     let desired = Vec2::new(36.0, 20.0);
     let (rect, mut resp) = ui.allocate_exact_size(desired, Sense::click());
+    resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
@@ -1482,7 +1751,7 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
     });
     ui.add_space(6.0);
     if running {
-        if danger_button(ui, s.btn_stop_server).clicked() {
+        if stop_running_button(ui, s.btn_stop_server).clicked() {
             app.pending_action = Some(Action::StopSession);
         }
     } else {
@@ -1501,7 +1770,6 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
 fn server_connected(ui: &mut Ui, app: &mut App) {
     let s = app.s();
     let peer = app.peer_addr_display();
-    let events = app.events_display();
     let uptime = app.uptime_display();
     ui.horizontal(|ui| {
         pill(ui, s.pill_connected, theme::PRIMARY, theme::PRIMARY_SOFT);
@@ -1528,12 +1796,11 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
     ui.add_space(18.0);
     let port_str = app.port.clone();
     let edge_str = app.edge.label(s);
-    field_quad(
+    field_trio(
         ui,
         [
             (s.label_port, port_str.as_str()),
             (s.label_edge, edge_str),
-            (s.label_events, events.as_str()),
             (s.label_up, uptime.as_str()),
         ],
     );
@@ -1541,7 +1808,7 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
     toggle(ui, s.toggle_clipboard_sync, &mut app.clipboard_sync);
     toggle(ui, s.toggle_keyboard_fwd, &mut app.keyboard_fwd);
     ui.add_space(4.0);
-    if danger_button(ui, s.btn_stop_server).clicked() {
+    if stop_running_button(ui, s.btn_stop_server).clicked() {
         app.pending_action = Some(Action::StopSession);
     }
 }
@@ -1869,7 +2136,10 @@ fn edge_picker(ui: &mut Ui, edge: &mut Edge, s: &Strings) {
                     });
                 })
                 .response;
-            if resp.interact(Sense::click()).clicked() {
+            let resp = resp
+                .interact(Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            if resp.clicked() {
                 *edge = *e;
             }
         }
@@ -1914,7 +2184,7 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
         );
     });
     ui.add_space(10.0);
-    if danger_button(ui, s.btn_cancel).clicked() {
+    if danger_button(ui, s.btn_disconnect).clicked() {
         app.pending_action = Some(Action::StopSession);
     }
 }
@@ -1922,7 +2192,6 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
 fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
     let s = app.s();
     let peer = app.peer_addr_display();
-    let events = app.events_display();
     let uptime = app.uptime_display();
     ui.horizontal(|ui| {
         pill(ui, s.pill_connected, theme::PRIMARY, theme::PRIMARY_SOFT);
@@ -1958,11 +2227,10 @@ fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
             );
         });
     ui.add_space(8.0);
-    field_quad(
+    field_trio(
         ui,
         [
             (s.label_edge, app.client_edge.label(s)),
-            (s.label_events, events.as_str()),
             (s.label_keys, "—"),
             (s.label_uptime, uptime.as_str()),
         ],
@@ -1976,7 +2244,6 @@ fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
 fn client_mouse_active(ui: &mut Ui, app: &mut App) {
     let s = app.s();
     let peer = app.peer_addr_display();
-    let events = app.events_display();
     let uptime = app.uptime_display();
     ui.horizontal(|ui| {
         pill(ui, s.pill_receiving_input, theme::INFO, theme::INFO_SOFT);
@@ -2012,11 +2279,10 @@ fn client_mouse_active(ui: &mut Ui, app: &mut App) {
             );
         });
     ui.add_space(8.0);
-    field_quad(
+    field_trio(
         ui,
         [
             (s.label_edge, app.client_edge.label(s)),
-            (s.label_events, events.as_str()),
             (s.label_keys, "—"),
             (s.label_uptime, uptime.as_str()),
         ],
@@ -2115,13 +2381,24 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
 
 fn log_tab(ui: &mut Ui, app: &mut App) {
     let s = app.s();
-    let lines = log_buffer::global().snapshot();
+
+    // Drain new log lines from the channel into our local cache.
+    // try_recv is non-blocking — moves messages without cloning.
+    if let Some(rx) = &mut app.log_rx {
+        rx.drain(&mut app.log_cache);
+    }
+    // Cap local storage to 1000 entries.
+    const LOG_CAPACITY: usize = 1000;
+    if app.log_cache.len() > LOG_CAPACITY {
+        app.log_cache.drain(..app.log_cache.len() - LOG_CAPACITY);
+    }
+    let lines = &app.log_cache;
 
     // Counts per level, used for the filter chips.
     let mut info_count = 0usize;
     let mut warn_count = 0usize;
     let mut err_count = 0usize;
-    for l in &lines {
+    for l in lines {
         match l.level {
             log::Level::Info | log::Level::Debug | log::Level::Trace => info_count += 1,
             log::Level::Warn => warn_count += 1,
@@ -2167,22 +2444,35 @@ fn log_tab(ui: &mut Ui, app: &mut App) {
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(260.0)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    if lines.is_empty() {
-                        ui.label(
-                            RichText::new("—")
-                                .size(12.0)
-                                .color(theme::TEXT_SUBTLE),
-                        );
-                    } else {
-                        for line in &lines {
-                            render_log_line(ui, line, s);
+            if lines.is_empty() {
+                ui.label(
+                    RichText::new("—")
+                        .size(12.0)
+                        .color(theme::TEXT_SUBTLE),
+                );
+            } else {
+                // Compute row height from the actual text style +
+                // spacing so virtual scrolling aligns correctly.
+                // log_entry uses 12pt as the tallest text; the Frame
+                // badge adds 2×1px inner margin. show_rows adds
+                // item_spacing.y between rows automatically, so we
+                // pass the height WITHOUT spacing.
+                let row_height = ui.text_style_height(&egui::TextStyle::Body)
+                    .max(14.0); // floor at 14px in case body font is tiny
+
+                // Virtual scrolling: egui only calls the closure with
+                // the visible row range, allocating placeholder space
+                // for the rest. Drops per-frame widget count from
+                // ~3000 to ~45.
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .stick_to_bottom(true)
+                    .show_rows(ui, row_height, total, |ui, row_range| {
+                        for i in row_range {
+                            render_log_line(ui, &lines[i], s);
                         }
-                    }
-                });
+                    });
+            }
         });
     ui.add_space(8.0);
     ui.horizontal(|ui| {

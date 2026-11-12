@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Copy, PartialEq, Eq)]
 pub enum MouseButton {
@@ -9,22 +8,15 @@ pub enum MouseButton {
     Other(u8),
 }
 
+/// A mouse event. Each variant carries exactly the data it needs:
+/// - `Move` / `Scroll`: directional deltas.
+/// - `ButtonDown` / `ButtonUp`: which button changed state.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum MouseEventType {
-    Move,
+pub enum MouseEvent {
+    Move { dx: f64, dy: f64 },
     ButtonDown(MouseButton),
     ButtonUp(MouseButton),
     Scroll { dx: f64, dy: f64 },
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MouseEvent {
-    /// Relative movement delta
-    pub dx: f64,
-    pub dy: f64,
-    pub event_type: MouseEventType,
-    /// Monotonic timestamp in microseconds
-    pub timestamp_us: u64,
 }
 
 /// A keyboard key press / release. Keycodes are platform-native:
@@ -63,23 +55,17 @@ pub enum Message {
     Heartbeat,
 }
 
-impl MouseEvent {
-    pub fn now(dx: f64, dy: f64, event_type: MouseEventType) -> Self {
-        let timestamp_us = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-        Self {
-            dx,
-            dy,
-            event_type,
-            timestamp_us,
-        }
-    }
-}
-
 pub fn serialize(msg: &Message) -> anyhow::Result<Vec<u8>> {
     Ok(bincode::serialize(msg)?)
+}
+
+/// Serialize `msg` into `buf`, reusing the buffer's existing capacity.
+/// Used on the server hot path to avoid allocating a fresh `Vec<u8>` per
+/// forwarded mouse event. `buf` is cleared first, then written into.
+pub fn serialize_into(buf: &mut Vec<u8>, msg: &Message) -> anyhow::Result<()> {
+    buf.clear();
+    bincode::serialize_into(&mut *buf, msg)?;
+    Ok(())
 }
 
 pub fn deserialize(data: &[u8]) -> anyhow::Result<Message> {

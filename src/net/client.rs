@@ -1,7 +1,7 @@
 use crate::input::{capture, simulate};
 use crate::net::state::{now_ms, SharedState};
-use crate::protocol::{self, Message, MouseEventType};
-use crate::screen::get_screen_info;
+use crate::protocol::{self, Message, MouseEvent};
+use crate::screen::{get_display_refresh_hz, get_screen_info};
 use anyhow::Result;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +24,12 @@ impl Client {
 
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
+        // Enlarge the kernel receive buffer. With the default macOS UDP
+        // buffer (~40 KiB) a burst from a 1000 Hz gaming mouse can briefly
+        // overflow, causing events to be dropped and the cursor to jitter.
+        // 1 MiB is trivial memory and eliminates the drops.
+        let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(1 << 20);
+        let _ = socket2::SockRef::from(&socket).set_send_buffer_size(1 << 20);
         log::info!("Connecting to server at {}", self.server_addr);
 
         // Get local screen info
@@ -78,6 +84,35 @@ impl Client {
         let mut last_move_log = Instant::now();
         let mut sim_x: f64 = 0.0;
         let mut sim_y: f64 = 0.0;
+        // Instant-based rate limiter for cursor warps, sized to the
+        // actual display refresh rate instead of a hard-coded 125 Hz.
+        //
+        // Why tie it to the display rate: `CGWarpMouseCursorPosition` is
+        // IPC to the window server, whose cursor pipeline is clocked to
+        // the physical display. Warping faster than the display refreshes
+        // just backlogs the pipeline — the extra warps are coalesced by
+        // the compositor into the same frame and the visible cursor
+        // lags behind reality. Warping slower than refresh wastes
+        // motion resolution. Matching makes the cursor feel as smooth
+        // as the hardware allows: 60 Hz on an office monitor, 120 Hz on
+        // ProMotion, 240 Hz on a gaming display — all handled correctly
+        // without user-visible tuning knobs.
+        //
+        // Mouse polling rate is *unrelated*: a 1000 Hz gaming mouse
+        // still generates 1000 events/s, all captured by the server and
+        // sent to the client. The client coalesces whatever arrived in
+        // a drain cycle into one warp, so the per-warp delta scales
+        // with mouse rate but the warp *frequency* is bounded by the
+        // display. No motion is lost, just batched into bigger hops
+        // that land exactly one per display frame.
+        let refresh_hz = get_display_refresh_hz();
+        let min_warp_interval = Duration::from_secs_f64(1.0 / refresh_hz);
+        log::info!(
+            "Client warp rate limit: {:.0} Hz ({} ms per flush)",
+            refresh_hz,
+            min_warp_interval.as_millis()
+        );
+        let mut last_warp = Instant::now() - min_warp_interval;
 
         let loop_result: Result<()> = 'evt: loop {
             // Graceful shutdown request from UI
@@ -86,96 +121,241 @@ impl Client {
                 break 'evt Ok(());
             }
 
-            // Send heartbeat
+            // Send heartbeat + check server liveness (once per second)
             if last_heartbeat.elapsed() > Duration::from_secs(1) {
                 let hb = protocol::serialize(&Message::Heartbeat)?;
                 let _ = socket.send_to(&hb, &self.server_addr);
                 last_heartbeat = Instant::now();
+
+                // If no heartbeat received from server for >5 s, presume
+                // it's offline and stop gracefully.
+                let last_hb = state.last_heartbeat_ms.load(Ordering::SeqCst);
+                if last_hb > 0 && now_ms() - last_hb > 5000 {
+                    log::warn!("No heartbeat from server for >5 s, disconnecting");
+                    state.set_error("Server offline (heartbeat timeout)".to_string());
+                    break 'evt Ok(());
+                }
             }
 
-            match socket.recv_from(&mut buf) {
-                Ok((len, _)) => {
-                    let msg = match protocol::deserialize(&buf[..len]) {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
+            // Accumulate Move deltas across every packet we can drain in
+            // this iteration, then emit exactly one simulator.move_relative
+            // at the end. Non-Move events (button/scroll/key) are flushed
+            // inline in order so click/drag timing is preserved.
+            //
+            // Why: each simulator.move_relative on macOS costs a
+            // CGWarpMouseCursorPosition + CGEvent::post (~hundreds of µs).
+            // A 1000 Hz gaming mouse can enqueue dozens of Move packets
+            // during one 50 ms recv timeout — processing them one-by-one
+            // lets the backlog grow faster than we drain it, which is the
+            // visible "client is laggy" symptom. Summing the deltas and
+            // issuing one move per drain cycle bounds per-frame work.
+            let mut pending_dx: f64 = 0.0;
+            let mut pending_dy: f64 = 0.0;
+            let mut have_move = false;
 
-                    match msg {
-                        Message::Enter { x, y } => {
-                            active = true;
-                            state.mouse_on_peer.store(true, Ordering::SeqCst);
-                            sim_x = x;
-                            sim_y = y;
-                            // Show cursor on entry so the user sees it.
-                            if cursor_hidden {
-                                capture::show_local_cursor();
-                                cursor_hidden = false;
-                            }
-                            log::info!("Mouse entered at ({:.0}, {:.0})", x, y);
-                            if let Err(e) = simulator.move_to(x, y) {
-                                log::error!("Failed to move cursor: {}", e);
-                            }
+            // Drain strategy: one blocking recv with the 50 ms read
+            // timeout so we don't spin when idle, then (if we got
+            // something) flip to non-blocking ONCE and drain whatever
+            // else is already queued, then flip back to blocking.
+            //
+            // The previous revision toggled `set_nonblocking` on every
+            // iteration inside the drain loop, which meant two fcntl
+            // syscalls per received packet — ~2000/sec under a 1 kHz
+            // gaming mouse, entirely wasted. Toggling once per burst
+            // drops that to ~2 × (burst rate) = ~100–200/sec regardless
+            // of mouse rate, which is negligible.
+            let mut recv_result = socket.recv_from(&mut buf);
+            let mut nonblocking_mode = false;
+
+            loop {
+                match recv_result {
+                    Ok((len, _)) => {
+                        // We have at least one packet — if we haven't
+                        // already, flip the socket to non-blocking so the
+                        // follow-up drain recvs return WouldBlock
+                        // immediately instead of waiting 50 ms for packets
+                        // that may not come.
+                        if !nonblocking_mode {
+                            let _ = socket.set_nonblocking(true);
+                            nonblocking_mode = true;
                         }
-                        Message::Leave => {
-                            active = false;
-                            state.mouse_on_peer.store(false, Ordering::SeqCst);
-                            // Mouse is going back to the server — hide local cursor.
-                            if !cursor_hidden {
-                                capture::hide_local_cursor();
-                                cursor_hidden = true;
+
+                        let msg = match protocol::deserialize(&buf[..len]) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                recv_result = socket.recv_from(&mut buf);
+                                continue;
                             }
-                            log::info!("Mouse left client screen");
-                        }
-                        Message::KeyInput(key) if active => {
-                            log::info!(
-                                "received key: code={} down={} flags=0x{:x}",
-                                key.keycode, key.down, key.flags
-                            );
-                            if let Err(e) = simulator.key_event(key.keycode, key.down, key.flags) {
-                                log::error!("Key simulation error: {}", e);
+                        };
+
+                        match msg {
+                            Message::Enter { x, y } => {
+                                // Flush any accumulated moves before a
+                                // teleport — otherwise the relative deltas
+                                // would be applied after the absolute jump.
+                                if have_move {
+                                    let _ = simulator.move_relative(pending_dx, pending_dy);
+                                    pending_dx = 0.0;
+                                    pending_dy = 0.0;
+                                    have_move = false;
+                                }
+                                active = true;
+                                state.mouse_on_peer.store(true, Ordering::SeqCst);
+                                sim_x = x;
+                                sim_y = y;
+                                log::info!("Mouse entered at ({:.0}, {:.0})", x, y);
+                                if cursor_hidden {
+                                    // Show cursor WITHOUT restoring the saved
+                                    // position — we're about to warp to the
+                                    // entry point, so the restore would fight
+                                    // with move_to.
+                                    capture::show_local_cursor_no_restore();
+                                    cursor_hidden = false;
+                                }
+                                if let Err(e) = simulator.move_to(x, y) {
+                                    log::error!("Failed to move cursor: {}", e);
+                                }
                             }
-                            state.events_total.fetch_add(1, Ordering::Relaxed);
-                            state.last_event_ms.store(now_ms(), Ordering::SeqCst);
-                        }
-                        Message::Input(event) if active => {
-                            state.events_total.fetch_add(1, Ordering::Relaxed);
-                            state.last_event_ms.store(now_ms(), Ordering::SeqCst);
-                            let result = match &event.event_type {
-                                MouseEventType::Move => {
-                                    sim_x += event.dx;
-                                    sim_y += event.dy;
-                                    if last_move_log.elapsed() > Duration::from_millis(1000) {
-                                        log::info!(
-                                            "sim cursor=({:.0},{:.0}) dx={:.1} dy={:.1}",
-                                            sim_x, sim_y, event.dx, event.dy
-                                        );
-                                        last_move_log = Instant::now();
+                            Message::Leave => {
+                                // Flush pending moves so the final cursor
+                                // position is correct before we hide it.
+                                if have_move {
+                                    let _ = simulator.move_relative(pending_dx, pending_dy);
+                                    pending_dx = 0.0;
+                                    pending_dy = 0.0;
+                                    have_move = false;
+                                }
+                                active = false;
+                                state.mouse_on_peer.store(false, Ordering::SeqCst);
+                                if !cursor_hidden {
+                                    capture::hide_local_cursor();
+                                    cursor_hidden = true;
+                                }
+                                log::info!("Mouse left client screen");
+                            }
+                            Message::KeyInput(key) if active => {
+                                log::info!(
+                                    "received key: code={} down={} flags=0x{:x}",
+                                    key.keycode, key.down, key.flags
+                                );
+                                if let Err(e) =
+                                    simulator.key_event(key.keycode, key.down, key.flags)
+                                {
+                                    log::error!("Key simulation error: {}", e);
+                                }
+                                state.last_event_ms.store(now_ms(), Ordering::SeqCst);
+                            }
+                            Message::Input(event) if active => {
+                                state.last_event_ms.store(now_ms(), Ordering::SeqCst);
+                                match event {
+                                    MouseEvent::Move { dx, dy } => {
+                                        sim_x += dx;
+                                        sim_y += dy;
+                                        pending_dx += dx;
+                                        pending_dy += dy;
+                                        have_move = true;
                                     }
-                                    simulator.move_relative(event.dx, event.dy)
+                                    MouseEvent::ButtonDown(btn) => {
+                                        if have_move {
+                                            let _ = simulator
+                                                .move_relative(pending_dx, pending_dy);
+                                            pending_dx = 0.0;
+                                            pending_dy = 0.0;
+                                            have_move = false;
+                                        }
+                                        if let Err(e) = simulator.button_down(btn) {
+                                            log::error!("Simulation error: {}", e);
+                                        }
+                                    }
+                                    MouseEvent::ButtonUp(btn) => {
+                                        if have_move {
+                                            let _ = simulator
+                                                .move_relative(pending_dx, pending_dy);
+                                            pending_dx = 0.0;
+                                            pending_dy = 0.0;
+                                            have_move = false;
+                                        }
+                                        if let Err(e) = simulator.button_up(btn) {
+                                            log::error!("Simulation error: {}", e);
+                                        }
+                                    }
+                                    MouseEvent::Scroll { dx, dy } => {
+                                        if have_move {
+                                            let _ = simulator
+                                                .move_relative(pending_dx, pending_dy);
+                                            pending_dx = 0.0;
+                                            pending_dy = 0.0;
+                                            have_move = false;
+                                        }
+                                        if let Err(e) = simulator.scroll(dx, dy) {
+                                            log::error!("Simulation error: {}", e);
+                                        }
+                                    }
                                 }
-                                MouseEventType::ButtonDown(btn) => simulator.button_down(*btn),
-                                MouseEventType::ButtonUp(btn) => simulator.button_up(*btn),
-                                MouseEventType::Scroll { dx, dy } => {
-                                    simulator.scroll(*dx, *dy)
-                                }
-                            };
-                            if let Err(e) = result {
-                                log::error!("Simulation error: {}", e);
                             }
+                            Message::Heartbeat => {
+                                state.last_heartbeat_ms.store(now_ms(), Ordering::SeqCst);
+                            }
+                            _ => {}
                         }
-                        Message::Heartbeat => {
-                            state.last_heartbeat_ms.store(now_ms(), Ordering::SeqCst);
-                        }
-                        _ => {}
+
+                        // Grab the next packet for the drain iteration.
+                        recv_result = socket.recv_from(&mut buf);
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        // Nothing more queued — stop draining.
+                        break;
+                    }
+                    Err(e) => {
+                        log::error!("Network error: {}", e);
+                        state.set_error(format!("{}", e));
+                        break;
                     }
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(e) => {
-                    log::error!("Network error: {}", e);
-                    state.set_error(format!("{}", e));
+            }
+
+            // Restore blocking mode for the next outer-loop recv. We only
+            // flipped it if we actually received at least one packet, so
+            // this is a no-op on idle iterations.
+            if nonblocking_mode {
+                let _ = socket.set_nonblocking(false);
+            }
+
+            // Flush the accumulated move as a single simulator call.
+            if have_move {
+                // Rate-limit cursor warps to ~125 Hz using an Instant
+                // budget rather than a fixed post-flush sleep. Why not a
+                // fixed sleep: `CGWarpMouseCursorPosition` is IPC to the
+                // window server, whose cursor pipeline is clocked to the
+                // display (~60–120 Hz). Firing warps faster than that
+                // backlogs the pipeline and the visible cursor lags
+                // behind — the original "feels like low frame rate" bug.
+                // A *fixed* 8 ms sleep fixes that symptom but quantises
+                // slow motion into visible 8 ms steps regardless of how
+                // long the drain cycle itself took, which the user sees
+                // as periodic jitter. Tracking the real time since the
+                // last warp and only sleeping the remainder gives smooth
+                // 125 Hz output: fast drain cycles still cap at 125 Hz,
+                // slow drain cycles pass through with zero added latency.
+                let since = last_warp.elapsed();
+                if since < min_warp_interval {
+                    std::thread::sleep(min_warp_interval - since);
                 }
+
+                if last_move_log.elapsed() > Duration::from_millis(1000) {
+                    log::info!(
+                        "sim cursor=({:.0},{:.0}) flush dx={:.1} dy={:.1}",
+                        sim_x, sim_y, pending_dx, pending_dy
+                    );
+                    last_move_log = Instant::now();
+                }
+                if let Err(e) = simulator.move_relative(pending_dx, pending_dy) {
+                    log::error!("Simulation error: {}", e);
+                }
+                last_warp = Instant::now();
             }
         };
 
