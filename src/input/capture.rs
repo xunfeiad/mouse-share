@@ -44,6 +44,68 @@ pub struct Suppression {
     pub mouse: AtomicBool,
     pub keyboard: AtomicBool,
     pub failed: AtomicBool,
+    pub ready: AtomicBool,
+    pub local_held: AtomicBool,
+}
+
+impl Suppression {
+    pub fn fail_open(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.mouse.store(false, Ordering::Release);
+        self.keyboard.store(false, Ordering::Release);
+    }
+}
+
+/// Each press keeps the same owner until its release, even when forwarding
+/// is turned off in the middle of a press or a drag.
+#[derive(Default)]
+pub struct InputRouting {
+    keys: std::collections::BTreeMap<u32, bool>,
+    buttons: std::collections::BTreeMap<crate::protocol::MouseButton, bool>,
+}
+
+impl InputRouting {
+    fn route<T: Ord>(
+        held: &mut std::collections::BTreeMap<T, bool>,
+        key: T,
+        down: bool,
+        enabled: bool,
+    ) -> (bool, bool) {
+        let remote = if down {
+            *held.entry(key).or_insert(enabled)
+        } else {
+            held.remove(&key).unwrap_or(false)
+        };
+        (remote, remote && enabled)
+    }
+
+    fn update_held(&self, state: &Suppression) {
+        let held = self
+            .keys
+            .values()
+            .chain(self.buttons.values())
+            .any(|remote| !remote);
+        state.local_held.store(held, Ordering::Release);
+    }
+
+    pub fn key(&mut self, code: u32, down: bool, state: &Suppression) -> (bool, bool) {
+        let enabled = state.keyboard.load(Ordering::Acquire);
+        let decision = Self::route(&mut self.keys, code, down, enabled);
+        self.update_held(state);
+        decision
+    }
+
+    pub fn mouse(&mut self, event: &MouseEvent, state: &Suppression) -> (bool, bool) {
+        let enabled = state.mouse.load(Ordering::Acquire);
+        let decision = match event {
+            MouseEvent::ButtonDown(b) => Self::route(&mut self.buttons, *b, true, enabled),
+            MouseEvent::ButtonUp(b) => Self::route(&mut self.buttons, *b, false, enabled),
+            // Idle movement still reaches the backend for edge detection.
+            _ => return (enabled, true),
+        };
+        self.update_held(state);
+        decision
+    }
 }
 
 pub struct CaptureQueue {
@@ -56,9 +118,7 @@ impl CaptureQueue {
         if self.tx.try_send(event).is_err() {
             // The hook must never block. Releasing local control is safer than
             // continuing a transfer after an event (possibly an Up) was lost.
-            self.suppression.failed.store(true, Ordering::Release);
-            self.suppression.mouse.store(false, Ordering::Release);
-            self.suppression.keyboard.store(false, Ordering::Release);
+            self.suppression.fail_open();
         }
     }
 }
@@ -78,6 +138,24 @@ pub trait InputCapture: Send {
 /// Get the current absolute cursor position (x, y).
 pub fn get_cursor_position() -> Result<(f64, f64)> {
     platform_get_cursor_position()
+}
+
+/// Include keys/buttons already held when the native hook was installed.
+pub fn physical_input_held() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+            fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
+        }
+        (0..128).any(|key| key != 57 && unsafe { CGEventSourceKeyState(1, key) })
+            || (0..32).any(|button| unsafe { CGEventSourceButtonState(1, button) })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        (1..256).any(|key| unsafe { GetAsyncKeyState(key) } < 0)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -378,5 +456,38 @@ pub fn create_capture() -> Box<dyn InputCapture> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         compile_error!("Unsupported platform. Only macOS and Windows are supported.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_ownership_survives_turning_forwarding_off() {
+        let state = Suppression::default();
+        let mut routing = InputRouting::default();
+        assert_eq!(routing.key(1, true, &state), (false, false));
+        assert!(state.local_held.load(Ordering::Acquire));
+        state.keyboard.store(true, Ordering::Release);
+        assert_eq!(routing.key(1, false, &state), (false, false));
+        assert_eq!(routing.key(2, true, &state), (true, true));
+        assert!(!state.local_held.load(Ordering::Acquire));
+        state.keyboard.store(false, Ordering::Release);
+        assert_eq!(routing.key(2, true, &state), (true, false));
+        assert_eq!(routing.key(2, false, &state), (true, false));
+        assert_eq!(routing.key(2, true, &state), (false, false));
+
+        use crate::protocol::MouseButton::Left;
+        state.mouse.store(true, Ordering::Release);
+        assert_eq!(
+            routing.mouse(&MouseEvent::ButtonDown(Left), &state),
+            (true, true)
+        );
+        state.mouse.store(false, Ordering::Release);
+        assert_eq!(
+            routing.mouse(&MouseEvent::ButtonUp(Left), &state),
+            (true, false)
+        );
     }
 }

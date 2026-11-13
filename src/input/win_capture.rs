@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::capture::{CaptureQueue, CapturedInput, InputCapture, Suppression};
+use super::capture::{CaptureQueue, CapturedInput, InputCapture, InputRouting, Suppression};
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -47,8 +47,7 @@ thread_local! {
     // Cached primary screen dimensions, used to recenter the cursor while
     // suppressing (so info.pt never clamps at an edge and kills the delta).
     static SCREEN_SIZE: std::cell::Cell<(i32, i32)> = std::cell::Cell::new((0, 0));
-    static LOCAL_KEYS: std::cell::RefCell<std::collections::BTreeSet<u32>> = Default::default();
-    static LOCAL_BUTTONS: std::cell::RefCell<std::collections::BTreeSet<MouseButton>> = Default::default();
+    static ROUTING: std::cell::RefCell<InputRouting> = Default::default();
 }
 
 impl InputCapture for WinCapture {
@@ -71,6 +70,7 @@ impl InputCapture for WinCapture {
                 }
             };
 
+        self.suppressing.ready.store(true, Ordering::Release);
         log::info!("Windows mouse + keyboard hooks installed, entering message loop");
 
         // Non-blocking message pump: drain pending messages, then sleep
@@ -79,7 +79,7 @@ impl InputCapture for WinCapture {
         // the backend.
         let mut msg = MSG::default();
         loop {
-            if shutdown.load(Ordering::SeqCst) {
+            if shutdown.load(Ordering::Acquire) || self.suppressing.failed.load(Ordering::Acquire) {
                 log::info!("Windows hook thread: shutdown requested, exiting pump");
                 break;
             }
@@ -164,47 +164,26 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         _ => None,
     };
 
-    if let Some(evt) = mouse_event {
-        let suppressed = HOOK_SUPPRESS.with(|s| {
-            s.borrow()
-                .as_ref()
-                .is_some_and(|b| b.mouse.load(Ordering::Acquire))
-        });
-        let local = LOCAL_BUTTONS.with(|buttons| {
-            let mut buttons = buttons.borrow_mut();
-            match evt {
-                MouseEvent::ButtonDown(b) if !suppressed => {
-                    buttons.insert(b);
-                }
-                MouseEvent::ButtonUp(b) if buttons.contains(&b) => {
-                    buttons.remove(&b);
-                    return true;
-                }
-                _ => {}
-            }
-            !suppressed && !buttons.is_empty()
-        });
-        if local {
-            return CallNextHookEx(None, code, wparam, lparam);
-        }
-        let abs_x = info.pt.x as f64;
-        let abs_y = info.pt.y as f64;
-        HOOK_SENDER.with(|s| {
-            if let Some(sender) = s.borrow().as_ref() {
-                sender.send(CapturedInput::Mouse {
-                    event: evt,
-                    abs_x,
-                    abs_y,
+    let should_suppress = mouse_event.is_some_and(|event| {
+        HOOK_SUPPRESS.with(|state| {
+            let state = state.borrow();
+            let Some(state) = state.as_ref() else {
+                return false;
+            };
+            let (swallow, send) = ROUTING.with(|routing| routing.borrow_mut().mouse(&event, state));
+            if send {
+                HOOK_SENDER.with(|sender| {
+                    if let Some(sender) = sender.borrow().as_ref() {
+                        sender.send(CapturedInput::Mouse {
+                            event,
+                            abs_x: info.pt.x as f64,
+                            abs_y: info.pt.y as f64,
+                        });
+                    }
                 });
             }
-        });
-    }
-
-    let should_suppress = HOOK_SUPPRESS.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|b| b.mouse.load(Ordering::Acquire))
-            .unwrap_or(false)
+            swallow
+        })
     });
 
     if should_suppress {
@@ -213,7 +192,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         // OS clamps info.pt at the edge and dx/dy collapses to zero on that
         // axis — leaving the remote cursor stuck.
         let (sw, sh) = SCREEN_SIZE.with(|s| s.get());
-        if sw > 0 && sh > 0 {
+        if w == WM_MOUSEMOVE && sw > 0 && sh > 0 {
             let cx = sw / 2;
             let cy = sh / 2;
             let _ = SetCursorPos(cx, cy);
@@ -237,54 +216,28 @@ unsafe extern "system" fn kbd_hook_proc(code: i32, wparam: WPARAM, lparam: LPARA
     let w = wparam.0 as u32;
     let down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
     let up = w == WM_KEYUP || w == WM_SYSKEYUP;
-    let suppressed = HOOK_SUPPRESS.with(|s| {
-        s.borrow()
-            .as_ref()
-            .is_some_and(|b| b.keyboard.load(Ordering::Acquire))
-    });
-    let local = LOCAL_KEYS.with(|keys| {
-        let mut keys = keys.borrow_mut();
-        if suppressed && !keys.contains(&info.vkCode) {
-            return false;
-        }
-        if down {
-            keys.insert(info.vkCode);
-        }
-        if up {
-            keys.remove(&info.vkCode);
-        }
-        true
-    });
-    if local {
-        return CallNextHookEx(None, code, wparam, lparam);
-    }
-
-    if down || up {
-        // Encode the extended-key bit in the low bit of `flags`. The Windows
-        // simulator on the other side uses this to set KEYEVENTF_EXTENDEDKEY
-        // so arrow keys, right-Ctrl/Alt, Insert, Delete, etc. simulate
-        // correctly. Note: `info.flags` is a KBDLLHOOKSTRUCT_FLAGS newtype,
-        // so we access the inner u32 via `.0`.
-        let extended = (info.flags.0 & LLKHF_EXTENDED) != 0;
-        let out_flags: u64 = if extended { 1 } else { 0 };
-        let key_event = KeyEvent {
-            keycode: info.vkCode,
-            down,
-            flags: out_flags,
-        };
-        HOOK_SENDER.with(|s| {
-            if let Some(sender) = s.borrow().as_ref() {
-                sender.send(CapturedInput::Key(key_event));
+    let should_suppress = (down || up)
+        && HOOK_SUPPRESS.with(|state| {
+            let state = state.borrow();
+            let Some(state) = state.as_ref() else {
+                return false;
+            };
+            let (swallow, send) =
+                ROUTING.with(|routing| routing.borrow_mut().key(info.vkCode, down, state));
+            if send {
+                let key_event = KeyEvent {
+                    keycode: info.vkCode,
+                    down,
+                    flags: u64::from((info.flags.0 & LLKHF_EXTENDED) != 0),
+                };
+                HOOK_SENDER.with(|sender| {
+                    if let Some(sender) = sender.borrow().as_ref() {
+                        sender.send(CapturedInput::Key(key_event));
+                    }
+                });
             }
+            swallow
         });
-    }
-
-    let should_suppress = HOOK_SUPPRESS.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|b| b.keyboard.load(Ordering::Acquire))
-            .unwrap_or(false)
-    });
 
     if should_suppress {
         LRESULT(1) // Swallow the event from local apps

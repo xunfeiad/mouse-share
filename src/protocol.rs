@@ -65,6 +65,8 @@ pub enum Login {
         token: Token,
         screen: ScreenInfo,
         mac: bool,
+        #[serde(default)]
+        limits: Features,
     },
 }
 
@@ -72,8 +74,18 @@ pub enum Login {
 pub enum LoginReply {
     Paired(Token),
     Saved,
-    Ready(Features),
+    Ready(ReadyConfig),
     Rejected(String),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ReadyConfig {
+    #[serde(flatten)]
+    pub features: Features,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge: Option<crate::config::Edge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard_supported: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]

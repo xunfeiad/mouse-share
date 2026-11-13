@@ -3,7 +3,10 @@
 use anyhow::{ensure, Context, Result};
 use quinn::{Connection, RecvStream, SendStream};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
@@ -38,14 +41,8 @@ fn open_clipboard() -> Result<Box<dyn ClipboardBackend>> {
     Ok(Box::new(arboard::Clipboard::new()?))
 }
 
-#[derive(Default)]
-struct Gate {
-    enabled: bool,
-    generation: u64,
-}
-
 pub struct Sync {
-    gate: Arc<Mutex<Gate>>,
+    gate: Arc<AtomicU64>,
     changes: watch::Sender<u64>,
     task: JoinHandle<()>,
 }
@@ -56,7 +53,7 @@ impl Sync {
     }
 
     fn with_backend(connection: Connection, server: bool, open: OpenClipboard) -> Self {
-        let gate = Arc::new(Mutex::new(Gate::default()));
+        let gate = Arc::new(AtomicU64::new(0));
         let (changes, rx) = watch::channel(0);
         let task = tokio::spawn(supervise(connection, server, gate.clone(), rx, open));
         Self {
@@ -67,11 +64,11 @@ impl Sync {
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
-        let mut gate = self.gate.lock().unwrap();
-        if gate.enabled != enabled {
-            gate.enabled = enabled;
-            gate.generation += 1;
-            self.changes.send_replace(gate.generation);
+        let generation = self.gate.load(Ordering::Acquire);
+        if (generation % 2 == 1) != enabled {
+            let generation = generation.wrapping_add(1);
+            self.gate.store(generation, Ordering::Release);
+            self.changes.send_replace(generation);
         }
     }
 }
@@ -95,13 +92,13 @@ impl Drop for Streams {
 async fn supervise(
     connection: Connection,
     server: bool,
-    gate: Arc<Mutex<Gate>>,
+    gate: Arc<AtomicU64>,
     mut changes: watch::Receiver<u64>,
     open: OpenClipboard,
 ) {
     loop {
         let generation = *changes.borrow_and_update();
-        if !gate.lock().unwrap().enabled {
+        if generation % 2 == 0 {
             if changes.changed().await.is_err() {
                 return;
             }
@@ -129,7 +126,7 @@ async fn supervise(
 async fn synchronize(
     connection: &Connection,
     server: bool,
-    gate: Arc<Mutex<Gate>>,
+    gate: Arc<AtomicU64>,
     generation: u64,
     open: OpenClipboard,
 ) -> Result<()> {
@@ -220,7 +217,7 @@ async fn receive_text(
 
 fn clipboard_worker(
     mut clipboard: Box<dyn ClipboardBackend>,
-    gate: Arc<Mutex<Gate>>,
+    gate: Arc<AtomicU64>,
     generation: u64,
     server: bool,
     updates: &mut mpsc::Receiver<Option<String>>,
@@ -229,45 +226,53 @@ fn clipboard_worker(
     let mut last = None;
     let mut received_initial = server;
     if server {
-        let gate = gate.lock().unwrap();
-        if !gate.enabled || gate.generation != generation {
+        if gate.load(Ordering::Acquire) != generation {
             return Ok(());
         }
         last = clipboard.read_text().ok().filter(|text| can_send(text));
+        if gate.load(Ordering::Acquire) != generation {
+            return Ok(());
+        }
         out.try_send(last.clone())?;
     }
     let mut poll = std::time::Instant::now();
-    loop {
-        {
-            let gate = gate.lock().unwrap();
-            if !gate.enabled || gate.generation != generation || out.is_closed() {
+    // Native pasteboard calls can block. Never hold a lock across one, so
+    // disabling sync or shutting down can invalidate the generation now.
+    while gate.load(Ordering::Acquire) == generation && !out.is_closed() {
+        match updates.try_recv() {
+            Ok(update) => {
+                received_initial = true;
+                if let Some(text) = update.filter(|text| can_send(text)) {
+                    if gate.load(Ordering::Acquire) != generation {
+                        return Ok(());
+                    }
+                    clipboard.write_text(text.as_str())?;
+                    last = Some(text);
+                }
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
+        if received_initial && poll.elapsed() >= Duration::from_millis(250) {
+            poll = std::time::Instant::now();
+            if gate.load(Ordering::Acquire) != generation {
                 return Ok(());
             }
-            match updates.try_recv() {
-                Ok(update) => {
-                    received_initial = true;
-                    if let Some(text) = update.filter(|text| can_send(text)) {
-                        clipboard.write_text(text.as_str())?;
-                        last = Some(text);
-                    }
+            if let Ok(text) = clipboard.read_text() {
+                if gate.load(Ordering::Acquire) != generation {
+                    return Ok(());
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
-                Err(mpsc::error::TryRecvError::Empty) => {}
-            }
-            if received_initial && poll.elapsed() >= Duration::from_millis(250) {
-                poll = std::time::Instant::now();
-                if let Ok(text) = clipboard.read_text() {
-                    if can_send(&text)
-                        && last.as_ref() != Some(&text)
-                        && out.try_send(Some(text.clone())).is_ok()
-                    {
-                        last = Some(text);
-                    }
+                if can_send(&text)
+                    && last.as_ref() != Some(&text)
+                    && out.try_send(Some(text.clone())).is_ok()
+                {
+                    last = Some(text);
                 }
             }
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+    Ok(())
 }
 
 fn can_send(text: &str) -> bool {
@@ -278,6 +283,7 @@ fn can_send(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::net::{devices::TLS_NAME, transport};
+    use std::sync::Mutex;
 
     struct MemoryClipboard(&'static Mutex<String>);
 
@@ -360,10 +366,7 @@ mod tests {
     #[test]
     fn disabled_generation_cannot_apply_a_buffered_update() -> Result<()> {
         static TEST: Mutex<String> = Mutex::new(String::new());
-        let gate = Arc::new(Mutex::new(Gate {
-            enabled: true,
-            generation: 2,
-        }));
+        let gate = Arc::new(AtomicU64::new(3));
         let (tx, mut updates) = mpsc::channel(1);
         let (out, _rx) = mpsc::channel(1);
         tx.try_send(Some("stale data".into()))?;

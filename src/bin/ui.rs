@@ -16,17 +16,23 @@
 #![allow(dead_code)]
 
 use eframe::egui::{
-    self, Align, Color32, FontId, Frame, Layout, Margin, Rect, Response, RichText, Rounding,
-    Sense, Stroke, TextEdit, Ui, Vec2,
+    self, Align, Color32, FontId, Frame, Layout, Margin, Rect, Response, RichText, Rounding, Sense,
+    Stroke, TextEdit, Ui, Vec2,
 };
 use mouse_share::{
-    config as msc,
+    config as msc, desktop,
     input::capture as input_capture,
     log_buffer::{self, LogLine, LogReceiver},
-    net::{self, devices::{DeviceId, Devices, Invite, PairedDevice},
-        SessionCommand, SessionConfig, SessionRole, SharedState},
+    net::{
+        self,
+        devices::{DeviceId, Devices, Features, Invite, PairedDevice},
+        state::Phase,
+        SessionCommand, SessionConfig, SessionRole, SharedState,
+    },
+    settings::{self, SavedSession, Settings},
+    tray::{Tray, TrayAction},
 };
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -36,20 +42,71 @@ use std::time::Duration;
 // ============================================================================
 
 fn main() -> eframe::Result<()> {
-    // Install the tee logger so env_logger output AND the in-memory ring
-    // buffer (for the Log tab) both receive every record. Safe to call more
-    // than once — subsequent calls are no-ops.
     log_buffer::install();
-
-    // Promote to a foreground app so CGDisplayHideCursor takes effect when
-    // the server hides the local cursor. Without this the .app bundle still
-    // works, but bare `cargo run` from a terminal would be a background
-    // process and silently no-op the hide.
+    let directory = match settings::directory() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(());
+        }
+    };
+    let demo = std::env::var("MOUSE_SHARE_UI_DEMO").is_ok_and(|v| v == "1");
+    let wake = Arc::new(AtomicBool::new(false));
+    let context = Arc::new(std::sync::Mutex::new(None::<egui::Context>));
+    let wake_callback = wake.clone();
+    let context_callback = context.clone();
+    let _instance = if demo {
+        None
+    } else {
+        match desktop::Instance::acquire(
+            &directory,
+            Arc::new(move || {
+                wake_callback.store(true, Ordering::SeqCst);
+                if let Some(ctx) = context_callback.lock().unwrap().as_ref() {
+                    ctx.request_repaint();
+                }
+            }),
+        ) {
+            Ok(desktop::InstanceResult::Primary(instance)) => Some(instance),
+            Ok(desktop::InstanceResult::Existing) => return Ok(()),
+            Err(e) => {
+                eprintln!("{e:#}");
+                return Ok(());
+            }
+        }
+    };
+    let path = directory.join("config.json");
+    let terminate = Arc::new(AtomicBool::new(false));
+    let terminate_callback = terminate.clone();
+    let context_callback = context.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        terminate_callback.store(true, Ordering::SeqCst);
+        if let Some(ctx) = context_callback.lock().unwrap().as_ref() {
+            ctx.request_repaint();
+        }
+    }) {
+        log::error!("Cannot install termination handler: {e}");
+    }
+    let (mut preferences, mut warning) = if demo {
+        (Settings::default(), None)
+    } else {
+        settings::load(&path).unwrap_or_else(|e| (Settings::default(), Some(e.to_string())))
+    };
+    // The OS registration, not a stale boolean, determines this setting.
+    if !demo {
+        match desktop::login_enabled() {
+            Ok(enabled) => preferences.start_on_login = enabled,
+            Err(error) => {
+                preferences.start_on_login = false;
+                warning = Some(format!(
+                    "{}Cannot read login startup registration: {error}",
+                    warning.map(|text| format!("{text}\n")).unwrap_or_default()
+                ));
+            }
+        }
+    }
     input_capture::promote_to_foreground_app();
-    // Defensive unstick in case a previous run crashed with the cursor
-    // hidden or mouse/cursor association off. No-op on a healthy system.
     input_capture::restore_cursor_state_on_startup();
-
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 640.0])
@@ -63,10 +120,22 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "mouse share",
         opts,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             install_fonts(&cc.egui_ctx);
             install_style(&cc.egui_ctx);
-            Ok(Box::new(App::default()))
+            *context.lock().unwrap() = Some(cc.egui_ctx.clone());
+            let mut app = App::default();
+            app.config_path = path;
+            app.wake = wake;
+            app.terminate = terminate;
+            app.preference_error = warning;
+            if !app.demo {
+                app.apply_preferences(&preferences);
+            }
+            app.last_success = preferences.last_success;
+            app.preferences = preferences;
+            app.autostart = std::env::args().any(|s| s == "--autostart");
+            Ok(Box::new(app))
         }),
     )
 }
@@ -387,8 +456,8 @@ const EN: Strings = Strings {
 
     section_general: "General",
     set_start_on_login: "Start on login",
-    set_start_on_login_sub: "Launch at system startup",
-    set_auto_connect: "Auto-connect",
+    set_start_on_login_sub: "Restore the last session after login",
+    set_auto_connect: "Auto-reconnect",
     set_auto_connect_sub: "Reconnect on disconnect",
     set_show_in_menubar: "Show in menu bar",
     set_show_in_menubar_sub: "Tray icon (macOS/Win)",
@@ -508,8 +577,8 @@ const ZH: Strings = Strings {
 
     section_general: "通用",
     set_start_on_login: "开机启动",
-    set_start_on_login_sub: "系统启动时自动运行",
-    set_auto_connect: "自动连接",
+    set_start_on_login_sub: "登录后恢复上次成功启动的会话",
+    set_auto_connect: "断线自动重连",
     set_auto_connect_sub: "断线后自动重连",
     set_show_in_menubar: "显示在菜单栏",
     set_show_in_menubar_sub: "托盘图标 (macOS/Win)",
@@ -671,6 +740,15 @@ enum Edge {
 }
 
 impl Edge {
+    fn from_config(edge: msc::Edge) -> Self {
+        match edge {
+            msc::Edge::Left => Self::Left,
+            msc::Edge::Right => Self::Right,
+            msc::Edge::Top => Self::Top,
+            msc::Edge::Bottom => Self::Bottom,
+        }
+    }
+
     fn label(self, s: &Strings) -> &'static str {
         match self {
             Edge::Left => s.edge_left,
@@ -702,6 +780,7 @@ struct SessionHandle {
     kind: SessionKind,
     thread: JoinHandle<()>,
     commands: tokio::sync::mpsc::Sender<SessionCommand>,
+    saved: SavedSession,
 }
 
 /// Button-click intents produced by render functions and processed after
@@ -712,6 +791,7 @@ enum Action {
     StartServer,
     StartClient,
     StopSession,
+    RestartClient,
     Pair,
 }
 
@@ -726,7 +806,7 @@ struct App {
     client_state: ClientState,
     server_addr: String,
     server_port: String,
-    client_edge: Edge,
+    client_edge: Option<Edge>,
     devices: Option<Devices>,
     peers: Vec<PairedDevice>,
     selected: Option<DeviceId>,
@@ -736,6 +816,18 @@ struct App {
     address_edit: Option<(DeviceId, String)>,
     next_refresh: std::time::Instant,
     close_when_stopped: bool,
+    restart_client: bool,
+    tray: Option<Tray>,
+    hidden: bool,
+    initialized: bool,
+    autostart: bool,
+    wake: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
+    config_path: std::path::PathBuf,
+    preferences: Settings,
+    preference_error: Option<String>,
+    preference_job: Option<JoinHandle<anyhow::Result<Settings>>>,
+    last_success: Option<SavedSession>,
     demo: bool,
     // Settings
     start_on_login: bool,
@@ -783,68 +875,155 @@ impl App {
     }
 
     fn translate<'a>(&self, en: &'a str, zh: &'a str) -> &'a str {
-        match self.lang { Lang::En => en, Lang::Zh => zh }
+        match self.lang {
+            Lang::En => en,
+            Lang::Zh => zh,
+        }
     }
 
     fn start_session(&mut self, kind: SessionKind, role: SessionRole) {
-        if self.is_running() || self.demo { return; }
-        let Some(devices) = self.devices.clone() else { return; };
+        if self.is_running() || self.close_when_stopped || self.demo {
+            return;
+        }
+        let Some(devices) = self.devices.clone() else {
+            return;
+        };
+        let saved = match &role {
+            SessionRole::Server { port, edge } => SavedSession::Server {
+                port: *port,
+                edge: *edge,
+            },
+            SessionRole::Client { server } => SavedSession::Client { device: server.id },
+        };
         self.shared = Arc::new(SharedState::new());
+        self.shared
+            .set_auto_reconnect(self.preferences.auto_reconnect);
         let shared = self.shared.clone();
         let (commands, rx) = tokio::sync::mpsc::channel(16);
-        match std::thread::Builder::new().name("mouse-share-session".into()).spawn(move || {
-            if let Err(e) = net::run(SessionConfig { devices, role }, shared.clone(), rx) {
-                shared.set_error(e.to_string());
+        match std::thread::Builder::new()
+            .name("mouse-share-session".into())
+            .spawn(move || {
+                let config = SessionConfig {
+                    devices,
+                    role,
+                    feature_limits: Features::default(),
+                };
+                if let Err(e) = net::run(config, shared.clone(), rx) {
+                    shared.fail(e.to_string());
+                }
+            }) {
+            Ok(thread) => {
+                self.session = Some(SessionHandle {
+                    kind,
+                    thread,
+                    commands,
+                    saved,
+                })
             }
-        }) {
-            Ok(thread) => self.session = Some(SessionHandle { kind, thread, commands }),
-            Err(e) => self.shared.set_error(e.to_string()),
+            Err(e) => self.shared.fail(e.to_string()),
         }
     }
 
     fn start_server(&mut self) {
-        let Ok(port) = self.port.trim().parse() else {
-            self.shared.set_error(self.translate("Invalid UDP port", "UDP 端口无效"));
+        let Some(port) = self
+            .port
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+        else {
+            self.shared
+                .set_error(self.translate("Invalid UDP port", "UDP 端口无效"));
             return;
         };
-        self.start_session(SessionKind::Server, SessionRole::Server { port, edge: self.edge.to_config() });
+        self.start_session(
+            SessionKind::Server,
+            SessionRole::Server {
+                port,
+                edge: self.edge.to_config(),
+            },
+        );
     }
 
     fn start_client(&mut self) {
-        if let Some(server) = self.peers.iter().find(|peer| Some(peer.id) == self.selected && peer.address.is_some()).cloned() {
+        if let Some(server) = self
+            .peers
+            .iter()
+            .find(|peer| Some(peer.id) == self.selected && peer.address.is_some())
+            .cloned()
+        {
             self.start_session(SessionKind::Client, SessionRole::Client { server });
+        }
+    }
+
+    fn resume(&mut self) {
+        match self.last_success {
+            Some(SavedSession::Server { port, edge }) => {
+                self.tab = Tab::Server;
+                self.start_session(SessionKind::Server, SessionRole::Server { port, edge });
+                if self.is_running() {
+                    self.port = port.to_string();
+                    self.edge = Edge::from_config(edge);
+                }
+            }
+            Some(SavedSession::Client { device }) => {
+                self.tab = Tab::Client;
+                self.selected = Some(device);
+                self.start_client();
+                if !self.is_running() {
+                    self.shared.set_error(self.translate(
+                        "The saved server is unavailable",
+                        "上次连接的服务端已不可用",
+                    ));
+                }
+            }
+            None => {}
         }
     }
 
     fn send_command(&self, command: SessionCommand) {
         if let Some(session) = &self.session {
             if let Err(e) = session.commands.try_send(command) {
-                self.shared.set_error(format!("Session command unavailable: {e}"));
+                self.shared
+                    .set_error(format!("Session command unavailable: {e}"));
             }
         }
     }
 
     fn stop_session(&mut self) {
-        self.shared.shutdown.store(true, Ordering::Release);
-        if let Some(session) = &self.session {
-            let _ = session.commands.try_send(SessionCommand::Stop);
+        if self.session.is_some() {
+            self.shared.request_stop();
         }
     }
 
     fn start_pairing(&mut self) {
-        let Some(devices) = self.devices.clone() else { return; };
-        if self.demo || self.pair_job.is_some() { return; }
+        let Some(devices) = self.devices.clone() else {
+            return;
+        };
+        if self.demo || self.pair_job.is_some() {
+            return;
+        }
         let invite = match Invite::decode(&std::mem::take(&mut self.invitation)) {
             Ok(invite) => invite,
-            Err(_) => { self.shared.set_error(self.translate("Invalid v2 pairing invitation", "配对邀请无效，请复制完整的 v2 邀请")); return; }
+            Err(_) => {
+                self.shared.set_error(self.translate(
+                    "Invalid v2 pairing invitation",
+                    "配对邀请无效，请复制完整的 v2 邀请",
+                ));
+                return;
+            }
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        let result = std::thread::Builder::new().name("pairing".into()).spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread().enable_all().build()
-                .map_err(anyhow::Error::from)
-                .and_then(|runtime| runtime.block_on(net::pair(devices, invite)));
-            let _ = tx.send(result);
-        });
+        let result = std::thread::Builder::new()
+            .name("pairing".into())
+            .spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|runtime| runtime.block_on(net::pair(devices, invite)));
+                let _ = tx.send(result);
+            });
         match result {
             Ok(_) => self.pair_job = Some(rx),
             Err(e) => self.shared.set_error(e.to_string()),
@@ -852,13 +1031,18 @@ impl App {
     }
 
     fn refresh_devices(&mut self) {
-        if self.demo { return; }
+        if self.demo {
+            return;
+        }
         if let Some(job) = &self.pair_job {
             match job.try_recv() {
                 Ok(result) => {
                     self.pair_job = None;
                     match result {
-                        Ok(peer) => { self.selected = Some(peer.id); self.shared.clear_error(); }
+                        Ok(peer) => {
+                            self.selected = Some(peer.id);
+                            self.shared.clear_error();
+                        }
                         Err(e) => self.shared.set_error(e.to_string()),
                     }
                     self.next_refresh = std::time::Instant::now();
@@ -886,68 +1070,260 @@ impl App {
             match action {
                 Action::StartServer => self.start_server(),
                 Action::StartClient => self.start_client(),
-                Action::StopSession => self.stop_session(),
+                Action::StopSession => {
+                    self.restart_client = false;
+                    self.stop_session();
+                }
+                Action::RestartClient => {
+                    self.restart_client = true;
+                    self.stop_session();
+                }
                 Action::Pair => self.start_pairing(),
             }
         }
     }
 
-    /// Reconcile the UI state enums with what the backend actually reports.
-    /// Called at the top of every frame before rendering.
     fn derive_states(&mut self) {
-        // Dev mode bypass — the user is driving the state machine manually
-        // via the dev switcher, so don't overwrite their selection.
         if self.dev_mode {
             return;
         }
-
-        let running = self.is_running();
-        let kind = self.session_kind();
-        let connected = self.shared.connected.load(Ordering::SeqCst);
-        let mouse_on_peer = self.shared.mouse_on_peer.load(Ordering::SeqCst);
-        let has_error = self.shared.last_error.lock().unwrap().is_some();
-
-        // If the session thread has finished on its own (error or normal
-        // exit), reap it so we flip back to the not-running state.
-        let finished = self
+        let status = self.shared.status();
+        if let Some(session) = &self.session {
+            if matches!(status.phase, Phase::Listening | Phase::Connected) {
+                self.last_success = Some(session.saved);
+            }
+        }
+        if self
             .session
             .as_ref()
-            .map(|s| s.thread.is_finished())
-            .unwrap_or(false);
-        if finished {
-            self.session.take();
-        }
-
-        let running = running && self.session.is_some();
-
-        // Server tab state
-        if matches!(kind, Some(SessionKind::Server)) && running {
-            self.server_state = if connected {
-                ServerState::Connected
-            } else {
-                ServerState::Idle
-            };
-        } else if !running {
-            // Only override if we're not sitting in a non-run screen the
-            // user reached via dev switcher.
-            self.server_state = ServerState::Idle;
-        }
-
-        // Client tab state
-        if matches!(kind, Some(SessionKind::Client)) && running {
-            self.client_state = if has_error && !connected {
-                ClientState::NetworkError
-            } else if !connected {
-                ClientState::Connecting
-            } else if mouse_on_peer {
-                ClientState::MouseActive
-            } else {
-                ClientState::MouseOnServer
-            };
-        } else if !running {
-            if !matches!(self.client_state, ClientState::Config) {
-                self.client_state = ClientState::Config;
+            .is_some_and(|session| session.thread.is_finished())
+        {
+            if self.session.take().unwrap().thread.join().is_err() {
+                self.shared.fail("Session worker stopped unexpectedly");
             }
+            // Changes to defaults during the session are for the next start.
+            self.port = self.default_port.clone();
+            self.edge = self.default_edge;
+        }
+        if self.restart_client && self.session.is_none() && !self.close_when_stopped {
+            self.restart_client = false;
+            self.start_client();
+        }
+        let kind = self.session_kind();
+        self.client_edge = status.edge.map(Edge::from_config);
+        self.server_state = if kind == Some(SessionKind::Server) && status.phase == Phase::Connected
+        {
+            ServerState::Connected
+        } else if self.tab == Tab::Server
+            && self
+                .shared
+                .last_error
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|error| error.contains("Accessibility"))
+        {
+            ServerState::PermissionRequired
+        } else {
+            ServerState::Idle
+        };
+        self.client_state = match (kind, status.phase, status.forwarding) {
+            (Some(SessionKind::Client), Phase::Connected, true) => ClientState::MouseActive,
+            (Some(SessionKind::Client), Phase::Connected, false) => ClientState::MouseOnServer,
+            (Some(SessionKind::Client), _, _) => ClientState::Connecting,
+            (_, Phase::Failed, _) if self.tab == Tab::Client && self.selected.is_some() => {
+                ClientState::NetworkError
+            }
+            _ => ClientState::Config,
+        };
+    }
+
+    fn apply_preferences(&mut self, prefs: &Settings) {
+        self.default_port = prefs.port.to_string();
+        self.default_edge = Edge::from_config(prefs.edge);
+        if !self.is_running() {
+            self.port = self.default_port.clone();
+            self.edge = self.default_edge;
+        }
+        self.start_on_login = prefs.start_on_login;
+        self.auto_connect = prefs.auto_reconnect;
+        self.show_in_menubar = prefs.show_in_menubar;
+        self.debug_logging = prefs.debug_logging;
+        self.lang = match prefs.language.as_str() {
+            "zh" => Lang::Zh,
+            "en" => Lang::En,
+            _ => Lang::from_system(),
+        };
+        log_buffer::set_debug(self.debug_logging);
+        self.shared.set_auto_reconnect(self.auto_connect);
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn update_tray(&mut self, ctx: &egui::Context) {
+        if self.show_in_menubar && self.tray.is_none() {
+            match Tray::new(ctx) {
+                Ok(tray) => self.tray = Some(tray),
+                Err(e) => {
+                    self.show_in_menubar = false;
+                    self.preference_error = Some(format!("Tray unavailable: {e}"));
+                    self.show_window(ctx);
+                }
+            }
+        } else if !self.show_in_menubar && self.tray.is_some() {
+            self.show_window(ctx);
+            self.tray.take();
+        }
+        let running = self.is_running();
+        if let Some(tray) = &mut self.tray {
+            tray.update(self.shared.status().phase, running, self.lang == Lang::Zh);
+        }
+    }
+
+    fn sync_preferences(&mut self, ctx: &egui::Context) {
+        if self
+            .preference_job
+            .as_ref()
+            .is_some_and(|job| job.is_finished())
+        {
+            let result = self
+                .preference_job
+                .take()
+                .unwrap()
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Settings worker stopped")));
+            match result {
+                Ok(prefs) => {
+                    self.preferences = prefs;
+                    log_buffer::set_debug(self.preferences.debug_logging);
+                    self.shared
+                        .set_auto_reconnect(self.preferences.auto_reconnect);
+                }
+                Err(e) => {
+                    self.preference_error = Some(e.to_string());
+                    self.apply_preferences(&self.preferences.clone());
+                    self.update_tray(ctx);
+                }
+            }
+        }
+        if self.preference_job.is_some() || self.close_when_stopped || self.dev_mode || self.demo {
+            return;
+        }
+        self.update_tray(ctx);
+        if !self.is_running() {
+            if self.tab == Tab::Server {
+                self.default_port.clone_from(&self.port);
+                self.default_edge = self.edge;
+            } else {
+                self.port.clone_from(&self.default_port);
+                self.edge = self.default_edge;
+            }
+        }
+        let mut prefs = self.preferences.clone();
+        if let Some(port) = self
+            .default_port
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+        {
+            prefs.port = port;
+        }
+        prefs.edge = self.default_edge.to_config();
+        prefs.language = if self.lang == Lang::Zh { "zh" } else { "en" }.into();
+        prefs.start_on_login = self.start_on_login;
+        prefs.auto_reconnect = self.auto_connect;
+        prefs.show_in_menubar = self.show_in_menubar;
+        prefs.debug_logging = self.debug_logging;
+        prefs.last_success = self.last_success;
+        if prefs == self.preferences {
+            return;
+        }
+        let path = self.config_path.clone();
+        let old = self.preferences.clone();
+        let repaint = ctx.clone();
+        self.preference_error = None;
+        match std::thread::Builder::new().name("settings".into()).spawn(move || {
+            let result = (|| -> anyhow::Result<_> {
+                let login_changed = prefs.start_on_login != old.start_on_login;
+                if login_changed { desktop::set_login(prefs.start_on_login)?; }
+                if let Err(e) = settings::save(&path, &prefs) {
+                    if login_changed {
+                        if let Err(rollback) = desktop::set_login(old.start_on_login) {
+                            return Err(anyhow::anyhow!("Cannot save settings: {e}; cannot restore login registration: {rollback}"));
+                        }
+                    }
+                    return Err(e);
+                }
+                Ok(prefs)
+            })();
+            repaint.request_repaint();
+            result
+        }) {
+            Ok(job) => self.preference_job = Some(job),
+            Err(e) => {
+                self.preference_error = Some(e.to_string());
+                self.apply_preferences(&self.preferences.clone());
+                self.update_tray(ctx);
+            }
+        }
+    }
+
+    fn request_exit(&mut self) {
+        self.close_when_stopped = true;
+        self.restart_client = false;
+        self.stop_session();
+    }
+
+    fn close_window(&mut self, ctx: &egui::Context) {
+        if !self.close_when_stopped && self.tray.is_some() {
+            self.hidden = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        } else {
+            self.request_exit();
+        }
+    }
+
+    fn desktop_events(&mut self, ctx: &egui::Context) {
+        if self.terminate.swap(false, Ordering::AcqRel) {
+            self.request_exit();
+        }
+        if self.wake.swap(false, Ordering::AcqRel) {
+            self.show_window(ctx);
+        }
+        for action in self.tray.as_ref().map(Tray::actions).unwrap_or_default() {
+            match action {
+                TrayAction::Open => self.show_window(ctx),
+                TrayAction::Start if !self.is_running() && !self.close_when_stopped => {
+                    if self.last_success.is_some() {
+                        self.resume();
+                    } else {
+                        self.start_server();
+                    }
+                }
+                TrayAction::Stop => {
+                    self.restart_client = false;
+                    self.stop_session();
+                }
+                TrayAction::Exit => self.request_exit(),
+                _ => {}
+            }
+        }
+        if ctx.input(|input| input.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_window(ctx);
+        }
+        if self.close_when_stopped
+            && self.session.is_none()
+            && self.pair_job.is_none()
+            && self.preference_job.is_none()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -969,7 +1345,6 @@ impl App {
         let secs = now.saturating_sub(started) / 1000;
         format_duration(secs)
     }
-
 }
 
 fn format_duration(secs: u64) -> String {
@@ -986,7 +1361,9 @@ impl Default for App {
     fn default() -> Self {
         let devices = Devices::system();
         let shared = Arc::new(SharedState::new());
-        if let Err(e) = &devices { shared.set_error(e.to_string()); }
+        if let Err(e) = &devices {
+            shared.set_error(e.to_string());
+        }
         let mut app = Self {
             tab: Tab::Server,
             lang: Lang::from_system(),
@@ -996,7 +1373,7 @@ impl Default for App {
             client_state: ClientState::Config,
             server_addr: "192.168.1.100".into(),
             server_port: "4242".into(),
-            client_edge: Edge::Right,
+            client_edge: None,
             devices: devices.ok(),
             peers: Vec::new(),
             selected: None,
@@ -1006,8 +1383,20 @@ impl Default for App {
             address_edit: None,
             next_refresh: std::time::Instant::now(),
             close_when_stopped: false,
+            restart_client: false,
+            tray: None,
+            hidden: false,
+            initialized: false,
+            autostart: false,
+            wake: Arc::default(),
+            terminate: Arc::default(),
+            config_path: Default::default(),
+            preferences: Settings::default(),
+            preference_error: None,
+            preference_job: None,
+            last_success: None,
             demo: std::env::var("MOUSE_SHARE_UI_DEMO").is_ok_and(|v| v == "1"),
-            start_on_login: true,
+            start_on_login: false,
             auto_connect: true,
             show_in_menubar: true,
             default_port: "4242".into(),
@@ -1025,19 +1414,55 @@ impl Default for App {
         // Dev hook: start in a specific visual state for screenshotting.
         if let Ok(s) = std::env::var("MOUSE_SHARE_UI_STATE") {
             match s.as_str() {
-                "server_idle" => { app.tab = Tab::Server; app.server_state = ServerState::Idle; }
-                "server_connected" => { app.tab = Tab::Server; app.server_state = ServerState::Connected; }
-                "server_conflict" => { app.tab = Tab::Server; app.server_state = ServerState::PortConflict; }
-                "server_resolved" => { app.tab = Tab::Server; app.server_state = ServerState::PortResolved; }
-                "client_config" => { app.tab = Tab::Client; app.client_state = ClientState::Config; }
-                "client_connecting" => { app.tab = Tab::Client; app.client_state = ClientState::Connecting; }
-                "client_on_server" => { app.tab = Tab::Client; app.client_state = ClientState::MouseOnServer; }
-                "client_active" => { app.tab = Tab::Client; app.client_state = ClientState::MouseActive; }
-                "permission" => { app.tab = Tab::Server; app.server_state = ServerState::PermissionRequired; }
-                "error" => { app.tab = Tab::Client; app.client_state = ClientState::NetworkError; }
-                "devices" => { app.tab = Tab::Devices; }
-                "log" => { app.tab = Tab::Log; }
-                "settings" => { app.tab = Tab::Settings; }
+                "server_idle" => {
+                    app.tab = Tab::Server;
+                    app.server_state = ServerState::Idle;
+                }
+                "server_connected" => {
+                    app.tab = Tab::Server;
+                    app.server_state = ServerState::Connected;
+                }
+                "server_conflict" => {
+                    app.tab = Tab::Server;
+                    app.server_state = ServerState::PortConflict;
+                }
+                "server_resolved" => {
+                    app.tab = Tab::Server;
+                    app.server_state = ServerState::PortResolved;
+                }
+                "client_config" => {
+                    app.tab = Tab::Client;
+                    app.client_state = ClientState::Config;
+                }
+                "client_connecting" => {
+                    app.tab = Tab::Client;
+                    app.client_state = ClientState::Connecting;
+                }
+                "client_on_server" => {
+                    app.tab = Tab::Client;
+                    app.client_state = ClientState::MouseOnServer;
+                }
+                "client_active" => {
+                    app.tab = Tab::Client;
+                    app.client_state = ClientState::MouseActive;
+                }
+                "permission" => {
+                    app.tab = Tab::Server;
+                    app.server_state = ServerState::PermissionRequired;
+                }
+                "error" => {
+                    app.tab = Tab::Client;
+                    app.client_state = ClientState::NetworkError;
+                }
+                "devices" => {
+                    app.tab = Tab::Devices;
+                }
+                "log" => {
+                    app.tab = Tab::Log;
+                }
+                "settings" => {
+                    app.tab = Tab::Settings;
+                }
                 _ => {}
             }
         }
@@ -1050,8 +1475,18 @@ impl Default for App {
         }
         if app.demo {
             app.peers = vec![
-                PairedDevice { id: [1; 16], name: "Studio Mac".into(), address: Some("192.0.2.10:4242".into()), certificate: Vec::new() },
-                PairedDevice { id: [2; 16], name: "Windows laptop".into(), address: None, certificate: Vec::new() },
+                PairedDevice {
+                    id: [1; 16],
+                    name: "Studio Mac".into(),
+                    address: Some("192.0.2.10:4242".into()),
+                    certificate: Vec::new(),
+                },
+                PairedDevice {
+                    id: [2; 16],
+                    name: "Windows laptop".into(),
+                    address: None,
+                    certificate: Vec::new(),
+                },
             ];
             app.selected = Some([1; 16]);
         }
@@ -1074,36 +1509,72 @@ impl eframe::App for App {
         // Reconcile UI enums with the backend before we render this frame.
         self.derive_states();
         self.refresh_devices();
-        if let Some(address) = self.peers.iter().find(|p| Some(p.id) == self.selected).and_then(|p| p.address.as_ref()) {
+        if let Some(address) = self
+            .peers
+            .iter()
+            .find(|p| Some(p.id) == self.selected)
+            .and_then(|p| p.address.as_ref())
+        {
             if let Some((host, port)) = address.rsplit_once(':') {
                 self.server_addr = host.to_owned();
                 self.server_port = port.to_owned();
             }
         }
-        if ctx.input(|input| input.viewport().close_requested()) && (self.is_running() || self.pair_job.is_some()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.close_when_stopped = true;
-            self.stop_session();
+        if !self.initialized {
+            self.initialized = true;
+            if !self.demo && !self.dev_mode {
+                self.update_tray(ctx);
+                if self.autostart && self.preferences.start_on_login && self.last_success.is_some()
+                {
+                    self.resume();
+                    if self.is_running() && self.tray.is_some() {
+                        self.hidden = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    }
+                }
+            }
         }
-        if self.close_when_stopped && !self.is_running() && self.pair_job.is_none() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        self.desktop_events(ctx);
+        if self.hidden && self.shared.status().phase == Phase::Failed {
+            self.show_window(ctx);
         }
 
         egui::CentralPanel::default()
-            .frame(Frame::none().fill(theme::BG).inner_margin(Margin::same(16.0)))
+            .frame(
+                Frame::none()
+                    .fill(theme::BG)
+                    .inner_margin(Margin::same(16.0)),
+            )
             .show(ctx, |ui| {
                 let s = self.s();
                 let width = ui.available_width();
                 card(ui, |ui| {
                     ui.set_min_width((width - 40.0).max(0.0));
-                    title_bar(ui, "mouse share");
+                    if title_bar(ui, "mouse share") {
+                        self.close_window(ctx);
+                    }
                     tab_bar(ui, &mut self.tab, s);
                     ui.add_space(14.0);
-                    ui.scope(|ui| {
+                    if let Some(error) = &self.preference_error {
+                        error_banner(ui, error);
+                    }
+                    if self.close_when_stopped || self.shared.status().phase == Phase::Stopping {
+                        ui.label(
+                            self.translate("Stopping and releasing input…", "正在停止并释放输入…"),
+                        );
+                    }
+                    if self.preference_job.is_some() {
+                        ui.small(self.translate("Applying settings…", "正在应用设置…"));
+                    }
+                    ui.add_enabled_ui(!self.close_when_stopped, |ui| {
                         ui.style_mut().spacing.item_spacing.y = 12.0;
                         match self.tab {
-                            Tab::Server => { egui::ScrollArea::vertical().show(ui, |ui| server_tab(ui, self)); }
-                            Tab::Client => { egui::ScrollArea::vertical().show(ui, |ui| client_tab(ui, self)); }
+                            Tab::Server => {
+                                egui::ScrollArea::vertical().show(ui, |ui| server_tab(ui, self));
+                            }
+                            Tab::Client => {
+                                egui::ScrollArea::vertical().show(ui, |ui| client_tab(ui, self));
+                            }
                             Tab::Log => log_tab(ui, self),
                             Tab::Settings => settings_tab(ui, self),
                             Tab::Devices => devices_tab(ui, self),
@@ -1113,11 +1584,26 @@ impl eframe::App for App {
             });
 
         // Apply any button action collected by the render pass.
-        self.apply_pending_action();
+        if !self.close_when_stopped {
+            self.apply_pending_action();
+        }
+        self.sync_preferences(ctx);
+        if let Some(rx) = &mut self.log_rx {
+            rx.drain(&mut self.log_cache);
+        }
+        if self.log_cache.len() > 1000 {
+            self.log_cache.drain(..self.log_cache.len() - 1000);
+        }
 
         // Keep the UI responsive to backend state changes. We poll atomics,
         // so a steady repaint cadence is what drives uptime/events updates.
-        ctx.request_repaint_after(Duration::from_millis(150));
+        ctx.request_repaint_after(Duration::from_millis(
+            if self.hidden && !self.close_when_stopped {
+                150
+            } else {
+                50
+            },
+        ));
     }
 }
 
@@ -1141,7 +1627,8 @@ fn card(ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
         .show(ui, contents);
 }
 
-fn title_bar(ui: &mut Ui, title: &str) {
+fn title_bar(ui: &mut Ui, title: &str) -> bool {
+    let mut close = false;
     ui.horizontal(|ui| {
         // Traffic lights — functional close/minimize/maximize buttons.
         // The eframe window is created with `with_decorations(false)` so the
@@ -1165,7 +1652,7 @@ fn title_bar(ui: &mut Ui, title: &str) {
                 .on_hover_cursor(egui::CursorIcon::PointingHand);
             if resp.clicked() {
                 match i {
-                    0 => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                    0 => close = true,
                     1 => ui
                         .ctx()
                         .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
@@ -1255,6 +1742,7 @@ fn title_bar(ui: &mut Ui, title: &str) {
         );
     });
     ui.add_space(12.0);
+    close
 }
 
 /// Draw the mouse-share app icon: a filled mouse-cursor (pointer arrow)
@@ -1726,7 +2214,7 @@ fn server_tab(ui: &mut Ui, app: &mut App) {
         ServerState::PortResolved => server_port_resolved(ui, app),
         ServerState::PermissionRequired => server_permission_required(ui, app),
     }
-    if app.session_kind() == Some(SessionKind::Server) && !app.shared.shutdown.load(Ordering::Acquire) {
+    if app.session_kind() == Some(SessionKind::Server) && matches!(app.shared.status().phase, Phase::Listening | Phase::Connected) {
         let status = app.shared.status();
         let mut requested = status.features;
         toggle(ui, s.toggle_clipboard_sync, &mut requested.clipboard);
@@ -1885,7 +2373,7 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
         });
     });
     ui.add_space(8.0);
-    let mouse_on_peer = app.shared.mouse_on_peer.load(Ordering::SeqCst);
+    let mouse_on_peer = app.shared.status().forwarding;
     topology(
         ui,
         "server",
@@ -2139,10 +2627,24 @@ fn server_permission_required(ui: &mut Ui, app: &mut App) {
     ui.add_space(10.0);
     ui.columns(2, |cols| {
         cols[0].vertical_centered_justified(|ui| {
-            primary_button(ui, s.btn_open_settings);
+            if primary_button(ui, s.btn_open_settings).clicked() {
+                #[cfg(target_os = "macos")]
+                if let Err(error) = std::process::Command::new("open")
+                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                    .spawn()
+                {
+                    app.shared.set_error(error.to_string());
+                }
+            }
         });
         cols[1].vertical_centered_justified(|ui| {
-            ghost_button(ui, s.btn_retry);
+            if app.is_running() {
+                if ghost_button(ui, s.btn_stop_server).clicked() {
+                    app.pending_action = Some(Action::StopSession);
+                }
+            } else if ghost_button(ui, s.btn_retry).clicked() {
+                app.pending_action = Some(Action::StartServer);
+            }
         });
     });
 }
@@ -2153,11 +2655,11 @@ fn server_permission_required(ui: &mut Ui, app: &mut App) {
 
 fn client_tab(ui: &mut Ui, app: &mut App) {
     if let Some(err) = app.shared.last_error.lock().unwrap().clone() {
-        // Only display the banner if the session isn't already routing to
-        // NetworkError — otherwise the error is duplicated.
-        if !matches!(app.client_state, ClientState::NetworkError) {
-            error_banner(ui, &err);
-        }
+        error_banner(ui, &err);
+    }
+    let status = app.shared.status();
+    if status.phase == Phase::Connected && !status.keyboard_supported {
+        ui.small(app.translate("Keyboard sharing requires matching operating systems.", "键盘转发需要两端使用相同操作系统。"));
     }
     match app.client_state {
         ClientState::Config => client_config(ui, app),
@@ -2301,7 +2803,10 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
     let s = app.s();
     let peer = app.peer_addr_display();
     ui.horizontal(|ui| {
-        pill(ui, s.pill_connecting, theme::WARN, theme::WARN_SOFT);
+        let label = if app.shared.status().phase == Phase::Reconnecting {
+            app.translate("Reconnecting", "正在重连")
+        } else { s.pill_connecting };
+        pill(ui, label, theme::WARN, theme::WARN_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
                 RichText::new(&peer)
@@ -2381,7 +2886,7 @@ fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
     field_trio(
         ui,
         [
-            (s.label_edge, app.client_edge.label(s)),
+            (s.label_edge, app.client_edge.map_or("—", |edge| edge.label(s))),
             (s.label_keys, "—"),
             (s.label_uptime, uptime.as_str()),
         ],
@@ -2433,7 +2938,7 @@ fn client_mouse_active(ui: &mut Ui, app: &mut App) {
     field_trio(
         ui,
         [
-            (s.label_edge, app.client_edge.label(s)),
+            (s.label_edge, app.client_edge.map_or("—", |edge| edge.label(s))),
             (s.label_keys, "—"),
             (s.label_uptime, uptime.as_str()),
         ],
@@ -2515,11 +3020,11 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
         });
     });
     if reconnect {
-        // Tear down the failed session then immediately start a new one.
-        app.pending_action = Some(Action::StartClient);
+        app.pending_action = Some(Action::RestartClient);
     }
     if edit_config {
         app.pending_action = Some(Action::StopSession);
+        app.shared.dismiss_error();
     }
 }
 
@@ -2532,9 +3037,6 @@ fn log_tab(ui: &mut Ui, app: &mut App) {
 
     // Drain new log lines from the channel into our local cache.
     // try_recv is non-blocking — moves messages without cloning.
-    if let Some(rx) = &mut app.log_rx {
-        rx.drain(&mut app.log_cache);
-    }
     // Cap local storage to 1000 entries.
     const LOG_CAPACITY: usize = 1000;
     if app.log_cache.len() > LOG_CAPACITY {
@@ -2769,6 +3271,9 @@ fn settings_tab(ui: &mut Ui, app: &mut App) {
                 .margin(Margin::symmetric(12.0, 8.0))
                 .desired_width(120.0),
         );
+        if !app.default_port.trim().parse::<u16>().is_ok_and(|port| port != 0) {
+            ui.small(app.translate("Enter a UDP port between 1 and 65535.", "请输入 1 到 65535 之间的 UDP 端口。"));
+        }
         ui.add_space(6.0);
         ui.label(
             RichText::new(s.set_default_edge)
@@ -2920,4 +3425,35 @@ fn dev_state_switcher_client(ui: &mut Ui, state: &mut ClientState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn closing_the_window_waits_for_pending_work() {
+        let mut app = App::default();
+        let (_send, receive) = std::sync::mpsc::channel();
+        app.pair_job = Some(receive);
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut raw = egui::RawInput::default();
+            raw.viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .events
+                .push(egui::ViewportEvent::Close);
+            let frame = ctx.run(raw, |ctx| app.desktop_events(ctx));
+            let commands = &frame.viewport_output[&egui::ViewportId::ROOT].commands;
+            assert!(commands.contains(&egui::ViewportCommand::CancelClose));
+            assert!(!commands.contains(&egui::ViewportCommand::Close));
+        }
+        assert!(app.close_when_stopped);
+        app.pair_job = None;
+        let frame = ctx.run(egui::RawInput::default(), |ctx| app.desktop_events(ctx));
+        assert!(frame.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Close));
+    }
 }

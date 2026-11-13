@@ -1,14 +1,14 @@
 use super::{
     devices::{local_name, random, DeviceId, Devices, Features, Invite, PairedDevice, Token},
     input::{Capture, Forward, RemoteInput},
-    state::{now_ms, SharedState},
+    state::{now_ms, Phase, SharedState},
     transport::{self, HANDSHAKE},
 };
 use crate::{
     clipboard,
     config::Edge,
     input::capture::CapturedInput,
-    protocol::{Control, Login, LoginReply, MouseEvent, ScreenInfo},
+    protocol::{Control, Login, LoginReply, MouseEvent, ReadyConfig, ScreenInfo},
     screen,
 };
 use anyhow::{bail, ensure, Context, Result};
@@ -32,7 +32,10 @@ const SNAPSHOT: Duration = Duration::from_millis(250);
 const FRAME: Duration = Duration::from_millis(5);
 const ENTER_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_PENDING_INPUT: usize = 512;
+const REVOKED: u8 = 1;
+const REPLACED: u8 = 2;
 
+#[derive(Clone)]
 pub enum SessionRole {
     Server { port: u16, edge: Edge },
     Client { server: PairedDevice },
@@ -41,6 +44,7 @@ pub enum SessionRole {
 pub struct SessionConfig {
     pub devices: Devices,
     pub role: SessionRole,
+    pub feature_limits: Features,
 }
 
 pub enum SessionCommand {
@@ -65,6 +69,7 @@ struct Authenticated {
     peer: DeviceId,
     screen: ScreenInfo,
     mac: bool,
+    limits: Features,
 }
 
 pub fn run(
@@ -72,24 +77,51 @@ pub fn run(
     state: Arc<SharedState>,
     commands: mpsc::Receiver<SessionCommand>,
 ) -> Result<()> {
-    state.started_ms.store(now_ms(), Ordering::Release);
+    state.phase(Phase::Connecting);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let mut stop = state.stop_signal();
     let result = runtime.block_on(async {
         match config.role {
             SessionRole::Server { port, edge } => {
-                serve(config.devices, port, edge, &state, commands, Capture::start).await
+                serve(
+                    config.devices,
+                    port,
+                    edge,
+                    &state,
+                    commands,
+                    Capture::start,
+                    config.feature_limits,
+                )
+                .await
             }
             SessionRole::Client { server } => {
-                connect(config.devices, server, &state, commands).await
+                connect(
+                    config.devices,
+                    server,
+                    &state,
+                    commands,
+                    config.feature_limits,
+                )
+                .await
             }
         }
     });
     runtime.shutdown_timeout(Duration::from_millis(200));
-    state.connected.store(false, Ordering::Release);
-    state.mouse_on_peer.store(false, Ordering::Release);
+    state.forwarding(false);
     state.invitation.lock().unwrap().take();
+    let result = if *stop.borrow_and_update() {
+        Ok(())
+    } else {
+        result
+    };
+    if let Err(e) = &result {
+        state.set_error(e.to_string());
+        state.phase(Phase::Failed);
+    } else {
+        state.phase(Phase::Idle);
+    }
     result
 }
 
@@ -231,6 +263,7 @@ async fn authenticate(
             token,
             screen,
             mac,
+            limits,
         } => {
             let token = Zeroizing::new(token);
             let authorized = screen.valid()
@@ -254,6 +287,7 @@ async fn authenticate(
                 peer: id,
                 screen,
                 mac,
+                limits,
             }))
         }
     }
@@ -270,6 +304,7 @@ fn authorized(devices: &Devices, id: DeviceId, token: &Token) -> bool {
 
 struct Active {
     id: DeviceId,
+    connection: Connection,
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
@@ -278,6 +313,11 @@ impl Active {
     async fn stop(self) {
         let _ = self.stop.send(true);
         let _ = self.task.await;
+    }
+
+    async fn disconnect(self, code: u8, reason: &'static [u8]) {
+        self.connection.close(code.into(), reason);
+        self.stop().await;
     }
 }
 
@@ -288,7 +328,12 @@ async fn serve(
     state: &Arc<SharedState>,
     mut commands: mpsc::Receiver<SessionCommand>,
     start_capture: fn() -> Result<Capture>,
+    limits: Features,
 ) -> Result<()> {
+    let mut stop = state.stop_signal();
+    if *stop.borrow() {
+        return Ok(());
+    }
     let (id, cert, key) = devices.identity()?;
     let endpoint = transport::server(
         SocketAddr::from(([0, 0, 0, 0], port)),
@@ -300,14 +345,22 @@ async fn serve(
     ensure!(local_screen.valid(), "Invalid local screen dimensions");
     let invite = Arc::new(Mutex::new(None::<Invitation>));
     let initial = devices.features()?;
-    *state.features.lock().unwrap() = initial;
+    let apply_limits = move |mut features: Features| {
+        features.keyboard &= limits.keyboard;
+        features.clipboard &= limits.clipboard;
+        features
+    };
+    state.set_features(apply_limits(initial));
     let (features, _) = watch::channel(initial);
     let mut pending = tokio::task::JoinSet::new();
     let mut active: Option<Active> = None;
     let mut tick = time::interval(Duration::from_millis(100));
+    state.mark_ready();
+    state.phase(Phase::Listening);
     log::info!("Listening for paired devices on UDP {port}");
     loop {
         tokio::select! {
+            _ = wait_for(&mut stop, true) => break,
             command = commands.recv() => match command {
                 Some(SessionCommand::Stop) | None => break,
                 Some(SessionCommand::Features { keyboard, clipboard }) => {
@@ -317,8 +370,8 @@ async fn serve(
                     match devices.set_features(value) {
                         Ok(()) => {
                             features.send_replace(value);
-                            if !state.connected.load(Ordering::Acquire) {
-                                *state.features.lock().unwrap() = value;
+                            if state.status().phase == Phase::Listening {
+                                state.set_features(apply_limits(value));
                             }
                         }
                         Err(e) => state.set_error(e.to_string()),
@@ -344,7 +397,7 @@ async fn serve(
                 }
                 Some(SessionCommand::Revoke(peer)) => {
                     if active.as_ref().is_some_and(|a| a.id == peer) {
-                        active.take().unwrap().stop().await;
+                        active.take().unwrap().disconnect(REVOKED, b"revoked").await;
                     }
                     let store = devices.clone();
                     if let Err(e) = tokio::task::spawn_blocking(move || store.forget(peer)).await? {
@@ -362,7 +415,7 @@ async fn serve(
             Some(result) = pending.join_next() => {
                 if let Ok(Ok(Ok(Some(mut peer)))) = result {
                     if !devices.list().is_ok_and(|list| list.iter().any(|d| d.id == peer.peer && d.address.is_none())) {
-                        peer.connection.close(1u8.into(), b"revoked");
+                        peer.connection.close(REVOKED.into(), b"revoked");
                         continue;
                     }
                     if active.as_ref().is_some_and(|a| a.id != peer.peer && !a.task.is_finished()) {
@@ -374,20 +427,23 @@ async fn serve(
                         });
                         continue;
                     }
-                    if let Some(previous) = active.take() { previous.stop().await; }
-                    let (stop, cancelled) = watch::channel(false);
+                    if let Some(previous) = active.take() {
+                        previous.disconnect(REPLACED, b"replaced by a new session").await;
+                    }
+                    let (peer_stop, cancelled) = watch::channel(false);
                     let state = state.clone();
                     let config = features.subscribe();
                     let peer_id = peer.peer;
+                    let connection = peer.connection.clone();
                     let task = tokio::spawn(async move {
-                        let result = serve_peer(peer, local_screen, edge, &state, config.clone(), cancelled, start_capture).await;
-                        *state.features.lock().unwrap() = *config.borrow();
-                        state.keyboard_supported.store(true, Ordering::Release);
-                        state.connected.store(false, Ordering::Release);
-                        state.mouse_on_peer.store(false, Ordering::Release);
+                        let result = serve_peer(peer, local_screen, edge, &state, config.clone(), cancelled, start_capture, limits).await;
+                        state.set_features(apply_limits(*config.borrow()));
+                        state.set_peer_details(true, Some(edge));
+                        state.forwarding(false);
                         if let Err(e) = result { state.set_error(e.to_string()); }
+                        state.phase(Phase::Listening);
                     });
-                    active = Some(Active { id: peer_id, stop, task });
+                    active = Some(Active { id: peer_id, connection, stop: peer_stop, task });
                 }
                 if let Ok(mut lease) = invite.try_lock() {
                     if lease.as_ref().is_some_and(|entry| Instant::now() >= entry.expires) {
@@ -397,15 +453,16 @@ async fn serve(
                 }
             }
             _ = tick.tick() => {
-                if state.shutdown.load(Ordering::Acquire) { break; }
                 if active.as_ref().is_some_and(|peer| peer.task.is_finished()) {
                     active.take().unwrap().stop().await;
-                    *state.features.lock().unwrap() = *features.borrow();
-                    state.keyboard_supported.store(true, Ordering::Release);
+                    state.set_features(apply_limits(*features.borrow()));
+                    state.set_peer_details(true, Some(edge));
+                    state.forwarding(false);
+                    state.phase(Phase::Listening);
                 }
                 if let Some(peer) = &active {
                     if !devices.list().is_ok_and(|list| list.iter().any(|d| d.id == peer.id && d.address.is_none())) {
-                        active.take().unwrap().stop().await;
+                        active.take().unwrap().disconnect(REVOKED, b"revoked").await;
                     }
                 }
                 if let Ok(mut lease) = invite.try_lock() {
@@ -422,8 +479,13 @@ async fn serve(
     }
     pending.shutdown().await;
     endpoint.close(0u8.into(), b"server stopped");
-    let _ = time::timeout(HEARTBEAT, endpoint.wait_idle()).await;
+    let _ = time::timeout(Duration::from_millis(200), endpoint.wait_idle()).await;
     Ok(())
+}
+
+// Discard the watch guard before returning to a select branch that can await.
+async fn wait_for(signal: &mut watch::Receiver<bool>, value: bool) {
+    let _ = signal.wait_for(|current| *current == value).await;
 }
 
 struct Channel {
@@ -431,6 +493,7 @@ struct Channel {
     tx: SendStream,
     incoming: mpsc::Receiver<Result<Control>>,
     reader: JoinHandle<()>,
+    stop: Option<watch::Receiver<bool>>,
 }
 
 impl Channel {
@@ -450,13 +513,22 @@ impl Channel {
             tx,
             incoming,
             reader,
+            stop: None,
         }
     }
 
     async fn send(&mut self, message: Control) -> Result<()> {
-        time::timeout(HEARTBEAT, transport::send(&mut self.tx, &message))
-            .await
-            .context("Control stream stalled")?
+        let send = time::timeout(HEARTBEAT, transport::send(&mut self.tx, &message));
+        let result = if let Some(stop) = &mut self.stop {
+            tokio::select! {
+                biased;
+                _ = wait_for(stop, true) => bail!("Session cancelled"),
+                result = send => result,
+            }
+        } else {
+            send.await
+        };
+        result.context("Control stream stalled")?
     }
 
     async fn receive(&mut self) -> Result<Control> {
@@ -511,9 +583,10 @@ impl Liveness {
 
 fn connected(state: &SharedState, connection: &Connection, features: Features) {
     state.set_peer(connection.remote_address().to_string());
-    *state.features.lock().unwrap() = features;
+    state.set_features(features);
     state.clear_error();
-    state.connected.store(true, Ordering::Release);
+    state.mark_ready();
+    state.phase(Phase::Connected);
 }
 
 async fn serve_peer(
@@ -524,24 +597,33 @@ async fn serve_peer(
     mut desired: watch::Receiver<Features>,
     mut cancelled: watch::Receiver<bool>,
     start_capture: impl FnOnce() -> Result<Capture>,
+    limits: Features,
 ) -> Result<()> {
     let same_platform = peer.mac == cfg!(target_os = "macos");
-    state
-        .keyboard_supported
-        .store(same_platform, Ordering::Release);
+    state.set_peer_details(same_platform, Some(edge));
     let negotiate = |mut features: Features| {
-        features.keyboard &= same_platform;
+        features.keyboard &= same_platform && limits.keyboard && peer.limits.keyboard;
+        features.clipboard &= limits.clipboard && peer.limits.clipboard;
         features
     };
     let mut features = negotiate(*desired.borrow_and_update());
     let mut capture = start_capture()?;
+    tokio::select! {
+        _ = wait_for(&mut cancelled, true) => return Ok(()),
+        ready = capture.ready() => ready?,
+    }
+    let ready = LoginReply::Ready(ReadyConfig {
+        features,
+        edge: Some(edge),
+        keyboard_supported: Some(same_platform),
+    });
     let mut tx = peer.tx;
-    time::timeout(
-        HEARTBEAT,
-        transport::send(&mut tx, &LoginReply::Ready(features)),
-    )
-    .await??;
+    tokio::select! {
+        _ = wait_for(&mut cancelled, true) => return Ok(()),
+        result = time::timeout(HEARTBEAT, transport::send(&mut tx, &ready)) => result??,
+    }
     let mut link = Channel::new(peer.connection, tx, peer.rx);
+    link.stop = Some(cancelled.clone());
     let mut clipboard = clipboard::Sync::new(link.connection.clone(), true);
     clipboard.set_enabled(features.clipboard);
     connected(state, &link.connection, features);
@@ -551,19 +633,26 @@ async fn serve_peer(
     let mut snapshot = time::interval(SNAPSHOT);
     let mut frame = time::interval(FRAME);
     frame.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut configure_sent = None::<Instant>;
     loop {
         tokio::select! {
-            _ = cancelled.changed() => break,
+            _ = wait_for(&mut cancelled, true) => break,
             message = link.receive() => match message? {
                 Control::Ping(seq) => link.send(Control::Pong(seq)).await?,
                 Control::Pong(seq) => liveness.receive(seq, state),
                 Control::Configured(value) => {
-                    if value == features { *state.features.lock().unwrap() = value; }
+                    if configure_sent.is_some() && value == features {
+                        configure_sent = None;
+                        state.set_features(value);
+                        capture.suppression.keyboard.store(
+                            value.keyboard && (forward.active || forward.pending.is_some()), Ordering::Release,
+                        );
+                    }
                 }
                 Control::EnterAck(epoch) if forward.pending.is_some() && epoch == forward.position.epoch => {
                     forward.pending = None;
                     forward.active = true;
-                    state.mouse_on_peer.store(true, Ordering::Release);
+                    state.forwarding(true);
                     for event in std::mem::take(&mut forward.buffered) {
                         if !forward.active { break; }
                         forward_event(event, &mut forward, &mut capture, state, features, &mut link).await?;
@@ -571,18 +660,7 @@ async fn serve_peer(
                 }
                 _ => {}
             },
-            _ = desired.changed() => {
-                features = negotiate(*desired.borrow_and_update());
-                if !features.keyboard {
-                    forward.disable_keyboard();
-                    capture.suppression.keyboard.store(false, Ordering::Release);
-                }
-                clipboard.set_enabled(features.clipboard);
-                link.send(Control::Configure(features)).await?;
-                if features.keyboard && (forward.active || forward.pending.is_some()) {
-                    capture.suppression.keyboard.store(true, Ordering::Release);
-                }
-            }
+            _ = desired.changed() => {}
             event = capture.events.recv() => {
                 let event = event.context("Input capture stopped")?;
                 if forward.active {
@@ -592,13 +670,18 @@ async fn serve_peer(
                     forward.buffered.push(event);
                 } else if let CapturedInput::Mouse { event: MouseEvent::Move { dx, dy }, abs_x, abs_y } = event {
                     if let Some(enter) = forward.entry(dx, dy, abs_x, abs_y) {
-                        capture.suppress(true, features.keyboard);
-                        link.send(enter).await?;
+                        if capture.can_enter() {
+                            capture.suppress(true, state.status().features.keyboard);
+                            link.send(enter).await?;
+                        } else {
+                            forward.clear();
+                        }
                     }
                 }
             }
             _ = frame.tick() => {
                 liveness.check()?;
+                ensure!(!configure_sent.is_some_and(|sent| sent.elapsed() >= Duration::from_secs(2)), "Peer did not acknowledge settings");
                 ensure!(!capture.suppression.failed.load(Ordering::Acquire), "Input capture queue overflow");
                 ensure!(!forward.pending.is_some_and(|start| start.elapsed() >= ENTER_TIMEOUT), "Peer did not confirm cursor entry");
                 if forward.motion_dirty && forward.active {
@@ -609,10 +692,25 @@ async fn serve_peer(
             _ = heartbeat.tick() => liveness.ping(&mut link).await?,
             _ = snapshot.tick() => if forward.active { link.send(forward.snapshot()).await?; }
         }
+        let next = negotiate(*desired.borrow_and_update());
+        if configure_sent.is_none() && next != features {
+            features = next;
+            if !features.keyboard {
+                forward.disable_keyboard();
+            }
+            clipboard.set_enabled(features.clipboard);
+            link.send(Control::Configure(features)).await?;
+            configure_sent = Some(Instant::now());
+        }
     }
     capture.suppress(false, false);
     if forward.active || forward.pending.is_some() {
-        let _ = link.send(Control::Leave(forward.position.epoch)).await;
+        let leave = Control::Leave(forward.position.epoch);
+        let _ = time::timeout(
+            Duration::from_millis(50),
+            transport::send(&mut link.tx, &leave),
+        )
+        .await;
     }
     Ok(())
 }
@@ -628,7 +726,7 @@ async fn forward_event(
     if let Some(message) = forward.input(event, features.keyboard) {
         if matches!(message, Control::Leave(_)) {
             capture.suppress(false, false);
-            state.mouse_on_peer.store(false, Ordering::Release);
+            state.forwarding(false);
         }
         link.send(message).await?;
     }
@@ -640,7 +738,8 @@ async fn client_login(
     devices: &Devices,
     server: &PairedDevice,
     screen: ScreenInfo,
-) -> Result<(quinn::Endpoint, Channel, Features)> {
+    limits: Features,
+) -> Result<(quinn::Endpoint, Channel, ReadyConfig)> {
     let (endpoint, connection) = transport::connect(
         server
             .address
@@ -649,22 +748,32 @@ async fn client_login(
         server.certificate.clone(),
     )
     .await?;
-    let token = devices.token(server.id)?;
+    let store = devices.clone();
+    let server_id = server.id;
+    let (local_id, token) = tokio::task::spawn_blocking(move || {
+        let id = store.id()?;
+        let token = store
+            .token(server_id)
+            .map_err(|e| LoginRejected(format!("Cannot read saved server credentials: {e}")))?;
+        Ok::<_, anyhow::Error>((id, token))
+    })
+    .await??;
     let (tx, rx, features) = time::timeout(HANDSHAKE, async {
         let (mut tx, mut rx) = connection.open_bi().await?;
         transport::send(
             &mut tx,
             &Login::Connect {
-                id: devices.id()?,
+                id: local_id,
                 token: *token,
                 screen,
                 mac: cfg!(target_os = "macos"),
+                limits,
             },
         )
         .await?;
         match transport::receive(&mut rx).await? {
             LoginReply::Ready(features) => Ok((tx, rx, features)),
-            LoginReply::Rejected(message) => bail!("{message}"),
+            LoginReply::Rejected(message) => Err(LoginRejected(message).into()),
             _ => bail!("Unexpected authentication reply"),
         }
     })
@@ -673,34 +782,177 @@ async fn client_login(
     Ok((endpoint, Channel::new(connection, tx, rx), features))
 }
 
+#[derive(Debug)]
+struct LoginRejected(String);
+
+impl std::fmt::Display for LoginRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for LoginRejected {}
+
 async fn connect(
     devices: Devices,
     server: PairedDevice,
     state: &SharedState,
-    mut commands: mpsc::Receiver<SessionCommand>,
+    commands: mpsc::Receiver<SessionCommand>,
+    limits: Features,
 ) -> Result<()> {
     let screen = screen::get_screen_info()?;
     ensure!(screen.valid(), "Invalid local screen dimensions");
-    let login = client_login(&devices, &server, screen);
-    tokio::pin!(login);
-    let (_endpoint, mut link, mut features) = loop {
-        tokio::select! {
-            result = &mut login => break result?,
-            command = commands.recv() => match command {
-                Some(SessionCommand::Stop) | None => return Ok(()),
-                Some(SessionCommand::Revoke(peer)) if peer == server.id => {
-                    devices.forget(peer)?;
-                    return Ok(());
-                }
-                Some(SessionCommand::Revoke(peer)) => devices.forget(peer)?,
-                _ => {}
-            },
+    connect_with_input(
+        devices,
+        server,
+        state,
+        commands,
+        limits,
+        screen,
+        crate::input::simulate::create_simulator,
+    )
+    .await
+}
+
+async fn connect_with_input(
+    devices: Devices,
+    mut server: PairedDevice,
+    state: &SharedState,
+    mut commands: mpsc::Receiver<SessionCommand>,
+    limits: Features,
+    screen: ScreenInfo,
+    simulator: fn() -> Result<Box<dyn crate::input::simulate::InputSimulator>>,
+) -> Result<()> {
+    let mut stop = state.stop_signal();
+    let mut auto_reconnect = state.reconnect_signal();
+    let mut delay = Duration::from_secs(1);
+    loop {
+        if *stop.borrow() {
+            return Ok(());
         }
+        let result = {
+            let login = client_login(&devices, &server, screen, limits);
+            tokio::pin!(login);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = wait_for(&mut stop, true) => return Ok(()),
+                    command = commands.recv() => if stop_client(command, &devices, server.id)? { return Ok(()); },
+                    result = &mut login => break result,
+                }
+            }
+        };
+        let error = match result {
+            Ok((_endpoint, link, ready)) => {
+                let connection = link.connection.clone();
+                let result = receive_input(
+                    &devices,
+                    &server,
+                    state,
+                    &mut commands,
+                    &mut stop,
+                    link,
+                    ready,
+                    screen,
+                    limits,
+                    simulator,
+                )
+                .await;
+                state.forwarding(false);
+                delay = Duration::from_secs(1);
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(error) => match connection.close_reason() {
+                        Some(quinn::ConnectionError::ApplicationClosed(close))
+                            if close.error_code == REPLACED.into() =>
+                        {
+                            LoginRejected("Another session has connected as this device".into())
+                                .into()
+                        }
+                        Some(quinn::ConnectionError::ApplicationClosed(close))
+                            if close.error_code == REVOKED.into() =>
+                        {
+                            LoginRejected("Device authorization was revoked".into()).into()
+                        }
+                        _ => error,
+                    },
+                }
+            }
+            Err(error) => error,
+        };
+        if *stop.borrow() {
+            return Ok(());
+        }
+        if !*auto_reconnect.borrow() || error.is::<LoginRejected>() {
+            return Err(error);
+        }
+        state.set_error(error.to_string());
+        state.phase(Phase::Reconnecting);
+        let jitter = Duration::from_millis(u64::from(random::<1>()?[0]) % 150);
+        let retry = time::sleep(delay + jitter);
+        tokio::pin!(retry);
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for(&mut stop, true) => return Ok(()),
+                _ = wait_for(&mut auto_reconnect, false) => return Err(error),
+                command = commands.recv() => if stop_client(command, &devices, server.id)? { return Ok(()); },
+                _ = &mut retry => break,
+            }
+        }
+        delay = (delay * 2).min(Duration::from_secs(8));
+        // Use the currently saved endpoint and pin. A forgotten server must
+        // never be reconnected using the old in-memory entry.
+        server = devices
+            .list()?
+            .into_iter()
+            .find(|peer| peer.id == server.id && peer.address.is_some())
+            .context("Saved server was removed")?;
+    }
+}
+
+fn stop_client(
+    command: Option<SessionCommand>,
+    devices: &Devices,
+    server: DeviceId,
+) -> Result<bool> {
+    match command {
+        Some(SessionCommand::Stop) | None => Ok(true),
+        Some(SessionCommand::Revoke(peer)) => {
+            devices.forget(peer)?;
+            Ok(peer == server)
+        }
+        _ => Ok(false),
+    }
+}
+
+async fn receive_input(
+    devices: &Devices,
+    server: &PairedDevice,
+    state: &SharedState,
+    commands: &mut mpsc::Receiver<SessionCommand>,
+    stop: &mut watch::Receiver<bool>,
+    mut link: Channel,
+    ready: ReadyConfig,
+    screen: ScreenInfo,
+    limits: Features,
+    simulator: fn() -> Result<Box<dyn crate::input::simulate::InputSimulator>>,
+) -> Result<()> {
+    let constrain = |mut features: Features| {
+        features.keyboard &= limits.keyboard;
+        features.clipboard &= limits.clipboard;
+        features
     };
+    let mut features = constrain(ready.features);
+    let mut input = RemoteInput::new(
+        simulator()
+            .map_err(|error| LoginRejected(format!("Cannot initialize local input: {error}")))?,
+        screen,
+    );
+    state.set_peer_details(ready.keyboard_supported.unwrap_or(true), ready.edge);
     connected(state, &link.connection, features);
+    link.stop = Some(stop.clone());
     let mut clipboard = clipboard::Sync::new(link.connection.clone(), false);
     clipboard.set_enabled(features.clipboard);
-    let mut input = RemoteInput::new(crate::input::simulate::create_simulator()?, screen);
     let mut heartbeat = time::interval(HEARTBEAT);
     let mut liveness = Liveness::new();
     let mut frame = time::interval(Duration::from_secs_f64(
@@ -710,33 +962,25 @@ async fn connect(
     let connection = link.connection.clone();
     loop {
         tokio::select! {
-            command = commands.recv() => match command {
-                Some(SessionCommand::Stop) | None => break,
-                Some(SessionCommand::Revoke(peer)) if peer == server.id => {
-                    input.leave()?;
-                    devices.forget(peer)?;
-                    break;
-                }
-                Some(SessionCommand::Revoke(peer)) => devices.forget(peer)?,
-                _ => {}
-            },
+            _ = wait_for(stop, true) => break,
+            command = commands.recv() => if stop_client(command, devices, server.id)? { break; },
             message = link.receive() => match message? {
                 Control::Ping(seq) => link.send(Control::Pong(seq)).await?,
                 Control::Pong(seq) => liveness.receive(seq, state),
                 Control::Enter(position) => {
                     input.enter(position)?;
-                    state.mouse_on_peer.store(true, Ordering::Release);
+                    state.forwarding(true);
                     link.send(Control::EnterAck(position.epoch)).await?;
                 }
                 Control::Leave(epoch) if epoch == input.epoch => {
                     input.leave()?;
-                    state.mouse_on_peer.store(false, Ordering::Release);
+                    state.forwarding(false);
                 }
                 Control::Configure(value) => {
-                    if !value.keyboard { input.release_keys()?; }
-                    clipboard.set_enabled(value.clipboard);
-                    features = value;
-                    *state.features.lock().unwrap() = value;
+                    features = constrain(value);
+                    if !features.keyboard { input.release_keys()?; }
+                    clipboard.set_enabled(features.clipboard);
+                    state.set_features(features);
                     link.send(Control::Configured(value)).await?;
                 }
                 message => {
@@ -750,7 +994,6 @@ async fn connect(
                 }
             }
             _ = frame.tick() => {
-                if state.shutdown.load(Ordering::Acquire) { break; }
                 liveness.check()?;
                 input.flush()?;
             }
@@ -829,10 +1072,18 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let state = shared.clone();
         let store = server.clone();
-        let task =
-            tokio::spawn(
-                async move { serve(store, 0, Edge::Right, &state, rx, Capture::mock).await },
-            );
+        let task = tokio::spawn(async move {
+            serve(
+                store,
+                0,
+                Edge::Right,
+                &state,
+                rx,
+                Capture::mock,
+                Features::default(),
+            )
+            .await
+        });
         tx.send(SessionCommand::Invite("127.0.0.1".into())).await?;
         let code = invitation(&shared).await;
 
@@ -854,12 +1105,14 @@ mod tests {
             .to_string()
             .contains("Invitation invalid"));
         stranger.add(saved.clone(), &[5; 32])?;
-        assert!(client_login(&stranger, &saved, screen())
-            .await
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("not authorized"));
+        assert!(
+            client_login(&stranger, &saved, screen(), Features::default())
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not authorized")
+        );
 
         let reopened = Devices::new(client_dir.path().into(), client_vault);
         let reopened_server = Devices::new(server_dir.path().into(), server_vault);
@@ -870,10 +1123,18 @@ mod tests {
         let shared = Arc::new(SharedState::new());
         let state = shared.clone();
         let store = reopened_server.clone();
-        let task =
-            tokio::spawn(
-                async move { serve(store, 0, Edge::Right, &state, rx, Capture::mock).await },
-            );
+        let task = tokio::spawn(async move {
+            serve(
+                store,
+                0,
+                Edge::Right,
+                &state,
+                rx,
+                Capture::mock,
+                Features::default(),
+            )
+            .await
+        });
         tx.send(SessionCommand::Invite("127.0.0.1".into())).await?;
         let address = invitation(&shared).await.server.address.unwrap();
         reopened.set_address(saved.id, address)?;
@@ -882,7 +1143,8 @@ mod tests {
             .into_iter()
             .find(|d| d.id == saved.id)
             .unwrap();
-        let (ep1, first, _) = client_login(&reopened, &saved, screen()).await?;
+        let (ep1, first, _) =
+            client_login(&reopened, &saved, screen(), Features::default()).await?;
         let (ep2, mut second, _) = client_login(
             &reopened,
             &saved,
@@ -890,10 +1152,14 @@ mod tests {
                 width: 1920,
                 height: 1080,
             },
+            Features::default(),
         )
         .await?;
         assert_ne!(ep1.local_addr()?.port(), ep2.local_addr()?.port());
-        time::timeout(HEARTBEAT, first.connection.closed()).await?;
+        assert!(
+            matches!(time::timeout(HEARTBEAT, first.connection.closed()).await?,
+            quinn::ConnectionError::ApplicationClosed(close) if close.error_code == REPLACED.into())
+        );
         drop(first);
         // Clipboard stays disabled and authenticated control remains usable.
         second.send(Control::Ping(99)).await?;
@@ -932,7 +1198,11 @@ mod tests {
 
         tx.send(SessionCommand::Revoke(reopened.id()?)).await?;
         time::timeout(HEARTBEAT, second.connection.closed()).await?;
-        assert!(client_login(&reopened, &saved, screen()).await.is_err());
+        assert!(
+            client_login(&reopened, &saved, screen(), Features::default())
+                .await
+                .is_err()
+        );
         tx.send(SessionCommand::Stop).await?;
         task.await??;
         Ok(())
@@ -1025,6 +1295,7 @@ mod tests {
                     peer: [0; 16],
                     screen: screen(),
                     mac: cfg!(target_os = "macos"),
+                    limits: Features::default(),
                 },
                 screen(),
                 Edge::Right,
@@ -1032,6 +1303,7 @@ mod tests {
                 features,
                 stop,
                 || Ok(capture),
+                Features::default(),
             )
             .await
         });
@@ -1055,7 +1327,7 @@ mod tests {
         .await??;
         transport::send(&mut tx, &Control::EnterAck(epoch)).await?;
         time::timeout(HEARTBEAT, async {
-            while !state.mouse_on_peer.load(Ordering::Acquire) {
+            while !state.status().forwarding {
                 time::sleep(FRAME).await;
             }
         })
@@ -1076,6 +1348,145 @@ mod tests {
         assert!(!suppression.mouse.load(Ordering::Acquire));
         assert!(!suppression.keyboard.load(Ordering::Acquire));
         producer.await?;
+        Ok(())
+    }
+
+    struct MockInput;
+
+    impl crate::input::simulate::InputSimulator for MockInput {
+        fn move_to(&mut self, _: f64, _: f64) -> Result<()> {
+            Ok(())
+        }
+        fn move_relative(&mut self, _: f64, _: f64) -> Result<()> {
+            Ok(())
+        }
+        fn button_down(&mut self, _: crate::protocol::MouseButton) -> Result<()> {
+            Ok(())
+        }
+        fn button_up(&mut self, _: crate::protocol::MouseButton) -> Result<()> {
+            Ok(())
+        }
+        fn key_event(&mut self, _: u32, _: bool, _: u64) -> Result<()> {
+            Ok(())
+        }
+        fn scroll(&mut self, _: f64, _: f64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn mock_input() -> Result<Box<dyn crate::input::simulate::InputSimulator>> {
+        Ok(Box::new(MockInput))
+    }
+
+    async fn wait_phase(state: &SharedState, phase: Phase) -> Result<()> {
+        time::timeout(Duration::from_secs(3), async {
+            while state.status().phase != phase {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconnect_uses_updated_paired_address_and_stops_during_backoff() -> Result<()> {
+        let server_dir = tempfile::tempdir()?;
+        let client_dir = tempfile::tempdir()?;
+        let server = Devices::new(server_dir.path().into(), Arc::new(Vault::default()));
+        let client = Devices::new(client_dir.path().into(), Arc::new(Vault::default()));
+        server.set_features(Features {
+            keyboard: true,
+            clipboard: false,
+        })?;
+        let server_state = Arc::new(SharedState::new());
+        let (server_tx, rx) = mpsc::channel(8);
+        let store = server.clone();
+        let shared = server_state.clone();
+        let server_task = tokio::spawn(async move {
+            serve(
+                store,
+                0,
+                Edge::Right,
+                &shared,
+                rx,
+                Capture::mock,
+                Features::default(),
+            )
+            .await
+        });
+        server_tx
+            .send(SessionCommand::Invite("127.0.0.1".into()))
+            .await?;
+        let saved = pair(client.clone(), invitation(&server_state).await).await?;
+        let original_address = saved.address.clone();
+
+        let client_state = Arc::new(SharedState::new());
+        let (_client_tx, rx) = mpsc::channel(8);
+        let store = client.clone();
+        let shared = client_state.clone();
+        let peer = saved.clone();
+        let client_task = tokio::spawn(async move {
+            connect_with_input(
+                store,
+                peer,
+                &shared,
+                rx,
+                Features {
+                    keyboard: false,
+                    clipboard: false,
+                },
+                screen(),
+                mock_input,
+            )
+            .await
+        });
+        wait_phase(&client_state, Phase::Connected).await?;
+        assert!(!client_state.status().features.keyboard);
+        assert_eq!(client_state.status().edge, Some(Edge::Right));
+
+        server_state.request_stop();
+        time::timeout(Duration::from_secs(1), server_task).await???;
+        wait_phase(&client_state, Phase::Reconnecting).await?;
+
+        let replacement_state = Arc::new(SharedState::new());
+        let (replacement_tx, rx) = mpsc::channel(8);
+        let shared = replacement_state.clone();
+        let replacement = tokio::spawn(async move {
+            serve(
+                server,
+                0,
+                Edge::Left,
+                &shared,
+                rx,
+                Capture::mock,
+                Features::default(),
+            )
+            .await
+        });
+        replacement_tx
+            .send(SessionCommand::Invite("127.0.0.1".into()))
+            .await?;
+        let address = invitation(&replacement_state).await.server.address.unwrap();
+        // The previous client/server endpoint is closed. If the OS reuses
+        // its port, this still exercises a new authenticated QUIC session.
+        if Some(&address) != original_address.as_ref() {
+            client.set_address(saved.id, address.clone())?;
+        }
+        wait_phase(&client_state, Phase::Connected).await?;
+        assert_eq!(client_state.status().edge, Some(Edge::Left));
+        assert_eq!(
+            client_state.peer_addr.lock().unwrap().as_deref(),
+            Some(address.as_str())
+        );
+
+        replacement_state.request_stop();
+        time::timeout(Duration::from_secs(1), replacement).await???;
+        wait_phase(&client_state, Phase::Reconnecting).await?;
+        let started = Instant::now();
+        client_state.request_stop();
+        assert_eq!(client_state.status().phase, Phase::Stopping);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        time::timeout(Duration::from_secs(1), client_task).await???;
         Ok(())
     }
 

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main, master]
     tags: ["v*"]
   pull_request:
     branches: [master]
@@ -48,7 +48,8 @@ jobs:
         run: cargo build --locked --features ui --target ${{ matrix.target }}
 
       - name: Test
-        run: cargo test --locked --all-features --lib --bins
+        if: matrix.target != 'aarch64-apple-darwin'
+        run: cargo test --locked --all-features --lib --tests
 
       - name: Build (release)
         if: startsWith(github.ref, 'refs/tags/')

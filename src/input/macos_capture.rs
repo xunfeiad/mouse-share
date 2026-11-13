@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::capture::{CaptureQueue, CapturedInput, InputCapture, Suppression};
+use super::capture::{CaptureQueue, CapturedInput, InputCapture, InputRouting, Suppression};
 
 pub struct MacOsCapture {
     suppressing: Arc<Suppression>,
@@ -28,17 +28,7 @@ impl MacOsCapture {
 impl InputCapture for MacOsCapture {
     fn run(&mut self, sender: CaptureQueue, shutdown: Arc<AtomicBool>) -> Result<()> {
         let suppressing = self.suppressing.clone();
-        // Set by the tap callback when macOS disables the tap (timeout or
-        // user-input stall). The outer run-loop polls this and re-enables.
-        // Without this, a single slow callback permanently kills the tap:
-        // events flow through unsuppressed, the local cursor tracks the
-        // physical mouse even though the server thinks it's forwarding,
-        // and the user sees "cursor still moving on the server even though
-        // mouse is supposed to be on the client".
-        let tap_disabled = Arc::new(AtomicBool::new(false));
-        let tap_disabled_cb = tap_disabled.clone();
-        let local_keys = std::cell::RefCell::new(std::collections::BTreeSet::new());
-        let local_buttons = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        let routing = std::cell::RefCell::new(InputRouting::default());
 
         let events_of_interest = vec![
             CGEventType::MouseMoved,
@@ -67,16 +57,9 @@ impl InputCapture for MacOsCapture {
                 {
                     return Some(event.clone());
                 }
-                match event_type {
-                    // macOS sends these special event types through the tap
-                    // callback when it has disabled the tap. Signal the
-                    // outer loop to re-enable, then pass through.
+                let swallow = match event_type {
                     CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
-                        log::warn!(
-                            "macOS event tap disabled ({:?}), scheduling re-enable",
-                            event_type
-                        );
-                        tap_disabled_cb.store(true, Ordering::SeqCst);
+                        suppressing.fail_open();
                         return Some(event.clone());
                     }
                     CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged => {
@@ -84,99 +67,62 @@ impl InputCapture for MacOsCapture {
                             .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
                             as u32;
                         let flags = event.get_flags().bits();
-                        let down = match event_type {
-                            CGEventType::FlagsChanged => modifier_down(keycode, flags),
-                            CGEventType::KeyDown => true,
-                            _ => false,
-                        };
-                        let mut local_keys = local_keys.borrow_mut();
-                        if !suppressing.keyboard.load(Ordering::Acquire)
-                            || local_keys.contains(&keycode)
-                        {
-                            if down {
-                                local_keys.insert(keycode);
-                            } else {
-                                local_keys.remove(&keycode);
+                        if keycode == 57 && matches!(event_type, CGEventType::FlagsChanged) {
+                            // Caps Lock is a toggle, never a continuously held key.
+                            let remote = suppressing.keyboard.load(Ordering::Acquire);
+                            if remote {
+                                for down in [true, false] {
+                                    sender.send(CapturedInput::Key(KeyEvent {
+                                        keycode,
+                                        down,
+                                        flags,
+                                    }));
+                                }
                             }
-                            return Some(event.clone());
-                        }
-                        sender.send(CapturedInput::Key(KeyEvent {
-                            keycode,
-                            down,
-                            flags,
-                        }));
-                        return if suppressing.keyboard.load(Ordering::Acquire) {
-                            None
+                            remote
                         } else {
-                            Some(event.clone())
-                        };
+                            let down = match event_type {
+                                CGEventType::FlagsChanged => modifier_down(keycode, flags),
+                                CGEventType::KeyDown => true,
+                                _ => false,
+                            };
+                            let (swallow, send) =
+                                routing.borrow_mut().key(keycode, down, &suppressing);
+                            if send {
+                                sender.send(CapturedInput::Key(KeyEvent {
+                                    keycode,
+                                    down,
+                                    flags,
+                                }));
+                            }
+                            swallow
+                        }
                     }
                     _ => {
-                        // Mouse: read raw HID delta from event fields. This
-                        // is the relative movement as reported by the mouse
-                        // hardware, independent of cursor position clamping
-                        // at screen edges — crucial because when suppression
-                        // is ON, the OS freezes the cursor and
-                        // event.location() stops changing.
                         let dx =
                             event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as f64;
                         let dy =
                             event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as f64;
-
-                        if let Some(mouse_event) = map_event(event_type, event, dx, dy) {
-                            let suppressed = suppressing.mouse.load(Ordering::Acquire);
-                            let mut local_buttons = local_buttons.borrow_mut();
-                            match &mouse_event {
-                                MouseEvent::ButtonDown(b) if !suppressed => {
-                                    local_buttons.insert(*b);
-                                }
-                                MouseEvent::ButtonUp(b) if local_buttons.remove(b) => {
-                                    return Some(event.clone())
-                                }
-                                _ => {}
+                        if let Some(mouse) = map_event(event_type, event, dx, dy) {
+                            let (swallow, send) = routing.borrow_mut().mouse(&mouse, &suppressing);
+                            if send {
+                                let loc = event.location();
+                                sender.send(CapturedInput::Mouse {
+                                    event: mouse,
+                                    abs_x: loc.x,
+                                    abs_y: loc.y,
+                                });
                             }
-                            if !suppressed && !local_buttons.is_empty() {
-                                return Some(event.clone());
-                            }
-                            let loc = event.location();
-                            sender.send(CapturedInput::Mouse {
-                                event: mouse_event,
-                                abs_x: loc.x,
-                                abs_y: loc.y,
-                            });
+                            swallow
+                        } else {
+                            false
                         }
                     }
-                }
-
-                // Upgraded to SeqCst to remove any doubt about the read
-                // seeing the latest store from the server event loop.
-                // This costs a memory barrier per event (~ns) — negligible
-                // at human mouse rates.
-                let suppress = suppressing.mouse.load(Ordering::Acquire);
-                // Diagnostic: when a button / scroll event flows through the
-                // tap, log which side of the suppress fence it took. This
-                // nails down whether the "click fires on server too" bug is
-                // (a) tap returning None but macOS ignoring it, or (b) the
-                // suppress flag not being set at that moment. Moves are not
-                // logged — they're too frequent.
-                let is_discrete = matches!(
-                    event_type,
-                    CGEventType::LeftMouseDown
-                        | CGEventType::LeftMouseUp
-                        | CGEventType::RightMouseDown
-                        | CGEventType::RightMouseUp
-                        | CGEventType::OtherMouseDown
-                        | CGEventType::OtherMouseUp
-                        | CGEventType::ScrollWheel
-                );
-                if is_discrete {
-                    log::trace!("Mouse event {event_type:?}, suppressed={suppress}");
-                }
-
-                if suppress {
-                    None // Suppress: swallow the event
+                };
+                if swallow {
+                    None
                 } else {
-                    Some(event.clone()) // Pass through
+                    Some(event.clone())
                 }
             },
         )
@@ -196,31 +142,10 @@ impl InputCapture for MacOsCapture {
         let run_loop = CFRunLoop::get_current();
         run_loop.add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
         tap.enable();
-
-        log::info!("macOS event tap started, entering run loop");
-        // Poll the runloop in short slices so we can notice `shutdown` and
-        // break out cleanly. `run_current()` would block forever and leave
-        // no way for the UI to stop the backend.
-        //
-        // 16 ms poll instead of 100 ms: when macOS auto-disables the tap
-        // (TapDisabledByTimeout / TapDisabledByUserInput) we only see it
-        // at the next poll cycle. With a 100 ms slice, up to 100 ms of
-        // events (clicks included!) can flow through unsuppressed — this
-        // is one root cause of the "click fires on server too" bug. A
-        // 16 ms slice caps the leak window at ~one display frame.
-        loop {
-            if shutdown.load(Ordering::SeqCst) {
-                log::info!("macOS event tap: shutdown requested, exiting run loop");
-                break;
-            }
-            // Re-enable the tap if macOS disabled it during the last
-            // callback cycle. `tap.enable()` is idempotent so the check
-            // doesn't need to be perfectly precise — worst case we call
-            // it an extra time.
-            if tap_disabled.swap(false, Ordering::SeqCst) {
-                log::info!("Re-enabling macOS event tap after disable");
-                tap.enable();
-            }
+        self.suppressing.ready.store(true, Ordering::Release);
+        log::info!("macOS input tap started");
+        while !shutdown.load(Ordering::Acquire) && !self.suppressing.failed.load(Ordering::Acquire)
+        {
             let result = CFRunLoop::run_in_mode(
                 unsafe { kCFRunLoopDefaultMode },
                 Duration::from_millis(16),
@@ -309,5 +234,20 @@ fn map_event(event_type: CGEventType, event: &CGEvent, dx: f64, dy: f64) -> Opti
         }
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::modifier_down;
+
+    #[test]
+    fn releasing_left_shift_keeps_right_shift_held() {
+        let both = 0x0002_0006;
+        let right = 0x0002_0004;
+        assert!(modifier_down(56, both));
+        assert!(modifier_down(60, both));
+        assert!(!modifier_down(56, right));
+        assert!(modifier_down(60, right));
     }
 }

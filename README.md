@@ -54,6 +54,14 @@ mouse-share client --device <saved-server-id>
 
 `pair` prompts for the invitation without echoing it. On subsequent starts, run `mouse-share server` and connect using the saved ID. Use `mouse-share address <id> <host:port>` to update an address and `mouse-share revoke <id>` to remove a device. Press Ctrl+C to end a CLI session.
 
+## Desktop settings
+
+- The app saves language, debug logging, the default UDP port, and screen edge. Port and edge changes apply the next time you start sharing.
+- Reconnect is enabled by default and uses the saved server address and certificate. Stopping, canceling, or quitting ends retries.
+- With the tray enabled, closing the window leaves sharing active. Use the tray to reopen the window, start or stop sharing, or quit.
+- Start on login is opt-in. It resumes the last successful role and connection settings. A regular launch opens the window.
+- For a CLI run, use `--no-keyboard`, `--no-clipboard`, `--no-reconnect`, or `--debug`.
+
 ## Connection and input behavior
 
 - Pairing pins the controller certificate and stores per-device credentials in macOS Keychain or Windows Credential Manager. A certificate change requires pairing again.
@@ -61,7 +69,7 @@ mouse-share client --device <saved-server-id>
 - The controller releases its local input when the connection fails or the client stops responding for five seconds. The client releases simulated keys and buttons on leave or disconnect.
 - The controller supports one active client and the primary display. Mouse and text clipboard sharing work across macOS and Windows. Keyboard forwarding requires matching operating systems.
 
-Run the automated checks with `cargo test --locked --all-features --lib --bins`. For connection diagnostics, start the app with `RUST_LOG=debug`.
+Run the automated checks with `cargo test --locked --all-features --lib --tests`. For connection diagnostics, start the app with `RUST_LOG=debug`.
 
 ## License
 

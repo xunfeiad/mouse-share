@@ -6,7 +6,7 @@ use mouse_share::{
     log_buffer,
     net::{
         self,
-        devices::{display_id, DeviceId, Devices, Invite},
+        devices::{display_id, DeviceId, Devices, Features, Invite},
         SessionCommand, SessionConfig, SessionRole, SharedState,
     },
 };
@@ -19,6 +19,14 @@ use tokio::sync::mpsc;
     about = "Share mouse and keyboard with a paired LAN device"
 )]
 struct Cli {
+    #[arg(long, global = true)]
+    no_keyboard: bool,
+    #[arg(long, global = true)]
+    no_clipboard: bool,
+    #[arg(long, global = true)]
+    no_reconnect: bool,
+    #[arg(long, global = true)]
+    debug: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -71,7 +79,8 @@ fn parse_id(text: &str) -> Result<DeviceId, String> {
 fn main() -> Result<()> {
     log_buffer::install();
     let devices = Devices::system()?;
-    let (role, invite) = match Cli::parse().command {
+    let cli = Cli::parse();
+    let (role, invite) = match cli.command {
         Command::Pair => {
             let code = zeroize::Zeroizing::new(rpassword::prompt_password("Pairing invitation: ")?);
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -111,12 +120,22 @@ fn main() -> Result<()> {
 
     capture::promote_to_foreground_app();
     capture::restore_cursor_state_on_startup();
+    let preferences = mouse_share::settings::directory()
+        .ok()
+        .and_then(|dir| mouse_share::settings::load(&dir.join("config.json")).ok())
+        .map(|(settings, warning)| {
+            if let Some(warning) = warning {
+                eprintln!("{warning}");
+            }
+            settings
+        })
+        .unwrap_or_default();
+    log_buffer::set_debug(cli.debug || preferences.debug_logging);
     let state = Arc::new(SharedState::new());
+    state.set_auto_reconnect(!cli.no_reconnect && preferences.auto_reconnect);
     let (tx, rx) = mpsc::channel(16);
-    let stop = tx.clone();
-    ctrlc::set_handler(move || {
-        let _ = stop.try_send(SessionCommand::Stop);
-    })?;
+    let stop = state.clone();
+    ctrlc::set_handler(move || stop.request_stop())?;
     if let Some(host) = invite {
         use std::io::IsTerminal;
         anyhow::ensure!(
@@ -139,5 +158,17 @@ fn main() -> Result<()> {
         });
     }
     let _keep_open = tx;
-    net::run(SessionConfig { devices, role }, state, rx)
+    let feature_limits = Features {
+        keyboard: !cli.no_keyboard,
+        clipboard: !cli.no_clipboard,
+    };
+    net::run(
+        SessionConfig {
+            devices,
+            role,
+            feature_limits,
+        },
+        state,
+        rx,
+    )
 }

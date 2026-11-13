@@ -54,6 +54,14 @@ mouse-share client --device <保存的服务端ID>
 
 `pair` 交互式读取邀请且不回显。以后只需启动 `mouse-share server`，再用已保存的 ID 连接。`mouse-share address <id> <host:port>` 更新地址，`mouse-share revoke <id>` 移除设备。按 Ctrl+C 结束 CLI 会话。
 
+## 桌面设置
+
+- 语言、调试日志、默认 UDP 端口和屏幕方向会保存。端口和方向用于下次手动启动。
+- 断线自动重连默认开启。客户端使用已保存的地址和证书重试。停止、取消或退出会结束当前重连。
+- 启用菜单栏或托盘时，关窗会隐藏窗口并继续共享。通过托盘可打开窗口、启动、停止或退出。
+- 登录启动默认关闭。开启后，应用在登录时尝试恢复最后一次成功启动的角色和连接参数。普通启动直接打开窗口。
+- CLI 可用 `--no-keyboard`、`--no-clipboard`、`--no-reconnect` 和 `--debug` 覆盖本次运行的设置。
+
 ## 连接与输入行为
 
 - 配对时固定服务端证书，各设备独立的认证凭据保存在 macOS Keychain 或 Windows Credential Manager。证书变更后需要重新配对。
@@ -61,7 +69,7 @@ mouse-share client --device <保存的服务端ID>
 - 连接断开或客户端连续 5 秒未响应时，服务端恢复本机控制。客户端在退出切屏或断开会话时释放已模拟的键和按钮。
 - 支持一个活动客户端和主显示器。鼠标及文本剪贴板可跨 macOS 和 Windows 使用，键盘转发要求两端操作系统相同。
 
-运行 `cargo test --locked --all-features --lib --bins` 执行自动化测试。排查连接问题时，可以使用 `RUST_LOG=debug` 启动应用。
+运行 `cargo test --locked --all-features --lib --tests` 执行自动化测试。排查连接问题时，可以使用 `RUST_LOG=debug` 启动应用。
 
 ## 许可证
 

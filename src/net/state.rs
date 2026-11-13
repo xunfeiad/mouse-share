@@ -1,34 +1,40 @@
 //! Shared state between the networking/input backend and the UI.
 //!
-//! The backend threads (server, client, clipboard, input capture) update the
-//! atomics and mutexes here; the UI reads them in its repaint loop. A single
-//! `shutdown` AtomicBool is checked in every event-loop iteration to let the
-//! UI gracefully stop a running session without killing the process.
+//! The UI and tray read the same session status. Watch signals wake pending
+//! network operations when the user stops a session or disables retries.
 
-use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::Mutex;
+use super::devices::Features;
+use crate::config::Edge;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
+use tokio::sync::watch;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+    #[default]
+    Idle,
+    Listening,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Stopping,
+    Failed,
+}
 
 /// Observable state for a running Server or Client session. Shared across
 /// backend threads via `Arc<SharedState>`. All fields are safe to read/write
 /// from any thread.
 pub struct SharedState {
-    pub features: Mutex<Features>,
-    pub keyboard_supported: AtomicBool,
+    status: Mutex<SessionStatus>,
+    stop: watch::Sender<bool>,
+    auto_reconnect: watch::Sender<bool>,
     pub invitation: Mutex<Option<zeroize::Zeroizing<String>>>,
-    /// UI sets this to `true` to request the backend stop. Backend loops
-    /// must check it on every iteration.
-    pub shutdown: AtomicBool,
-
-    /// `true` while a peer is connected and the session is live.
-    pub connected: AtomicBool,
 
     /// Remote peer address (server address on client, client address on
     /// server). `None` until the first handshake completes.
     pub peer_addr: Mutex<Option<String>>,
-
-    /// `true` while the cursor has been handed off to the other side
-    /// (i.e. local input is being suppressed and forwarded).
-    pub mouse_on_peer: AtomicBool,
 
     /// Unix millis of the last event — used for watchdog / freshness checks.
     pub last_event_ms: AtomicU64,
@@ -49,13 +55,11 @@ pub struct SharedState {
 impl SharedState {
     pub fn new() -> Self {
         Self {
-            features: Mutex::new(Features::default()),
-            keyboard_supported: AtomicBool::new(true),
+            status: Mutex::new(SessionStatus::default()),
+            stop: watch::channel(false).0,
+            auto_reconnect: watch::channel(true).0,
             invitation: Mutex::new(None),
-            shutdown: AtomicBool::new(false),
-            connected: AtomicBool::new(false),
             peer_addr: Mutex::new(None),
-            mouse_on_peer: AtomicBool::new(false),
             last_event_ms: AtomicU64::new(0),
             last_heartbeat_ms: AtomicU64::new(0),
             started_ms: AtomicU64::new(0),
@@ -64,13 +68,65 @@ impl SharedState {
     }
 
     pub fn status(&self) -> SessionStatus {
-        use std::sync::atomic::Ordering::Acquire;
-        SessionStatus {
-            features: *self.features.lock().unwrap(),
-            connected: self.connected.load(Acquire),
-            forwarding: self.mouse_on_peer.load(Acquire),
-            keyboard_supported: self.keyboard_supported.load(Acquire),
+        *self.status.lock().unwrap()
+    }
+
+    pub(crate) fn phase(&self, phase: Phase) {
+        let mut status = self.status.lock().unwrap();
+        if status.phase != Phase::Stopping || matches!(phase, Phase::Idle | Phase::Failed) {
+            status.phase = phase;
         }
+    }
+
+    pub fn dismiss_error(&self) {
+        self.clear_error();
+        if self.status().phase == Phase::Failed {
+            self.phase(Phase::Idle);
+        }
+    }
+
+    pub fn fail(&self, error: impl Into<String>) {
+        self.set_error(error);
+        self.forwarding(false);
+        self.phase(Phase::Failed);
+    }
+
+    pub(crate) fn forwarding(&self, value: bool) {
+        self.status.lock().unwrap().forwarding = value;
+    }
+
+    pub(crate) fn set_features(&self, features: Features) {
+        self.status.lock().unwrap().features = features;
+    }
+
+    pub(crate) fn set_peer_details(&self, keyboard_supported: bool, edge: Option<Edge>) {
+        let mut status = self.status.lock().unwrap();
+        status.keyboard_supported = keyboard_supported;
+        status.edge = edge;
+    }
+
+    pub fn request_stop(&self) {
+        self.stop.send_replace(true);
+        let mut status = self.status.lock().unwrap();
+        if !matches!(status.phase, Phase::Idle | Phase::Failed) {
+            status.phase = Phase::Stopping;
+        }
+    }
+
+    pub(crate) fn stop_signal(&self) -> watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
+    pub fn set_auto_reconnect(&self, enabled: bool) {
+        self.auto_reconnect.send_replace(enabled);
+    }
+
+    pub(crate) fn reconnect_signal(&self) -> watch::Receiver<bool> {
+        self.auto_reconnect.subscribe()
+    }
+
+    pub(crate) fn mark_ready(&self) {
+        self.started_ms.store(now_ms(), Ordering::Release);
     }
 
     pub fn set_error(&self, err: impl Into<String>) {
@@ -101,12 +157,23 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-use super::devices::Features;
-
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct SessionStatus {
+    pub phase: Phase,
     pub features: Features,
-    pub connected: bool,
     pub forwarding: bool,
     pub keyboard_supported: bool,
+    pub edge: Option<Edge>,
+}
+
+impl Default for SessionStatus {
+    fn default() -> Self {
+        Self {
+            phase: Phase::Idle,
+            features: Features::default(),
+            forwarding: false,
+            keyboard_supported: true,
+            edge: None,
+        }
+    }
 }

@@ -6,7 +6,7 @@ use crate::{
     },
     protocol::{Control, KeyEvent, MouseButton, MouseEvent, Point, Position, ScreenInfo},
 };
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -22,6 +22,7 @@ pub struct Capture {
     pub suppression: Arc<Suppression>,
     shutdown: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    outcome: Option<tokio::sync::oneshot::Receiver<Result<()>>>,
     hidden: bool,
     #[cfg(test)]
     keep_open: Option<mpsc::Sender<CapturedInput>>,
@@ -38,18 +39,18 @@ impl Capture {
             tx,
             suppression: suppression.clone(),
         };
+        let (done, outcome) = tokio::sync::oneshot::channel();
         let thread = thread::Builder::new()
             .name("input-capture".into())
             .spawn(move || {
-                if let Err(e) = hook.run(queue, stop) {
-                    log::warn!("Input capture stopped: {e}");
-                }
+                let _ = done.send(hook.run(queue, stop));
             })?;
         Ok(Self {
             events,
             suppression,
             shutdown,
             thread: Some(thread),
+            outcome: Some(outcome),
             hidden: false,
             #[cfg(test)]
             keep_open: None,
@@ -67,14 +68,52 @@ impl Capture {
         (
             Self {
                 events,
-                suppression: Default::default(),
+                suppression: Arc::new(Suppression {
+                    ready: AtomicBool::new(true),
+                    ..Default::default()
+                }),
                 shutdown: Default::default(),
                 thread: None,
+                outcome: None,
                 hidden: false,
                 keep_open: Some(tx.clone()),
             },
             tx,
         )
+    }
+
+    pub async fn ready(&mut self) -> Result<()> {
+        if let Some(outcome) = &mut self.outcome {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while !self.suppression.ready.load(Ordering::Acquire) {
+                    tokio::select! {
+                        result = &mut *outcome => {
+                            result.context("Input capture worker stopped")??;
+                            anyhow::bail!("Input capture stopped before initialization");
+                        }
+                        _ = tick.tick() => {}
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .context("Input capture initialization timed out")??;
+        }
+        Ok(())
+    }
+
+    pub fn can_enter(&self) -> bool {
+        if self.suppression.failed.load(Ordering::Acquire)
+            || self.suppression.local_held.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        #[cfg(test)]
+        if self.keep_open.is_some() {
+            return true;
+        }
+        !capture::physical_input_held()
     }
 
     pub fn suppress(&mut self, mouse: bool, keyboard: bool) {
@@ -317,7 +356,10 @@ impl RemoteInput {
                 Ok(()) => {
                     self.held.buttons.remove(&button);
                 }
-                Err(e) => result = Err(e),
+                Err(e) => {
+                    log::warn!("Could not release injected mouse button {button:?}: {e}");
+                    result = Err(e);
+                }
             }
         }
         result
@@ -338,7 +380,10 @@ impl RemoteInput {
                 Ok(()) => {
                     self.held.keys.remove(&key.keycode);
                 }
-                Err(e) => result = Err(e),
+                Err(e) => {
+                    log::warn!("Could not release injected key {}: {e}", key.keycode);
+                    result = Err(e);
+                }
             }
         }
         result

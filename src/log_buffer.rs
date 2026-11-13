@@ -4,13 +4,16 @@
 //! the channel. The UI thread calls `drain()` to batch-receive all pending
 //! messages into its own `Vec` — no shared Mutex, no ring buffer scanning,
 //! no seq tracking. The channel's bounded capacity (1000) provides natural
-//! back-pressure: if the UI falls behind, the oldest unsent messages are
+//! back-pressure: if the UI falls behind, new messages are
 //! dropped by `try_send` returning `Full`.
 //!
 //! This replaces the previous `Mutex<Ring>` + `drain_since(seq)` design.
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    OnceLock,
+};
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
@@ -55,22 +58,36 @@ fn create_channel() -> (LogSender, LogReceiver) {
 /// stderr) and a `tokio::mpsc` channel (for the GUI).
 struct TeeLogger {
     inner: env_logger::Logger,
+    debug: env_logger::Logger,
     sender: LogSender,
 }
 
-// Safety: env_logger::Logger is Send+Sync, mpsc::Sender is Send+Sync.
-unsafe impl Sync for TeeLogger {}
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+pub fn set_debug(enabled: bool) {
+    DEBUG.store(enabled, Ordering::Release);
+}
+
+impl TeeLogger {
+    fn filter(&self) -> &env_logger::Logger {
+        if DEBUG.load(Ordering::Acquire) {
+            &self.debug
+        } else {
+            &self.inner
+        }
+    }
+}
 
 impl Log for TeeLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        self.inner.enabled(metadata)
+        self.filter().enabled(metadata)
     }
 
     fn log(&self, record: &Record) {
         if !self.enabled(record.metadata()) {
             return;
         }
-        self.inner.log(record);
+        self.filter().log(record);
         // try_send is non-blocking. If the channel is full (UI not
         // draining fast enough), we silently drop the line — this is
         // the back-pressure policy. No lock, no allocation beyond the
@@ -83,7 +100,7 @@ impl Log for TeeLogger {
     }
 
     fn flush(&self) {
-        self.inner.flush();
+        self.filter().flush();
     }
 }
 
@@ -100,14 +117,22 @@ pub fn install() {
         // Stash the receiver for the UI to claim later.
         let _ = RECEIVER.set(std::sync::Mutex::new(Some(receiver)));
 
-        let inner = env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info"),
-        )
-        .format_timestamp_millis()
-        .build();
-        let filter = inner.filter();
+        let inner =
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .format_timestamp_millis()
+                .build();
+        let debug = env_logger::Builder::new()
+            .filter_level(LevelFilter::Info)
+            .filter_module("mouse_share", LevelFilter::Debug)
+            .format_timestamp_millis()
+            .build();
+        let filter = inner.filter().max(debug.filter());
 
-        let tee = TeeLogger { inner, sender };
+        let tee = TeeLogger {
+            inner,
+            debug,
+            sender,
+        };
 
         if log::set_boxed_logger(Box::new(tee)).is_ok() {
             log::set_max_level(filter);

@@ -1,7 +1,7 @@
 use crate::protocol::ScreenInfo;
 
 /// Which edge of the server screen triggers transition to the client
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Edge {
     Left,
     Right,

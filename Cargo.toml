@@ -8,7 +8,7 @@ description = "Share mouse across computers on the same WiFi network"
 default = []
 # Build the GUI binary. Kept optional so the CLI stays lean (eframe + winit
 # pull in a lot of deps we don't need for the headless `mouse-share` command).
-ui = ["dep:eframe"]
+ui = ["dep:eframe", "dep:tray-icon"]
 
 [[bin]]
 name = "mouse-share"
@@ -39,7 +39,8 @@ subtle = "2"
 tempfile = "3"
 rpassword = "7"
 zeroize = "1"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
+tray-icon = { version = "0.26.1", optional = true, default-features = false }
 eframe = { version = "0.29", optional = true, default-features = false, features = [
     "default_fonts",
     "glow",
@@ -65,4 +66,5 @@ windows = { version = "0.58", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_System_Registry",
 ] }
