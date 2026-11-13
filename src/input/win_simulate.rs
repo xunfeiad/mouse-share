@@ -5,10 +5,10 @@ use super::simulate::InputSimulator;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
@@ -54,9 +54,12 @@ impl WinSimulator {
             },
         };
 
-        unsafe {
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-        }
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        anyhow::ensure!(
+            sent == 1,
+            "Windows did not inject input: {}",
+            std::io::Error::last_os_error()
+        );
         Ok(())
     }
 }
@@ -112,8 +115,7 @@ impl InputSimulator for WinSimulator {
         // it (e.g. a future non-Windows server), fall back to a VK heuristic
         // so arrows/navigation keys still work.
         let extended_from_flags = (flags & 0x1) != 0;
-        let extended =
-            extended_from_flags || is_extended_key(keycode as u16);
+        let extended = extended_from_flags || is_extended_key(keycode as u16);
 
         let mut kflags: u32 = 0;
         if !down {
@@ -135,9 +137,12 @@ impl InputSimulator for WinSimulator {
                 },
             },
         };
-        unsafe {
-            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
-        }
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        anyhow::ensure!(
+            sent == 1,
+            "Windows did not inject input: {}",
+            std::io::Error::last_os_error()
+        );
         Ok(())
     }
 }
@@ -155,6 +160,6 @@ fn is_extended_key(vk: u16) -> bool {
         0x25 | 0x26 | 0x27 | 0x28 | // VK_LEFT/UP/RIGHT/DOWN
         0x90 | // VK_NUMLOCK
         0x6F | // VK_DIVIDE (numpad /)
-        0x2C   // VK_SNAPSHOT (PrtSc)
+        0x2C // VK_SNAPSHOT (PrtSc)
     )
 }

@@ -1,7 +1,7 @@
 use crate::protocol::{KeyEvent, MouseEvent};
 use anyhow::Result;
-use crossbeam_channel::Sender;
-use std::sync::atomic::AtomicBool;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Saved cursor position captured by `hide_local_cursor` so
@@ -39,16 +39,40 @@ pub enum CapturedInput {
     Key(KeyEvent),
 }
 
+#[derive(Default)]
+pub struct Suppression {
+    pub mouse: AtomicBool,
+    pub keyboard: AtomicBool,
+    pub failed: AtomicBool,
+}
+
+pub struct CaptureQueue {
+    pub tx: tokio::sync::mpsc::Sender<CapturedInput>,
+    pub suppression: Arc<Suppression>,
+}
+
+impl CaptureQueue {
+    pub fn send(&self, event: CapturedInput) {
+        if self.tx.try_send(event).is_err() {
+            // The hook must never block. Releasing local control is safer than
+            // continuing a transfer after an event (possibly an Up) was lost.
+            self.suppression.failed.store(true, Ordering::Release);
+            self.suppression.mouse.store(false, Ordering::Release);
+            self.suppression.keyboard.store(false, Ordering::Release);
+        }
+    }
+}
+
 /// Trait for capturing global input events on the server side.
 pub trait InputCapture: Send {
     /// Start the capture loop. Sends captured events through `sender`.
     /// This blocks the calling thread (runs an event loop). The loop exits
     /// cleanly when `shutdown` flips to `true`.
-    fn run(&mut self, sender: Sender<CapturedInput>, shutdown: Arc<AtomicBool>) -> Result<()>;
+    fn run(&mut self, sender: CaptureQueue, shutdown: Arc<AtomicBool>) -> Result<()>;
 
     /// Get a handle to toggle event suppression.
     /// When suppressed, events are consumed (not delivered to the local OS).
-    fn suppress_handle(&self) -> Arc<AtomicBool>;
+    fn suppress_handle(&self) -> Arc<Suppression>;
 }
 
 /// Get the current absolute cursor position (x, y).
@@ -79,8 +103,8 @@ fn platform_get_cursor_position() -> Result<(f64, f64)> {
             );
         }
         let source = slot.as_ref().unwrap().clone();
-        let event = CGEvent::new(source)
-            .map_err(|_| anyhow::anyhow!("failed to create CGEvent"))?;
+        let event =
+            CGEvent::new(source).map_err(|_| anyhow::anyhow!("failed to create CGEvent"))?;
         let pos = event.location();
         Ok((pos.x, pos.y))
     })
@@ -88,8 +112,8 @@ fn platform_get_cursor_position() -> Result<(f64, f64)> {
 
 #[cfg(target_os = "windows")]
 fn platform_get_cursor_position() -> Result<(f64, f64)> {
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
     let mut point = POINT::default();
     unsafe { GetCursorPos(&mut point)? };
@@ -225,6 +249,8 @@ pub fn show_local_cursor_no_restore() {
 }
 
 fn show_local_cursor_inner(restore_position: bool) {
+    #[cfg(not(target_os = "macos"))]
+    let _ = restore_position;
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGDisplay;
@@ -260,7 +286,10 @@ fn show_local_cursor_inner(restore_position: bool) {
         // Defensive: restore association in case a previous run left it
         // disabled. Idempotent when already enabled.
         if let Err(e) = CGDisplay::associate_mouse_and_mouse_cursor_position(true) {
-            log::warn!("CGAssociateMouseAndMouseCursorPosition(true) failed: {:?}", e);
+            log::warn!(
+                "CGAssociateMouseAndMouseCursorPosition(true) failed: {:?}",
+                e
+            );
         }
     }
 }
@@ -317,19 +346,15 @@ pub fn promote_to_foreground_app() {
 
         #[link(name = "ApplicationServices", kind = "framework")]
         extern "C" {
-            fn TransformProcessType(
-                psn: *const ProcessSerialNumber,
-                transform_state: u32,
-            ) -> i32;
+            fn TransformProcessType(psn: *const ProcessSerialNumber, transform_state: u32) -> i32;
         }
 
         let psn = ProcessSerialNumber {
             high_long_of_psn: 0,
             low_long_of_psn: K_CURRENT_PROCESS,
         };
-        let status = unsafe {
-            TransformProcessType(&psn, K_PROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION)
-        };
+        let status =
+            unsafe { TransformProcessType(&psn, K_PROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION) };
         if status == 0 {
             log::info!("Promoted to foreground application (for cursor hiding)");
         } else {

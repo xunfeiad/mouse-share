@@ -45,15 +45,14 @@ jobs:
 
       - name: Build (debug)
         if: "!startsWith(github.ref, 'refs/tags/')"
-        run: cargo build --verbose --target ${{ matrix.target }}
+        run: cargo build --locked --features ui --target ${{ matrix.target }}
 
       - name: Test
-        if: matrix.target != 'aarch64-apple-darwin'
-        run: cargo test --verbose
+        run: cargo test --locked --all-features --lib --bins
 
       - name: Build (release)
         if: startsWith(github.ref, 'refs/tags/')
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --features ui --target ${{ matrix.target }}
 
       # ---------- Package ----------
       - name: Package (unix)
@@ -64,7 +63,10 @@ jobs:
           DIR="${{ matrix.artifact }}-${VERSION}"
           mkdir -p "$DIR"
           cp "target/${{ matrix.target }}/release/mouse-share" "$DIR/"
-          cp README.md LICENSE* "$DIR/" 2>/dev/null || true
+          cp "target/${{ matrix.target }}/release/mouse-share-ui" "$DIR/"
+          cp README.md README.zh-CN.md "$DIR/"
+          mkdir -p "$DIR/doc"
+          cp -R doc/screenshots "$DIR/doc/"
           tar czf "${DIR}.tar.gz" "$DIR"
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
 
@@ -76,7 +78,10 @@ jobs:
           $DIR = "${{ matrix.artifact }}-${VERSION}"
           New-Item -ItemType Directory -Path $DIR | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/mouse-share.exe" "$DIR/"
-          Copy-Item "README.md" "$DIR/" -ErrorAction SilentlyContinue
+          Copy-Item "target/${{ matrix.target }}/release/mouse-share-ui.exe" "$DIR/"
+          Copy-Item "README.md", "README.zh-CN.md" "$DIR/"
+          New-Item -ItemType Directory -Path "$DIR/doc" | Out-Null
+          Copy-Item -Recurse "doc/screenshots" "$DIR/doc/"
           Compress-Archive -Path "$DIR/*" -DestinationPath "${DIR}.zip"
           echo "ASSET=${DIR}.zip" | Out-File -Append -FilePath $env:GITHUB_ENV
 

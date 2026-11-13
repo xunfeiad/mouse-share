@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Debug, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MouseButton {
     Left,
     Right,
@@ -31,43 +31,69 @@ pub struct KeyEvent {
     pub flags: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct ScreenInfo {
     pub width: u32,
     pub height: u32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum Message {
-    /// Client -> Server: register with screen info
-    Hello(ScreenInfo),
-    /// Server -> Client: acknowledge with server screen info
-    HelloAck(ScreenInfo),
-    /// Server -> Client: mouse entered client screen at position
-    Enter { x: f64, y: f64 },
-    /// Server -> Client: mouse left client screen
-    Leave,
-    /// Server -> Client: mouse event
-    Input(MouseEvent),
-    /// Server -> Client: keyboard event (forwarded only while mouse is on client)
-    KeyInput(KeyEvent),
-    /// Bidirectional keepalive
-    Heartbeat,
+impl ScreenInfo {
+    pub fn valid(self) -> bool {
+        (1..=65_536).contains(&self.width) && (1..=65_536).contains(&self.height)
+    }
+
+    pub fn clamp(self, (x, y): Point) -> Point {
+        (
+            x.clamp(0.0, f64::from(self.width - 1)),
+            y.clamp(0.0, f64::from(self.height - 1)),
+        )
+    }
 }
 
-pub fn serialize(msg: &Message) -> anyhow::Result<Vec<u8>> {
-    Ok(bincode::serialize(msg)?)
+use crate::net::devices::{DeviceId, Features, Token};
+pub type Point = (f64, f64);
+
+#[derive(Serialize, Deserialize)]
+pub enum Login {
+    Pair {
+        id: DeviceId,
+        name: String,
+        invite: Token,
+    },
+    Connect {
+        id: DeviceId,
+        token: Token,
+        screen: ScreenInfo,
+        mac: bool,
+    },
 }
 
-/// Serialize `msg` into `buf`, reusing the buffer's existing capacity.
-/// Used on the server hot path to avoid allocating a fresh `Vec<u8>` per
-/// forwarded mouse event. `buf` is cleared first, then written into.
-pub fn serialize_into(buf: &mut Vec<u8>, msg: &Message) -> anyhow::Result<()> {
-    buf.clear();
-    bincode::serialize_into(&mut *buf, msg)?;
-    Ok(())
+#[derive(Serialize, Deserialize)]
+pub enum LoginReply {
+    Paired(Token),
+    Saved,
+    Ready(Features),
+    Rejected(String),
 }
 
-pub fn deserialize(data: &[u8]) -> anyhow::Result<Message> {
-    Ok(bincode::deserialize(data)?)
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct Position {
+    pub epoch: u64,
+    pub seq: u64,
+    pub control: u64,
+    pub point: Point,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum Control {
+    Ping(u64),
+    Pong(u64),
+    Enter(Position),
+    EnterAck(u64),
+    Leave(u64),
+    Key(Position, KeyEvent),
+    Mouse(Position, MouseEvent),
+    Snapshot(Position, Vec<KeyEvent>, Vec<MouseButton>),
+    Configure(Features),
+    Configured(Features),
 }

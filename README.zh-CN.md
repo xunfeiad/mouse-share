@@ -2,214 +2,67 @@
 
 [English](README.md)
 
-通过 WiFi 局域网在多台电脑之间共享鼠标控制。支持 macOS 和 Windows 跨平台使用。
+在同一局域网内，让已配对的 macOS 和 Windows 电脑共享鼠标、键盘和文本剪贴板。把光标移过服务端主屏幕上设置的边缘，即可控制另一台电脑。
 
-## 工作原理
+**协议 v2 要求两端一起升级。** 服务端仅需放行一个 UDP 端口，默认 4242。输入和剪贴板共用加密的 QUIC 连接。
 
-```
-┌─────────────────┐              ┌─────────────────┐
-│  Server (控制端)  │── UDP ──────▶│  Client (被控端)  │
-│  捕获鼠标事件     │   鼠标事件    │  模拟鼠标输入     │
-│  边缘检测切换     │◀── UDP ─────│  心跳保活        │
-└─────────────────┘              └─────────────────┘
-```
+## 图形界面
 
-- **Server 端**：运行在主控电脑上，捕获全局鼠标事件。当鼠标移动到屏幕边缘时，自动切换到 Client 端控制。
-- **Client 端**：运行在被控电脑上，接收 Server 发来的鼠标事件并模拟执行。
+| 服务端 | 客户端 | 已配对设备 |
+| --- | --- | --- |
+| ![服务端设置](doc/screenshots/zh-server_idle.png) | ![客户端连接，演示数据](doc/screenshots/zh-client_config.png) | ![已配对设备，演示数据](doc/screenshots/zh-devices.png) |
 
-## 快速开始
+在 macOS 上打包并启动：
 
-### 编译
-
-```bash
-# 需要 Rust 工具链 (https://rustup.rs/)
-cargo build --release
-```
-
-CLI 可执行文件位于 `target/release/mouse-share`。
-
-### 图形界面（macOS）
-
-项目自带一个小型 GUI，将 server/client 统一封装到一个窗口里。在 macOS 上推荐
-以 `.app` 形式运行——这样「辅助功能」权限绑定在 bundle identifier 上，重新
-编译后不需要重新授权：
-
-```bash
+```sh
 ./scripts/build-app.sh
 open "dist/mouse share.app"
 ```
 
-也可以直接从源码运行而不打包：
+macOS 和 Windows 也可以从源码启动界面：
 
-```bash
-cargo run --release --features ui --bin mouse-share-ui
+```sh
+cargo run --locked --release --features ui --bin mouse-share-ui
 ```
 
-首次启动 macOS 会弹窗索要「辅助功能」权限。在**系统设置 → 隐私与安全性 →
-辅助功能**里勾选 `mouse share` 并重启应用即可。
+1. 在连接物理鼠标的电脑上打开 **服务端**，选择屏幕边缘并启动服务。在防火墙中放行所选 UDP 端口。
+2. 输入服务端的局域网地址或主机名，点击 **添加设备**，复制邀请并私下发给要连接的客户端。邀请有效期为 5 分钟，仅可使用一次。
+3. 在另一台电脑上打开 **客户端**，粘贴邀请，点击 **配对并记住设备**。从已保存的服务端中选择设备，再点击 **连接**。
+4. 将鼠标移过设置的边缘。切回时，先向客户端屏幕内移动一段距离，再从进入的边缘返回。
 
-### 命令行使用
+在 **设备** 页可以重新连接、修改服务端地址、忘记设备或撤销客户端授权。服务运行期间，可以在服务端页面关闭键盘转发或剪贴板同步。
 
-**在控制端电脑（Server）上运行：**
+### 系统权限
 
-```bash
-# 默认端口 4242，客户端在右侧
-mouse-share server
+macOS 在 **系统设置 → 隐私与安全性 → 辅助功能** 中为 mouse share 授权。若系统提示服务端需要 **输入监控**，一并授权。使用 CLI 时，向系统指明的终端或可执行文件授权。Windows 可能限制向权限更高的应用注入输入。
 
-# 指定端口和客户端方位
-mouse-share server --port 5000 --edge left
+## 命令行
+
+用 `cargo build --locked --release` 构建。在交互终端启动服务端并生成邀请：
+
+```sh
+mouse-share server --port 4242 --edge right --invite-for 192.168.1.100
 ```
 
-**在被控端电脑（Client）上运行：**
+将 `--invite-for` 的值替换为服务端的实际局域网地址。在客户端运行：
 
-```bash
-# 连接到 Server 的 IP 和端口
-mouse-share client --server 192.168.1.100:4242
+```sh
+mouse-share pair
+mouse-share devices
+mouse-share client --device <保存的服务端ID>
 ```
 
-### 参数说明
+`pair` 交互式读取邀请且不回显。以后只需启动 `mouse-share server`，再用已保存的 ID 连接。`mouse-share address <id> <host:port>` 更新地址，`mouse-share revoke <id>` 移除设备。按 Ctrl+C 结束 CLI 会话。
 
-```
-Usage: mouse-share <COMMAND>
+## 连接与输入行为
 
-Commands:
-  server  Run as server (controller side)
-  client  Run as client (controlled side)
+- 配对时固定服务端证书，各设备独立的认证凭据保存在 macOS Keychain 或 Windows Credential Manager。证书变更后需要重新配对。
+- 光标位置通过 QUIC 数据报传输。切屏、按钮、按键及输入状态使用可靠控制流，文本剪贴板使用同一连接内的独立流。
+- 连接断开或客户端连续 5 秒未响应时，服务端恢复本机控制。客户端在退出切屏或断开会话时释放已模拟的键和按钮。
+- 支持一个活动客户端和主显示器。鼠标及文本剪贴板可跨 macOS 和 Windows 使用，键盘转发要求两端操作系统相同。
 
-Server options:
-  -p, --port <PORT>  监听端口 [默认: 4242]
-  -e, --edge <EDGE>  客户端屏幕方位: left/right/top/bottom [默认: right]
+运行 `cargo test --locked --all-features --lib --bins` 执行自动化测试。排查连接问题时，可以使用 `RUST_LOG=debug` 启动应用。
 
-Client options:
-  -s, --server <ADDR>  Server 地址，如 192.168.1.100:4242
-```
-
-## 平台权限
-
-### macOS
-
-需要授予「辅助功能」权限：
-
-**系统设置 → 隐私与安全性 → 辅助功能** → 添加终端应用（Terminal / iTerm2 / 你运行程序的终端）
-
-### Windows
-
-以**管理员身份运行**即可（低级鼠标钩子需要管理员权限）。
-
-## 架构设计
-
-### 项目结构
-
-```
-src/
-├── main.rs                 # CLI 入口，server/client 分发
-├── protocol.rs             # 网络协议定义（消息类型、序列化）
-├── config.rs               # 屏幕配置、边缘检测
-├── screen.rs               # 跨平台屏幕信息获取
-├── net/
-│   ├── server.rs           # Server 端：事件转发、边缘检测
-│   └── client.rs           # Client 端：事件接收、模拟执行
-└── input/
-    ├── capture.rs           # InputCapture trait 定义
-    ├── simulate.rs          # InputSimulator trait 定义
-    ├── macos_capture.rs     # macOS: CGEventTap 捕获
-    ├── macos_simulate.rs    # macOS: CGEvent 模拟
-    ├── win_capture.rs       # Windows: SetWindowsHookEx 捕获
-    └── win_simulate.rs      # Windows: SendInput 模拟
-```
-
-### 核心模块
-
-#### 协议层 (`protocol.rs`)
-
-使用 `serde` + `bincode` 二进制序列化，单个鼠标事件约 40 字节。
-
-```rust
-enum Message {
-    Hello(ScreenInfo),          // Client → Server: 注册
-    HelloAck(ScreenInfo),       // Server → Client: 确认
-    Enter { x: f64, y: f64 },  // 鼠标进入 Client 屏幕
-    Leave,                      // 鼠标离开 Client 屏幕
-    Input(MouseEvent),          // 鼠标事件数据
-    Heartbeat,                  // 心跳保活
-}
-```
-
-#### 输入捕获 (`input/capture.rs`)
-
-通过 trait 抽象跨平台差异：
-
-| 平台 | 实现方式 | 事件抑制 |
-|------|---------|---------|
-| macOS | `CGEventTap` (HID level) | 回调返回 `None` |
-| Windows | `SetWindowsHookEx(WH_MOUSE_LL)` | 返回 `LRESULT(1)` |
-
-#### 输入模拟 (`input/simulate.rs`)
-
-| 平台 | 实现方式 |
-|------|---------|
-| macOS | `CGEvent::new_mouse_event` + `CGEvent::post` |
-| Windows | `SendInput` + `MOUSEINPUT` (绝对坐标 0-65535) |
-
-### 网络设计
-
-- **传输层**：UDP — 鼠标事件高频(60-120Hz)、每个事件独立、丢包可接受（下一帧覆盖）
-- **连接管理**：Hello/HelloAck 握手，Client 自动重试 10 次
-- **保活**：双向 Heartbeat（1秒间隔）
-- **安全看门狗**：Server 端 5 秒无事件自动释放鼠标抑制，防止鼠标卡死
-
-### 屏幕切换逻辑
-
-1. Server 持续监测鼠标位置
-2. 鼠标到达配置的边缘（如右边缘）→ 开启事件抑制 → 发送 `Enter` 到 Client
-3. Server 跟踪虚拟光标在 Client 屏幕上的位置
-4. 虚拟光标到达 Client 的返回边缘 → 关闭抑制 → 发送 `Leave`
-
-## 跨平台编译
-
-### macOS 上编译 Windows 版本
-
-```bash
-# 安装 Windows 交叉编译工具链
-rustup target add x86_64-pc-windows-msvc
-# 需要通过 cargo-xwin 或在 Windows 上直接编译
-```
-
-### Windows 上编译
-
-```bash
-cargo build --release
-```
-
-## 调试
-
-启用详细日志：
-
-```bash
-RUST_LOG=debug mouse-share server
-RUST_LOG=debug mouse-share client --server 192.168.1.100:4242
-```
-
-## 已知限制
-
-- 当前仅支持单 Client 连接
-- 不支持键盘共享（仅鼠标）
-- 不支持剪贴板同步
-- UDP 无加密，仅适用于可信局域网
-- 不支持 Linux
-
-## 技术依赖
-
-| 依赖 | 用途 |
-|------|------|
-| `clap` | CLI 参数解析 |
-| `serde` + `bincode` | 二进制序列化 |
-| `crossbeam-channel` | 无锁线程间通信 |
-| `core-graphics` | macOS 输入捕获/模拟 |
-| `windows` | Windows Win32 API |
-| `anyhow` | 错误处理 |
-| `log` + `env_logger` | 日志 |
-
-## License
+## 许可证
 
 MIT

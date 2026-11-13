@@ -12,6 +12,9 @@ use std::sync::Mutex;
 /// backend threads via `Arc<SharedState>`. All fields are safe to read/write
 /// from any thread.
 pub struct SharedState {
+    pub features: Mutex<Features>,
+    pub keyboard_supported: AtomicBool,
+    pub invitation: Mutex<Option<zeroize::Zeroizing<String>>>,
     /// UI sets this to `true` to request the backend stop. Backend loops
     /// must check it on every iteration.
     pub shutdown: AtomicBool,
@@ -46,6 +49,9 @@ pub struct SharedState {
 impl SharedState {
     pub fn new() -> Self {
         Self {
+            features: Mutex::new(Features::default()),
+            keyboard_supported: AtomicBool::new(true),
+            invitation: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             peer_addr: Mutex::new(None),
@@ -54,6 +60,16 @@ impl SharedState {
             last_heartbeat_ms: AtomicU64::new(0),
             started_ms: AtomicU64::new(0),
             last_error: Mutex::new(None),
+        }
+    }
+
+    pub fn status(&self) -> SessionStatus {
+        use std::sync::atomic::Ordering::Acquire;
+        SessionStatus {
+            features: *self.features.lock().unwrap(),
+            connected: self.connected.load(Acquire),
+            forwarding: self.mouse_on_peer.load(Acquire),
+            keyboard_supported: self.keyboard_supported.load(Acquire),
         }
     }
 
@@ -83,4 +99,14 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+use super::devices::Features;
+
+#[derive(Default, Clone, Copy)]
+pub struct SessionStatus {
+    pub features: Features,
+    pub connected: bool,
+    pub forwarding: bool,
+    pub keyboard_supported: bool,
 }

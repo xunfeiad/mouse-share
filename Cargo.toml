@@ -22,20 +22,31 @@ required-features = ["ui"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
-crossbeam-channel = "0.5"
-anyhow = "1"
+anyhow = "1.0.103"
 log = "0.4"
 env_logger = "0.11"
-socket2 = "0.5"
-tokio = { version = "1", default-features = false, features = ["sync"] }
+tokio = { version = "1.53.3", default-features = false, features = ["sync", "rt", "time", "net", "macros", "io-util"] }
 arboard = "3"
+base64 = "0.22"
+directories = "6"
+getrandom = "0.3"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+quinn-proto = { version = "0.11.18", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+serde_json = "1"
+subtle = "2"
+tempfile = "3"
+rpassword = "7"
+zeroize = "1"
+ctrlc = "3"
 eframe = { version = "0.29", optional = true, default-features = false, features = [
     "default_fonts",
     "glow",
 ] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
@@ -43,10 +54,12 @@ name = "log_buffer_bench"
 harness = false
 
 [target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6", features = ["apple-native"] }
 core-graphics = "0.24"
 core-foundation = "0.10"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6", features = ["windows-native"] }
 windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",

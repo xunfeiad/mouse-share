@@ -7,27 +7,26 @@ use core_graphics::event::{
     CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType, EventField,
 };
-use crossbeam_channel::Sender;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::capture::{CapturedInput, InputCapture};
+use super::capture::{CaptureQueue, CapturedInput, InputCapture, Suppression};
 
 pub struct MacOsCapture {
-    suppressing: Arc<AtomicBool>,
+    suppressing: Arc<Suppression>,
 }
 
 impl MacOsCapture {
     pub fn new() -> Self {
         Self {
-            suppressing: Arc::new(AtomicBool::new(false)),
+            suppressing: Arc::new(Suppression::default()),
         }
     }
 }
 
 impl InputCapture for MacOsCapture {
-    fn run(&mut self, sender: Sender<CapturedInput>, shutdown: Arc<AtomicBool>) -> Result<()> {
+    fn run(&mut self, sender: CaptureQueue, shutdown: Arc<AtomicBool>) -> Result<()> {
         let suppressing = self.suppressing.clone();
         // Set by the tap callback when macOS disables the tap (timeout or
         // user-input stall). The outer run-loop polls this and re-enables.
@@ -38,6 +37,8 @@ impl InputCapture for MacOsCapture {
         // mouse is supposed to be on the client".
         let tap_disabled = Arc::new(AtomicBool::new(false));
         let tap_disabled_cb = tap_disabled.clone();
+        let local_keys = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        let local_buttons = std::cell::RefCell::new(std::collections::BTreeSet::new());
 
         let events_of_interest = vec![
             CGEventType::MouseMoved,
@@ -62,12 +63,15 @@ impl InputCapture for MacOsCapture {
             CGEventTapOptions::Default,
             events_of_interest,
             move |_proxy: CGEventTapProxy, event_type: CGEventType, event: &CGEvent| {
+                if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == 0x4d53_5632
+                {
+                    return Some(event.clone());
+                }
                 match event_type {
                     // macOS sends these special event types through the tap
                     // callback when it has disabled the tap. Signal the
                     // outer loop to re-enable, then pass through.
-                    CGEventType::TapDisabledByTimeout
-                    | CGEventType::TapDisabledByUserInput => {
+                    CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
                         log::warn!(
                             "macOS event tap disabled ({:?}), scheduling re-enable",
                             event_type
@@ -75,24 +79,37 @@ impl InputCapture for MacOsCapture {
                         tap_disabled_cb.store(true, Ordering::SeqCst);
                         return Some(event.clone());
                     }
-                    CGEventType::KeyDown
-                    | CGEventType::KeyUp
-                    | CGEventType::FlagsChanged => {
-                        // Keyboard. FlagsChanged is fired for modifier key
-                        // (shift/ctrl/opt/cmd) transitions and has no down/up;
-                        // we treat it as a keydown and rely on the flags
-                        // snapshot to carry the current modifier state.
-                        let keycode = event.get_integer_value_field(
-                            EventField::KEYBOARD_EVENT_KEYCODE,
-                        ) as u32;
-                        let flags = event.get_flags().bits() as u64;
-                        let down = !matches!(event_type, CGEventType::KeyUp);
-                        log::info!(
-                            "key captured: code={} down={} flags=0x{:x}",
-                            keycode, down, flags
-                        );
-                        let key_event = KeyEvent { keycode, down, flags };
-                        let _ = sender.try_send(CapturedInput::Key(key_event));
+                    CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged => {
+                        let keycode = event
+                            .get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE)
+                            as u32;
+                        let flags = event.get_flags().bits();
+                        let down = match event_type {
+                            CGEventType::FlagsChanged => modifier_down(keycode, flags),
+                            CGEventType::KeyDown => true,
+                            _ => false,
+                        };
+                        let mut local_keys = local_keys.borrow_mut();
+                        if !suppressing.keyboard.load(Ordering::Acquire)
+                            || local_keys.contains(&keycode)
+                        {
+                            if down {
+                                local_keys.insert(keycode);
+                            } else {
+                                local_keys.remove(&keycode);
+                            }
+                            return Some(event.clone());
+                        }
+                        sender.send(CapturedInput::Key(KeyEvent {
+                            keycode,
+                            down,
+                            flags,
+                        }));
+                        return if suppressing.keyboard.load(Ordering::Acquire) {
+                            None
+                        } else {
+                            Some(event.clone())
+                        };
                     }
                     _ => {
                         // Mouse: read raw HID delta from event fields. This
@@ -101,16 +118,28 @@ impl InputCapture for MacOsCapture {
                         // at screen edges — crucial because when suppression
                         // is ON, the OS freezes the cursor and
                         // event.location() stops changing.
-                        let dx = event
-                            .get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X)
-                            as f64;
-                        let dy = event
-                            .get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y)
-                            as f64;
+                        let dx =
+                            event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X) as f64;
+                        let dy =
+                            event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y) as f64;
 
                         if let Some(mouse_event) = map_event(event_type, event, dx, dy) {
+                            let suppressed = suppressing.mouse.load(Ordering::Acquire);
+                            let mut local_buttons = local_buttons.borrow_mut();
+                            match &mouse_event {
+                                MouseEvent::ButtonDown(b) if !suppressed => {
+                                    local_buttons.insert(*b);
+                                }
+                                MouseEvent::ButtonUp(b) if local_buttons.remove(b) => {
+                                    return Some(event.clone())
+                                }
+                                _ => {}
+                            }
+                            if !suppressed && !local_buttons.is_empty() {
+                                return Some(event.clone());
+                            }
                             let loc = event.location();
-                            let _ = sender.try_send(CapturedInput::Mouse {
+                            sender.send(CapturedInput::Mouse {
                                 event: mouse_event,
                                 abs_x: loc.x,
                                 abs_y: loc.y,
@@ -123,7 +152,7 @@ impl InputCapture for MacOsCapture {
                 // seeing the latest store from the server event loop.
                 // This costs a memory barrier per event (~ns) — negligible
                 // at human mouse rates.
-                let suppress = suppressing.load(Ordering::SeqCst);
+                let suppress = suppressing.mouse.load(Ordering::Acquire);
                 // Diagnostic: when a button / scroll event flows through the
                 // tap, log which side of the suppress fence it took. This
                 // nails down whether the "click fires on server too" bug is
@@ -141,11 +170,7 @@ impl InputCapture for MacOsCapture {
                         | CGEventType::ScrollWheel
                 );
                 if is_discrete {
-                    if suppress {
-                        log::info!("tap suppressing {:?}", event_type);
-                    } else {
-                        log::info!("tap passing through {:?}", event_type);
-                    }
+                    log::trace!("Mouse event {event_type:?}, suppressed={suppress}");
                 }
 
                 if suppress {
@@ -201,7 +226,10 @@ impl InputCapture for MacOsCapture {
                 Duration::from_millis(16),
                 false,
             );
-            if matches!(result, CFRunLoopRunResult::Finished | CFRunLoopRunResult::Stopped) {
+            if matches!(
+                result,
+                CFRunLoopRunResult::Finished | CFRunLoopRunResult::Stopped
+            ) {
                 break;
             }
         }
@@ -212,9 +240,28 @@ impl InputCapture for MacOsCapture {
         Ok(())
     }
 
-    fn suppress_handle(&self) -> Arc<AtomicBool> {
+    fn suppress_handle(&self) -> Arc<Suppression> {
         self.suppressing.clone()
     }
+}
+
+// Quartz exposes side-specific device modifier flags in addition to the
+// combined modifier flags. A combined flag alone cannot distinguish sides.
+fn modifier_down(keycode: u32, flags: u64) -> bool {
+    let mask = match keycode {
+        54 => 0x10,
+        55 => 0x08, // Command
+        56 => 0x02,
+        60 => 0x04, // Shift
+        58 => 0x20,
+        61 => 0x40, // Option
+        59 => 0x01,
+        62 => 0x2000,   // Control
+        57 => 0x10000,  // Caps Lock
+        63 => 0x800000, // Fn
+        _ => 0,
+    };
+    flags & mask != 0
 }
 
 fn map_event(event_type: CGEventType, event: &CGEvent, dx: f64, dy: f64) -> Option<MouseEvent> {
@@ -230,31 +277,31 @@ fn map_event(event_type: CGEventType, event: &CGEvent, dx: f64, dy: f64) -> Opti
         CGEventType::RightMouseUp => Some(MouseEvent::ButtonUp(MouseButton::Right)),
 
         CGEventType::OtherMouseDown => {
-            let btn_num =
-                event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
+            let btn_num = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
             let button = match btn_num {
                 2 => MouseButton::Middle,
-                n => MouseButton::Other(n as u8),
+                3 => MouseButton::Other(1),
+                4 => MouseButton::Other(2),
+                _ => return None,
             };
             Some(MouseEvent::ButtonDown(button))
         }
         CGEventType::OtherMouseUp => {
-            let btn_num =
-                event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
+            let btn_num = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
             let button = match btn_num {
                 2 => MouseButton::Middle,
-                n => MouseButton::Other(n as u8),
+                3 => MouseButton::Other(1),
+                4 => MouseButton::Other(2),
+                _ => return None,
             };
             Some(MouseEvent::ButtonUp(button))
         }
 
         CGEventType::ScrollWheel => {
-            let scroll_dy = event
-                .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1)
-                as f64;
-            let scroll_dx = event
-                .get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2)
-                as f64;
+            let scroll_dy =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1) as f64;
+            let scroll_dx =
+                event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2) as f64;
             Some(MouseEvent::Scroll {
                 dx: scroll_dx,
                 dy: scroll_dy,

@@ -14,14 +14,14 @@ pub trait InputSimulator: Send {
     fn key_event(&mut self, keycode: u32, down: bool, flags: u64) -> Result<()>;
 }
 
-pub fn create_simulator() -> Box<dyn InputSimulator> {
+pub fn create_simulator() -> Result<Box<dyn InputSimulator>> {
     #[cfg(target_os = "macos")]
     {
-        Box::new(super::macos_simulate::MacOsSimulator::new())
+        Ok(Box::new(super::macos_simulate::MacOsSimulator::new()?))
     }
     #[cfg(target_os = "windows")]
     {
-        Box::new(super::win_simulate::WinSimulator::new())
+        Ok(Box::new(super::win_simulate::WinSimulator::new()))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

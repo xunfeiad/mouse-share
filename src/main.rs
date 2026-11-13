@@ -1,68 +1,143 @@
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use mouse_share::{config, input, log_buffer, net};
+use mouse_share::{
+    config::Edge,
+    input::capture,
+    log_buffer,
+    net::{
+        self,
+        devices::{display_id, DeviceId, Devices, Invite},
+        SessionCommand, SessionConfig, SessionRole, SharedState,
+    },
+};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::mpsc;
 
 #[derive(Parser)]
-#[command(name = "mouse-share", about = "Share mouse across WiFi network")]
+#[command(
+    name = "mouse-share",
+    about = "Share mouse and keyboard with a paired LAN device"
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Command,
 }
 
 #[derive(Subcommand)]
-enum Commands {
-    /// Run as server (controller side)
+enum Command {
+    /// Start the controller. Pairing is available while the server runs.
     Server {
-        /// Port to listen on
         #[arg(short, long, default_value_t = 4242)]
         port: u16,
-
-        /// Edge where client screen is located (left/right/top/bottom)
         #[arg(short, long, default_value = "right")]
-        edge: String,
+        edge: Edge,
+        /// Generate an invitation for this address or hostname. Printed once on the terminal.
+        #[arg(long)]
+        invite_for: Option<String>,
     },
-    /// Run as client (controlled side)
+    /// Connect to a saved server by device ID.
     Client {
-        /// Server address (e.g., 192.168.1.100:4242)
-        #[arg(short, long)]
-        server: String,
+        #[arg(long, value_parser = parse_id)]
+        device: DeviceId,
+    },
+    /// Read a one-time invitation from the terminal and remember the server.
+    Pair,
+    /// List saved and authorized devices.
+    Devices,
+    /// Remove authorization and credentials for a device.
+    Revoke {
+        #[arg(value_parser = parse_id)]
+        device: DeviceId,
+    },
+    /// Update a saved server's address without changing its certificate.
+    Address {
+        #[arg(value_parser = parse_id)]
+        device: DeviceId,
+        address: String,
     },
 }
 
-fn main() -> anyhow::Result<()> {
-    // Install the tee logger so both stderr (env_logger) and the in-memory
-    // ring buffer (for the GUI Log tab) see every record.
-    log_buffer::install();
-
-    let cli = Cli::parse();
-
-    // Promote to foreground app so CGDisplayHideCursor actually takes
-    // effect. Without this, hiding the cursor from a plain CLI binary
-    // silently no-ops because macOS treats it as a background process.
-    // Both server and client need this (client also hides its cursor
-    // when mouse is on server).
-    input::capture::promote_to_foreground_app();
-
-    // Defensively restore cursor state in case a previous run crashed
-    // while the cursor was hidden or mouse/cursor association was off.
-    // No-op when the system is already healthy; the point is to let a
-    // fresh launch self-heal after a bad previous session.
-    input::capture::restore_cursor_state_on_startup();
-
-    let state = std::sync::Arc::new(net::SharedState::new());
-
-    match cli.command {
-        Commands::Server { port, edge } => {
-            let edge: config::Edge = edge
-                .parse()
-                .map_err(|e: String| anyhow::anyhow!(e))?;
-            log::info!("Starting server on port {}, client edge: {:?}", port, edge);
-            let server = net::server::Server::new(port, edge);
-            server.run(state)
-        }
-        Commands::Client { server } => {
-            log::info!("Starting client, connecting to {}", server);
-            let client = net::client::Client::new(server);
-            client.run(state)
-        }
+fn parse_id(text: &str) -> Result<DeviceId, String> {
+    if text.len() != 32 || !text.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Expected a 32-character device ID".into());
     }
+    let mut id = [0; 16];
+    for (byte, hex) in id.iter_mut().zip(text.as_bytes().chunks_exact(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(hex).unwrap(), 16).unwrap();
+    }
+    Ok(id)
+}
+
+fn main() -> Result<()> {
+    log_buffer::install();
+    let devices = Devices::system()?;
+    let (role, invite) = match Cli::parse().command {
+        Command::Pair => {
+            let code = zeroize::Zeroizing::new(rpassword::prompt_password("Pairing invitation: ")?);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let server = runtime.block_on(net::pair(devices, Invite::decode(&code)?))?;
+            println!("Paired with {} ({})", server.name, display_id(server.id));
+            return Ok(());
+        }
+        Command::Devices => {
+            for device in devices.list()? {
+                println!(
+                    "{}  {}  {}",
+                    display_id(device.id),
+                    device.name,
+                    device.address.as_deref().unwrap_or("authorized client")
+                );
+            }
+            return Ok(());
+        }
+        Command::Revoke { device } => return devices.forget(device),
+        Command::Address { device, address } => return devices.set_address(device, address),
+        Command::Server {
+            port,
+            edge,
+            invite_for,
+        } => (SessionRole::Server { port, edge }, invite_for),
+        Command::Client { device } => {
+            let server = devices
+                .list()?
+                .into_iter()
+                .find(|d| d.id == device && d.address.is_some())
+                .context("Unknown saved server. Use mouse-share devices or pair first.")?;
+            (SessionRole::Client { server }, None)
+        }
+    };
+
+    capture::promote_to_foreground_app();
+    capture::restore_cursor_state_on_startup();
+    let state = Arc::new(SharedState::new());
+    let (tx, rx) = mpsc::channel(16);
+    let stop = tx.clone();
+    ctrlc::set_handler(move || {
+        let _ = stop.try_send(SessionCommand::Stop);
+    })?;
+    if let Some(host) = invite {
+        use std::io::IsTerminal;
+        anyhow::ensure!(
+            std::io::stdout().is_terminal(),
+            "Use an interactive terminal to display a pairing invitation"
+        );
+        tx.try_send(SessionCommand::Invite(host))?;
+        let state = state.clone();
+        std::thread::spawn(move || {
+            for _ in 0..100 {
+                if let Some(invite) = state.invitation.lock().unwrap().as_ref() {
+                    println!(
+                        "Pairing invitation (valid for five minutes):\n{}",
+                        invite.as_str()
+                    );
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+    }
+    let _keep_open = tx;
+    net::run(SessionConfig { devices, role }, state, rx)
 }

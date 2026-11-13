@@ -23,7 +23,8 @@ use mouse_share::{
     config as msc,
     input::capture as input_capture,
     log_buffer::{self, LogLine, LogReceiver},
-    net::{client::Client as BeClient, server::Server as BeServer, SharedState},
+    net::{self, devices::{DeviceId, Devices, Invite, PairedDevice},
+        SessionCommand, SessionConfig, SessionRole, SharedState},
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -153,6 +154,7 @@ struct Strings {
     tab_client: &'static str,
     tab_log: &'static str,
     tab_settings: &'static str,
+    tab_devices: &'static str,
 
     // Server / idle
     waiting_for_client: &'static str,
@@ -285,10 +287,11 @@ const EN: Strings = Strings {
     tab_client: "Client",
     tab_log: "Log",
     tab_settings: "Settings",
+    tab_devices: "Devices",
 
     waiting_for_client: "Waiting for client",
-    start_client_hint_l1: "Start the client on another device and",
-    start_client_hint_l2: "point it here",
+    start_client_hint_l1: "Choose the edge to switch to the other device.",
+    start_client_hint_l2: "Pair a client after the server starts.",
     label_port: "Port",
     label_edge: "Edge",
     label_local_ip: "Local IP",
@@ -352,13 +355,13 @@ const EN: Strings = Strings {
 
     pill_receiving_input: "Receiving input",
     label_suppressed: "Suppressed",
-    text_cursor_at: "❙❙❙  Cursor at (823, 412) · keyboard forwarding",
+    text_cursor_at: "Remote cursor active",
 
     pill_connection_lost: "Connection lost",
     err_server_unreachable: "Server unreachable",
     err_unreachable_detail: "Cannot reach 192.168.1.100:4242. Check that both devices are on the same network and the server is running.",
     err_firewall_check: "Firewall check",
-    err_firewall_detail: "Ensure UDP :4242 and TCP :4243 are allowed through your firewall.",
+    err_firewall_detail: "Allow the server’s UDP port through your firewall (4242 by default).",
     btn_copy_firewall: "Copy firewall rules",
     btn_reconnect: "Reconnect",
     btn_edit_config: "Edit config",
@@ -405,10 +408,11 @@ const ZH: Strings = Strings {
     tab_client: "客户端",
     tab_log: "日志",
     tab_settings: "设置",
+    tab_devices: "设备",
 
     waiting_for_client: "等待客户端",
-    start_client_hint_l1: "在另一台设备上启动客户端",
-    start_client_hint_l2: "并连接到此处",
+    start_client_hint_l1: "选择切换到另一台设备的屏幕边缘。",
+    start_client_hint_l2: "服务启动后即可配对客户端。",
     label_port: "端口",
     label_edge: "方位",
     label_local_ip: "本机 IP",
@@ -472,13 +476,13 @@ const ZH: Strings = Strings {
 
     pill_receiving_input: "正在接收输入",
     label_suppressed: "已抑制",
-    text_cursor_at: "❙❙❙  光标位置 (823, 412) · 键盘转发中",
+    text_cursor_at: "正在控制本机光标",
 
     pill_connection_lost: "连接断开",
     err_server_unreachable: "服务端不可达",
     err_unreachable_detail: "无法连接 192.168.1.100:4242。请确认两台设备在同一网络且服务端正在运行。",
     err_firewall_check: "防火墙检查",
-    err_firewall_detail: "请在防火墙中放行 UDP :4242 与 TCP :4243。",
+    err_firewall_detail: "请在防火墙中放行服务端的 UDP 端口（默认 4242）。",
     btn_copy_firewall: "复制防火墙规则",
     btn_reconnect: "重新连接",
     btn_edit_config: "编辑配置",
@@ -577,7 +581,7 @@ fn install_style(ctx: &egui::Context) {
     v.extreme_bg_color = theme::FIELD_BG;
     v.faint_bg_color = theme::FIELD_BG;
     v.selection.bg_fill = theme::PRIMARY.linear_multiply(0.3);
-    v.selection.stroke = Stroke::new(1.0, theme::PRIMARY);
+    v.selection.stroke = Stroke::new(1.0_f32, theme::PRIMARY);
 
     // Widgets: form fields / buttons defaults
     for w in [
@@ -587,15 +591,15 @@ fn install_style(ctx: &egui::Context) {
     ] {
         w.bg_fill = theme::FIELD_BG;
         w.weak_bg_fill = theme::FIELD_BG;
-        w.bg_stroke = Stroke::new(1.0, theme::FIELD_BORDER);
+        w.bg_stroke = Stroke::new(1.0_f32, theme::FIELD_BORDER);
         w.rounding = Rounding::same(8.0);
-        w.fg_stroke = Stroke::new(1.0, theme::TEXT);
+        w.fg_stroke = Stroke::new(1.0_f32, theme::TEXT);
         w.expansion = 0.0;
     }
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, theme::PRIMARY);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme::PRIMARY);
     v.widgets.noninteractive.bg_fill = theme::CARD_BG;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, theme::CARD_BORDER);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, theme::TEXT);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, theme::CARD_BORDER);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, theme::TEXT);
 
     style.spacing.item_spacing = Vec2::new(10.0, 10.0);
     style.spacing.button_padding = Vec2::new(14.0, 8.0);
@@ -637,6 +641,7 @@ enum Tab {
     Client,
     Log,
     Settings,
+    Devices,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -692,11 +697,11 @@ enum SessionKind {
     Client,
 }
 
-/// Handle to a live backend session. Dropping this does NOT stop the
-/// session — use `App::stop_session` which sets `shutdown` and joins.
+/// Running backend and its command channel.
 struct SessionHandle {
     kind: SessionKind,
-    thread: Option<JoinHandle<()>>,
+    thread: JoinHandle<()>,
+    commands: tokio::sync::mpsc::Sender<SessionCommand>,
 }
 
 /// Button-click intents produced by render functions and processed after
@@ -707,6 +712,7 @@ enum Action {
     StartServer,
     StartClient,
     StopSession,
+    Pair,
 }
 
 struct App {
@@ -716,13 +722,21 @@ struct App {
     server_state: ServerState,
     port: String,
     edge: Edge,
-    clipboard_sync: bool,
-    keyboard_fwd: bool,
     // Client tab state
     client_state: ClientState,
     server_addr: String,
     server_port: String,
     client_edge: Edge,
+    devices: Option<Devices>,
+    peers: Vec<PairedDevice>,
+    selected: Option<DeviceId>,
+    invitation: zeroize::Zeroizing<String>,
+    invite_host: String,
+    pair_job: Option<std::sync::mpsc::Receiver<anyhow::Result<PairedDevice>>>,
+    address_edit: Option<(DeviceId, String)>,
+    next_refresh: std::time::Instant,
+    close_when_stopped: bool,
+    demo: bool,
     // Settings
     start_on_login: bool,
     auto_connect: bool,
@@ -768,88 +782,112 @@ impl App {
         self.session.as_ref().map(|s| s.kind)
     }
 
-    /// Spawn the backend `Server` on a dedicated thread. Installs a fresh
-    /// `SharedState` so the UI observes only state from this new session.
+    fn translate<'a>(&self, en: &'a str, zh: &'a str) -> &'a str {
+        match self.lang { Lang::En => en, Lang::Zh => zh }
+    }
+
+    fn start_session(&mut self, kind: SessionKind, role: SessionRole) {
+        if self.is_running() || self.demo { return; }
+        let Some(devices) = self.devices.clone() else { return; };
+        self.shared = Arc::new(SharedState::new());
+        let shared = self.shared.clone();
+        let (commands, rx) = tokio::sync::mpsc::channel(16);
+        match std::thread::Builder::new().name("mouse-share-session".into()).spawn(move || {
+            if let Err(e) = net::run(SessionConfig { devices, role }, shared.clone(), rx) {
+                shared.set_error(e.to_string());
+            }
+        }) {
+            Ok(thread) => self.session = Some(SessionHandle { kind, thread, commands }),
+            Err(e) => self.shared.set_error(e.to_string()),
+        }
+    }
+
     fn start_server(&mut self) {
-        if self.is_running() {
+        let Ok(port) = self.port.trim().parse() else {
+            self.shared.set_error(self.translate("Invalid UDP port", "UDP 端口无效"));
             return;
-        }
-        let port: u16 = self.port.trim().parse().unwrap_or(4242);
-        let edge = self.edge.to_config();
-        self.shared = Arc::new(SharedState::new());
-        let shared = self.shared.clone();
-        log::info!("UI: starting server on port {} edge {:?}", port, edge);
-        let thread = std::thread::Builder::new()
-            .name("mouse-share-server".into())
-            .spawn(move || {
-                let server = BeServer::new(port, edge);
-                if let Err(e) = server.run(shared.clone()) {
-                    log::error!("server exited with error: {}", e);
-                    shared.set_error(format!("{}", e));
-                }
-            })
-            .ok();
-        self.session = Some(SessionHandle {
-            kind: SessionKind::Server,
-            thread,
-        });
-    }
-
-    /// Spawn the backend `Client` on a dedicated thread.
-    fn start_client(&mut self) {
-        if self.is_running() {
-            return;
-        }
-        let host = self.server_addr.trim().to_string();
-        let port = self.server_port.trim().to_string();
-        let addr = if port.is_empty() {
-            host
-        } else {
-            format!("{}:{}", host, port)
         };
-        self.shared = Arc::new(SharedState::new());
-        let shared = self.shared.clone();
-        log::info!("UI: starting client → {}", addr);
-        let thread = std::thread::Builder::new()
-            .name("mouse-share-client".into())
-            .spawn(move || {
-                let client = BeClient::new(addr);
-                if let Err(e) = client.run(shared.clone()) {
-                    log::error!("client exited with error: {}", e);
-                    shared.set_error(format!("{}", e));
-                }
-            })
-            .ok();
-        self.session = Some(SessionHandle {
-            kind: SessionKind::Client,
-            thread,
-        });
+        self.start_session(SessionKind::Server, SessionRole::Server { port, edge: self.edge.to_config() });
     }
 
-    /// Signal the running session to shut down and join its thread. Safe to
-    /// call when nothing is running — it just clears state.
-    fn stop_session(&mut self) {
-        if let Some(mut sess) = self.session.take() {
-            log::info!("UI: stopping session");
-            self.shared.shutdown.store(true, Ordering::SeqCst);
-            if let Some(t) = sess.thread.take() {
-                // Best-effort join — the backend loops poll shutdown every
-                // 100ms or so, and clipboard sockets have 500ms timeouts, so
-                // this should complete quickly. We don't block forever.
-                let _ = t.join();
+    fn start_client(&mut self) {
+        if let Some(server) = self.peers.iter().find(|peer| Some(peer.id) == self.selected && peer.address.is_some()).cloned() {
+            self.start_session(SessionKind::Client, SessionRole::Client { server });
+        }
+    }
+
+    fn send_command(&self, command: SessionCommand) {
+        if let Some(session) = &self.session {
+            if let Err(e) = session.commands.try_send(command) {
+                self.shared.set_error(format!("Session command unavailable: {e}"));
             }
         }
-        // Reset observable state for the next session.
-        self.shared = Arc::new(SharedState::new());
     }
 
-    /// Process any action a render function emitted during this frame.
+    fn stop_session(&mut self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        if let Some(session) = &self.session {
+            let _ = session.commands.try_send(SessionCommand::Stop);
+        }
+    }
+
+    fn start_pairing(&mut self) {
+        let Some(devices) = self.devices.clone() else { return; };
+        if self.demo || self.pair_job.is_some() { return; }
+        let invite = match Invite::decode(&std::mem::take(&mut self.invitation)) {
+            Ok(invite) => invite,
+            Err(_) => { self.shared.set_error(self.translate("Invalid v2 pairing invitation", "配对邀请无效，请复制完整的 v2 邀请")); return; }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let result = std::thread::Builder::new().name("pairing".into()).spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .map_err(anyhow::Error::from)
+                .and_then(|runtime| runtime.block_on(net::pair(devices, invite)));
+            let _ = tx.send(result);
+        });
+        match result {
+            Ok(_) => self.pair_job = Some(rx),
+            Err(e) => self.shared.set_error(e.to_string()),
+        }
+    }
+
+    fn refresh_devices(&mut self) {
+        if self.demo { return; }
+        if let Some(job) = &self.pair_job {
+            match job.try_recv() {
+                Ok(result) => {
+                    self.pair_job = None;
+                    match result {
+                        Ok(peer) => { self.selected = Some(peer.id); self.shared.clear_error(); }
+                        Err(e) => self.shared.set_error(e.to_string()),
+                    }
+                    self.next_refresh = std::time::Instant::now();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.pair_job = None;
+                    self.shared.set_error("Pairing worker stopped");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if std::time::Instant::now() >= self.next_refresh {
+            self.next_refresh = std::time::Instant::now() + Duration::from_secs(1);
+            if let Some(devices) = &self.devices {
+                match devices.list() {
+                    Ok(peers) => self.peers = peers,
+                    Err(e) => self.shared.set_error(e.to_string()),
+                }
+            }
+        }
+    }
+
     fn apply_pending_action(&mut self) {
         if let Some(action) = self.pending_action.take() {
             match action {
                 Action::StartServer => self.start_server(),
                 Action::StartClient => self.start_client(),
                 Action::StopSession => self.stop_session(),
+                Action::Pair => self.start_pairing(),
             }
         }
     }
@@ -874,15 +912,10 @@ impl App {
         let finished = self
             .session
             .as_ref()
-            .and_then(|s| s.thread.as_ref())
-            .map(|t| t.is_finished())
+            .map(|s| s.thread.is_finished())
             .unwrap_or(false);
         if finished {
-            if let Some(mut sess) = self.session.take() {
-                if let Some(t) = sess.thread.take() {
-                    let _ = t.join();
-                }
-            }
+            self.session.take();
         }
 
         let running = running && self.session.is_some();
@@ -951,25 +984,36 @@ fn format_duration(secs: u64) -> String {
 
 impl Default for App {
     fn default() -> Self {
+        let devices = Devices::system();
+        let shared = Arc::new(SharedState::new());
+        if let Err(e) = &devices { shared.set_error(e.to_string()); }
         let mut app = Self {
             tab: Tab::Server,
             lang: Lang::from_system(),
             server_state: ServerState::Idle,
             port: "4242".into(),
             edge: Edge::Right,
-            clipboard_sync: true,
-            keyboard_fwd: true,
             client_state: ClientState::Config,
             server_addr: "192.168.1.100".into(),
             server_port: "4242".into(),
             client_edge: Edge::Right,
+            devices: devices.ok(),
+            peers: Vec::new(),
+            selected: None,
+            invitation: Default::default(),
+            invite_host: String::new(),
+            pair_job: None,
+            address_edit: None,
+            next_refresh: std::time::Instant::now(),
+            close_when_stopped: false,
+            demo: std::env::var("MOUSE_SHARE_UI_DEMO").is_ok_and(|v| v == "1"),
             start_on_login: true,
             auto_connect: true,
             show_in_menubar: true,
             default_port: "4242".into(),
             default_edge: Edge::Right,
             debug_logging: false,
-            shared: Arc::new(SharedState::new()),
+            shared,
             session: None,
             pending_action: None,
             dev_mode: std::env::var("MOUSE_SHARE_UI_DEV")
@@ -991,6 +1035,7 @@ impl Default for App {
                 "client_active" => { app.tab = Tab::Client; app.client_state = ClientState::MouseActive; }
                 "permission" => { app.tab = Tab::Server; app.server_state = ServerState::PermissionRequired; }
                 "error" => { app.tab = Tab::Client; app.client_state = ClientState::NetworkError; }
+                "devices" => { app.tab = Tab::Devices; }
                 "log" => { app.tab = Tab::Log; }
                 "settings" => { app.tab = Tab::Settings; }
                 _ => {}
@@ -1002,6 +1047,13 @@ impl Default for App {
                 "zh" => Lang::Zh,
                 _ => Lang::En,
             };
+        }
+        if app.demo {
+            app.peers = vec![
+                PairedDevice { id: [1; 16], name: "Studio Mac".into(), address: Some("192.0.2.10:4242".into()), certificate: Vec::new() },
+                PairedDevice { id: [2; 16], name: "Windows laptop".into(), address: None, certificate: Vec::new() },
+            ];
+            app.selected = Some([1; 16]);
         }
         app
     }
@@ -1021,22 +1073,40 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Reconcile UI enums with the backend before we render this frame.
         self.derive_states();
+        self.refresh_devices();
+        if let Some(address) = self.peers.iter().find(|p| Some(p.id) == self.selected).and_then(|p| p.address.as_ref()) {
+            if let Some((host, port)) = address.rsplit_once(':') {
+                self.server_addr = host.to_owned();
+                self.server_port = port.to_owned();
+            }
+        }
+        if ctx.input(|input| input.viewport().close_requested()) && (self.is_running() || self.pair_job.is_some()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_when_stopped = true;
+            self.stop_session();
+        }
+        if self.close_when_stopped && !self.is_running() && self.pair_job.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         egui::CentralPanel::default()
             .frame(Frame::none().fill(theme::BG).inner_margin(Margin::same(16.0)))
             .show(ctx, |ui| {
                 let s = self.s();
+                let width = ui.available_width();
                 card(ui, |ui| {
+                    ui.set_min_width((width - 40.0).max(0.0));
                     title_bar(ui, "mouse share");
                     tab_bar(ui, &mut self.tab, s);
                     ui.add_space(14.0);
                     ui.scope(|ui| {
                         ui.style_mut().spacing.item_spacing.y = 12.0;
                         match self.tab {
-                            Tab::Server => server_tab(ui, self),
-                            Tab::Client => client_tab(ui, self),
+                            Tab::Server => { egui::ScrollArea::vertical().show(ui, |ui| server_tab(ui, self)); }
+                            Tab::Client => { egui::ScrollArea::vertical().show(ui, |ui| client_tab(ui, self)); }
                             Tab::Log => log_tab(ui, self),
                             Tab::Settings => settings_tab(ui, self),
+                            Tab::Devices => devices_tab(ui, self),
                         }
                     });
                 });
@@ -1065,7 +1135,7 @@ impl Drop for App {
 fn card(ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
     Frame::none()
         .fill(theme::CARD_BG)
-        .stroke(Stroke::new(1.0, theme::CARD_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::CARD_BORDER))
         .rounding(Rounding::same(14.0))
         .inner_margin(Margin::symmetric(20.0, 16.0))
         .show(ui, contents);
@@ -1113,7 +1183,7 @@ fn title_bar(ui: &mut Ui, title: &str) {
                 center,
                 5.5,
                 *c,
-                Stroke::new(1.0, theme::TL_STROKE),
+                Stroke::new(1.0_f32, theme::TL_STROKE),
             );
             // On hover, overlay the macOS-style glyph: × / − / +
             if any_hover {
@@ -1125,29 +1195,29 @@ fn title_bar(ui: &mut Ui, title: &str) {
                         let d = 2.5;
                         p.line_segment(
                             [egui::pos2(x - d, y - d), egui::pos2(x + d, y + d)],
-                            Stroke::new(1.2, glyph_color),
+                            Stroke::new(1.2_f32, glyph_color),
                         );
                         p.line_segment(
                             [egui::pos2(x - d, y + d), egui::pos2(x + d, y - d)],
-                            Stroke::new(1.2, glyph_color),
+                            Stroke::new(1.2_f32, glyph_color),
                         );
                     }
                     1 => {
                         // −
                         p.line_segment(
                             [egui::pos2(x - 3.0, y), egui::pos2(x + 3.0, y)],
-                            Stroke::new(1.4, glyph_color),
+                            Stroke::new(1.4_f32, glyph_color),
                         );
                     }
                     _ => {
                         // + (simple zoom indicator)
                         p.line_segment(
                             [egui::pos2(x - 2.8, y), egui::pos2(x + 2.8, y)],
-                            Stroke::new(1.2, glyph_color),
+                            Stroke::new(1.2_f32, glyph_color),
                         );
                         p.line_segment(
                             [egui::pos2(x, y - 2.8), egui::pos2(x, y + 2.8)],
-                            Stroke::new(1.2, glyph_color),
+                            Stroke::new(1.2_f32, glyph_color),
                         );
                     }
                 }
@@ -1237,11 +1307,12 @@ fn draw_app_icon(painter: &eframe::egui::Painter, rect: Rect) {
 
 fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
     ui.horizontal(|ui| {
-        ui.style_mut().spacing.item_spacing.x = 22.0;
+        ui.style_mut().spacing.item_spacing.x = 16.0;
         for (t, label) in [
             (Tab::Server, s.tab_server),
             (Tab::Client, s.tab_client),
             (Tab::Log, s.tab_log),
+            (Tab::Devices, s.tab_devices),
             (Tab::Settings, s.tab_settings),
         ] {
             let selected = *tab == t;
@@ -1263,7 +1334,7 @@ fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
                 let y = rect.bottom() + 4.0;
                 ui.painter().line_segment(
                     [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                    Stroke::new(2.0, theme::PRIMARY),
+                    Stroke::new(2.0_f32, theme::PRIMARY),
                 );
             }
         }
@@ -1276,7 +1347,7 @@ fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
             egui::pos2(r.left() - 20.0, r.top() + 2.0),
             egui::pos2(r.right() + 20.0, r.top() + 2.0),
         ],
-        Stroke::new(1.0, theme::CARD_BORDER),
+        Stroke::new(1.0_f32, theme::CARD_BORDER),
     );
     ui.add_space(4.0);
 }
@@ -1300,7 +1371,7 @@ fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> Response {
 fn field(ui: &mut Ui, label: &str, value: &str) {
     Frame::none()
         .fill(theme::FIELD_BG)
-        .stroke(Stroke::new(1.0, theme::FIELD_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::FIELD_BORDER))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {
@@ -1398,7 +1469,7 @@ fn danger_button(ui: &mut Ui, text: &str) -> Response {
         theme::CARD_BG,
         theme::DANGER_SOFT,
         Color32::from_rgb(250, 220, 222),
-        Stroke::new(1.0, theme::DANGER_SOFT_BORDER),
+        Stroke::new(1.0_f32, theme::DANGER_SOFT_BORDER),
         theme::DANGER,
         true,
     )
@@ -1411,7 +1482,7 @@ fn ghost_button(ui: &mut Ui, text: &str) -> Response {
         theme::CARD_BG,
         theme::FIELD_BG,
         theme::FIELD_BORDER,
-        Stroke::new(1.0, theme::CARD_BORDER),
+        Stroke::new(1.0_f32, theme::CARD_BORDER),
         theme::TEXT,
         false,
     )
@@ -1456,7 +1527,7 @@ fn stop_running_button(ui: &mut Ui, text: &str) -> Response {
         rect,
         Rounding::same(10.0),
         base_fill,
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
     );
 
     // Pulsing dot on the left. Radius breathes between 3.5 and 5.5 px;
@@ -1474,7 +1545,7 @@ fn stop_running_button(ui: &mut Ui, text: &str) -> Response {
             dot_center,
             dot_radius + 2.0 + pulse * 2.5,
             Stroke::new(
-                1.0,
+                1.0_f32,
                 Color32::from_rgba_unmultiplied(255, 255, 255, ring_alpha),
             ),
         );
@@ -1514,7 +1585,7 @@ fn screen_box(
         rect,
         Rounding::same(8.0),
         fill,
-        Stroke::new(if highlighted { 2.0 } else { 1.0 }, stroke_color),
+        Stroke::new(if highlighted { 2.0_f32 } else { 1.0 }, stroke_color),
     );
     p.text(
         rect.center(),
@@ -1573,7 +1644,7 @@ fn topology(
                     let next = (x + dash).min(gap_end);
                     p.line_segment(
                         [egui::pos2(x, y), egui::pos2(next, y)],
-                        Stroke::new(1.5, theme::PRIMARY),
+                        Stroke::new(1.5_f32, theme::PRIMARY),
                     );
                     x = next + gap;
                 }
@@ -1643,6 +1714,7 @@ fn section_label(ui: &mut Ui, text: &str) {
 // ============================================================================
 
 fn server_tab(ui: &mut Ui, app: &mut App) {
+    let s = app.s();
     // Surface any backend error at the top of the tab.
     if let Some(err) = app.shared.last_error.lock().unwrap().clone() {
         error_banner(ui, &err);
@@ -1654,6 +1726,35 @@ fn server_tab(ui: &mut Ui, app: &mut App) {
         ServerState::PortResolved => server_port_resolved(ui, app),
         ServerState::PermissionRequired => server_permission_required(ui, app),
     }
+    if app.session_kind() == Some(SessionKind::Server) && !app.shared.shutdown.load(Ordering::Acquire) {
+        let status = app.shared.status();
+        let mut requested = status.features;
+        toggle(ui, s.toggle_clipboard_sync, &mut requested.clipboard);
+        ui.add_enabled_ui(status.keyboard_supported, |ui| {
+            toggle(ui, s.toggle_keyboard_fwd, &mut requested.keyboard);
+        });
+        if !status.keyboard_supported {
+            ui.small(app.translate("Keyboard sharing requires matching operating systems.", "键盘转发需要两端使用相同操作系统。"));
+        }
+        if requested != status.features {
+            app.send_command(SessionCommand::Features {
+                keyboard: (requested.keyboard != status.features.keyboard).then_some(requested.keyboard),
+                clipboard: (requested.clipboard != status.features.clipboard).then_some(requested.clipboard),
+            });
+        }
+        let hint = app.translate("Server address on your LAN", "服务端局域网地址");
+        ui.add(egui::TextEdit::singleline(&mut app.invite_host).hint_text(hint));
+        if ghost_button(ui, app.translate("Add device", "添加设备")).clicked() {
+            app.send_command(SessionCommand::Invite(app.invite_host.clone()));
+        }
+        let invitation = app.shared.invitation.lock().unwrap();
+        if let Some(invitation) = invitation.as_ref() {
+            ui.label(app.translate("Invitation ready · valid for five minutes", "邀请已生成 · 五分钟内有效"));
+            if ghost_button(ui, app.translate("Copy invitation", "复制邀请")).clicked() {
+                ui.ctx().copy_text(invitation.to_string());
+            }
+        }
+    }
     if app.dev_mode {
         ui.add_space(6.0);
         dev_state_switcher_server(ui, &mut app.server_state);
@@ -1663,7 +1764,7 @@ fn server_tab(ui: &mut Ui, app: &mut App) {
 fn error_banner(ui: &mut Ui, msg: &str) {
     Frame::none()
         .fill(theme::DANGER_SOFT)
-        .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::DANGER_SOFT_BORDER))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(12.0, 8.0))
         .show(ui, |ui| {
@@ -1687,7 +1788,7 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
         let (icon_rect, _) =
             ui.allocate_exact_size(Vec2::new(48.0, 44.0), Sense::hover());
         let p = ui.painter();
-        let stroke = Stroke::new(1.6, theme::TEXT_MUTED);
+        let stroke = Stroke::new(1.6_f32, theme::TEXT_MUTED);
         let screen = Rect::from_min_size(
             egui::pos2(icon_rect.left() + 6.0, icon_rect.top() + 4.0),
             Vec2::new(36.0, 26.0),
@@ -1709,7 +1810,9 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
             stroke,
         );
         ui.add_space(10.0);
-        ui.label(RichText::new(s.waiting_for_client).size(15.0).strong());
+        let label = if running { s.waiting_for_client }
+            else { app.translate("Start the controller", "启动服务端") };
+        ui.label(RichText::new(label).size(15.0).strong());
         ui.add_space(4.0);
         ui.label(
             RichText::new(s.start_client_hint_l1)
@@ -1805,8 +1908,6 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
         ],
     );
     ui.add_space(6.0);
-    toggle(ui, s.toggle_clipboard_sync, &mut app.clipboard_sync);
-    toggle(ui, s.toggle_keyboard_fwd, &mut app.keyboard_fwd);
     ui.add_space(4.0);
     if stop_running_button(ui, s.btn_stop_server).clicked() {
         app.pending_action = Some(Action::StopSession);
@@ -1827,7 +1928,7 @@ fn server_port_conflict(ui: &mut Ui, app: &mut App) {
     ui.horizontal(|ui| {
         Frame::none()
             .fill(theme::CARD_BG)
-            .stroke(Stroke::new(1.5, theme::DANGER))
+            .stroke(Stroke::new(1.5_f32, theme::DANGER))
             .rounding(Rounding::same(10.0))
             .inner_margin(Margin::symmetric(14.0, 10.0))
             .show(ui, |ui| {
@@ -1843,7 +1944,7 @@ fn server_port_conflict(ui: &mut Ui, app: &mut App) {
     ui.add_space(10.0);
     Frame::none()
         .fill(theme::DANGER_SOFT)
-        .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::DANGER_SOFT_BORDER))
         .rounding(Rounding::same(12.0))
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
@@ -1856,7 +1957,7 @@ fn server_port_conflict(ui: &mut Ui, app: &mut App) {
             ui.add_space(8.0);
             Frame::none()
                 .fill(theme::CARD_BG)
-                .stroke(Stroke::new(1.0, theme::CARD_BORDER))
+                .stroke(Stroke::new(1.0_f32, theme::CARD_BORDER))
                 .rounding(Rounding::same(8.0))
                 .inner_margin(Margin::symmetric(12.0, 8.0))
                 .show(ui, |ui| {
@@ -1881,7 +1982,7 @@ fn server_port_conflict(ui: &mut Ui, app: &mut App) {
                 ui.add(btn);
                 let btn = egui::Button::new(RichText::new(s.btn_retry).size(12.0))
                     .fill(theme::CARD_BG)
-                    .stroke(Stroke::new(1.0, theme::CARD_BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::CARD_BORDER))
                     .rounding(Rounding::same(8.0))
                     .min_size(Vec2::new(70.0, 30.0));
                 ui.add(btn);
@@ -1889,7 +1990,7 @@ fn server_port_conflict(ui: &mut Ui, app: &mut App) {
                     RichText::new(s.btn_kill).size(12.0).color(theme::DANGER).strong(),
                 )
                 .fill(theme::CARD_BG)
-                .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
+                .stroke(Stroke::new(1.0_f32, theme::DANGER_SOFT_BORDER))
                 .rounding(Rounding::same(8.0))
                 .min_size(Vec2::new(70.0, 30.0));
                 ui.add(btn);
@@ -1941,7 +2042,7 @@ fn server_port_resolved(ui: &mut Ui, app: &mut App) {
     ui.horizontal(|ui| {
         Frame::none()
             .fill(theme::CARD_BG)
-            .stroke(Stroke::new(1.5, theme::PRIMARY))
+            .stroke(Stroke::new(1.5_f32, theme::PRIMARY))
             .rounding(Rounding::same(10.0))
             .inner_margin(Margin::symmetric(14.0, 10.0))
             .show(ui, |ui| {
@@ -1967,7 +2068,7 @@ fn server_port_resolved(ui: &mut Ui, app: &mut App) {
             );
         });
     ui.add_space(10.0);
-    field_pair(ui, s.label_udp_input, ":4244", s.label_tcp_clipboard, ":4245");
+    field_pair(ui, "QUIC / UDP", ":4244", s.label_status, s.status_idle);
     ui.add_space(4.0);
     ui.label(
         RichText::new(s.text_consecutive_ports)
@@ -1989,14 +2090,14 @@ fn server_permission_required(ui: &mut Ui, app: &mut App) {
         p.circle_stroke(
             icon_rect.center(),
             25.0,
-            Stroke::new(1.8, theme::WARN),
+            Stroke::new(1.8_f32, theme::WARN),
         );
         // Exclamation mark
         let cx = icon_rect.center().x;
         let top = icon_rect.center().y - 10.0;
         p.line_segment(
             [egui::pos2(cx, top), egui::pos2(cx, top + 14.0)],
-            Stroke::new(2.4, theme::WARN),
+            Stroke::new(2.4_f32, theme::WARN),
         );
         p.circle_filled(egui::pos2(cx, top + 20.0), 1.8, theme::WARN);
         ui.add_space(12.0);
@@ -2017,7 +2118,7 @@ fn server_permission_required(ui: &mut Ui, app: &mut App) {
     // "How to enable" card (warm/yellow)
     Frame::none()
         .fill(theme::WARN_SOFT)
-        .stroke(Stroke::new(1.0, theme::WARN.linear_multiply(0.35)))
+        .stroke(Stroke::new(1.0_f32, theme::WARN.linear_multiply(0.35)))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
@@ -2073,38 +2174,88 @@ fn client_tab(ui: &mut Ui, app: &mut App) {
 
 fn client_config(ui: &mut Ui, app: &mut App) {
     let s = app.s();
-    ui.label(
-        RichText::new(s.label_server_address)
-            .size(11.0)
-            .color(theme::TEXT_MUTED),
-    );
-    ui.horizontal(|ui| {
-        ui.add(
-            TextEdit::singleline(&mut app.server_addr)
-                .font(FontId::new(14.0, egui::FontFamily::Proportional))
-                .margin(Margin::symmetric(12.0, 8.0))
-                .desired_width(ui.available_width() - 90.0),
-        );
-        ui.add(
-            TextEdit::singleline(&mut app.server_port)
-                .font(FontId::new(14.0, egui::FontFamily::Proportional))
-                .margin(Margin::symmetric(12.0, 8.0))
-                .desired_width(70.0),
-        );
+    ui.label(RichText::new(app.translate("Saved server", "已保存的服务端")).strong());
+    let selected = app.peers.iter().find(|peer| Some(peer.id) == app.selected)
+        .map(|peer| peer.name.as_str()).unwrap_or_else(|| app.translate("Select a device", "选择设备"));
+    egui::ComboBox::from_id_salt("saved-server").selected_text(selected).show_ui(ui, |ui| {
+        for peer in app.peers.iter().filter(|peer| peer.address.is_some()) {
+            ui.selectable_value(&mut app.selected, Some(peer.id), &peer.name);
+        }
     });
-    ui.add_space(6.0);
-    ui.label(
-        RichText::new(s.label_screen_edge)
-            .size(11.0)
-            .color(theme::TEXT_MUTED),
-    );
-    edge_picker(ui, &mut app.client_edge, s);
-    ui.add_space(6.0);
-    field_pair(ui, s.label_local_screen, "—", s.label_status, s.status_idle);
-    ui.add_space(4.0);
-    if primary_button(ui, s.btn_connect).clicked() {
-        app.pending_action = Some(Action::StartClient);
+    if let Some(peer) = app.peers.iter().find(|peer| Some(peer.id) == app.selected) {
+        ui.label(peer.address.as_deref().unwrap_or_default());
     }
+    ui.add_enabled_ui(app.selected.is_some() && !app.is_running() && !app.demo, |ui| {
+        if primary_button(ui, s.btn_connect).clicked() {
+            app.pending_action = Some(Action::StartClient);
+        }
+    });
+    ui.separator();
+    ui.label(RichText::new(app.translate("Pair a new server", "配对新的服务端")).strong());
+    ui.label(app.translate("Paste the one-time invitation from the server.", "粘贴服务端生成的一次性邀请。"));
+    let hint = app.translate("Pairing invitation", "配对邀请");
+    ui.add(egui::TextEdit::singleline(&mut *app.invitation).hint_text(hint).password(true).desired_width(f32::INFINITY));
+    ui.add_enabled_ui(!app.invitation.is_empty() && app.pair_job.is_none() && !app.demo, |ui| {
+        if ghost_button(ui, app.translate("Pair and remember", "配对并记住设备")).clicked() {
+            app.pending_action = Some(Action::Pair);
+        }
+    });
+    if app.pair_job.is_some() { ui.spinner(); }
+    if app.demo { ui.small(app.translate("Demo data", "演示数据")); }
+}
+
+fn devices_tab(ui: &mut Ui, app: &mut App) {
+    ui.label(RichText::new(app.translate("Paired devices", "已配对设备")).size(18.0).strong());
+    let error = app.shared.last_error.lock().unwrap().clone();
+    if let Some(err) = error { error_banner(ui, &err); }
+    if app.demo { ui.small(app.translate("Demo data", "演示数据")); }
+    if app.peers.is_empty() {
+        ui.label(app.translate("Paired servers and authorized clients appear here.", "这里会显示已配对的服务端和获授权的客户端。"));
+    }
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for peer in app.peers.clone() {
+            ui.separator();
+            ui.label(RichText::new(&peer.name).strong());
+            ui.label(peer.address.as_deref().unwrap_or_else(|| app.translate("Authorized client", "已授权客户端")));
+            ui.add_enabled_ui(!app.demo, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(address) = peer.address.as_ref() {
+                        if ui.add_enabled(!app.is_running(), egui::Button::new(app.s().btn_connect)).clicked() {
+                            app.selected = Some(peer.id);
+                            app.tab = Tab::Client;
+                            app.pending_action = Some(Action::StartClient);
+                        }
+                        if ui.button(app.translate("Edit address", "修改地址")).clicked() {
+                            app.address_edit = Some((peer.id, address.clone()));
+                        }
+                    }
+                    let label = if peer.address.is_some() { app.translate("Forget", "忘记设备") }
+                        else { app.translate("Revoke", "撤销授权") };
+                    if ui.button(label).clicked() {
+                        if app.is_running() {
+                            app.send_command(SessionCommand::Revoke(peer.id));
+                        } else if let Some(devices) = &app.devices {
+                            if let Err(e) = devices.forget(peer.id) { app.shared.set_error(e.to_string()); }
+                        }
+                        if app.selected == Some(peer.id) { app.selected = None; }
+                        app.next_refresh = std::time::Instant::now();
+                    }
+                });
+            });
+        }
+        let save_label = app.translate("Save address", "保存地址");
+        if let Some((id, address)) = app.address_edit.as_mut() {
+            ui.text_edit_singleline(address);
+            if ui.button(save_label).clicked() {
+                if let Some(devices) = &app.devices {
+                    match devices.set_address(*id, address.trim().to_owned()) {
+                        Ok(()) => { app.address_edit = None; app.next_refresh = std::time::Instant::now(); }
+                        Err(e) => app.shared.set_error(e.to_string()),
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn edge_picker(ui: &mut Ui, edge: &mut Edge, s: &Strings) {
@@ -2122,7 +2273,7 @@ fn edge_picker(ui: &mut Ui, edge: &mut Edge, s: &Strings) {
             };
             let resp = Frame::none()
                 .fill(fill)
-                .stroke(Stroke::new(if selected { 1.5 } else { 1.0 }, stroke_c))
+                .stroke(Stroke::new(if selected { 1.5_f32 } else { 1.0 }, stroke_c))
                 .rounding(Rounding::same(10.0))
                 .inner_margin(Margin::symmetric(0.0, 10.0))
                 .show(col, |ui| {
@@ -2301,7 +2452,7 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
     ui.add_space(12.0);
     Frame::none()
         .fill(theme::DANGER_SOFT)
-        .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::DANGER_SOFT_BORDER))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
@@ -2321,7 +2472,7 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
     ui.add_space(10.0);
     Frame::none()
         .fill(theme::INFO_SOFT)
-        .stroke(Stroke::new(1.0, theme::INFO.linear_multiply(0.3)))
+        .stroke(Stroke::new(1.0_f32, theme::INFO.linear_multiply(0.3)))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
@@ -2344,7 +2495,7 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
                     .color(theme::INFO),
             )
             .fill(theme::CARD_BG)
-            .stroke(Stroke::new(1.0, theme::INFO.linear_multiply(0.3)))
+            .stroke(Stroke::new(1.0_f32, theme::INFO.linear_multiply(0.3)))
             .rounding(Rounding::same(8.0));
             ui.add(btn);
         });
@@ -2365,10 +2516,7 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
     });
     if reconnect {
         // Tear down the failed session then immediately start a new one.
-        app.pending_action = Some(Action::StopSession);
-        // Chain StartClient via a follow-up frame: set a flag on shared so
-        // the next derive picks it up. Simpler: just stop, and the user
-        // presses Connect again from Config.
+        app.pending_action = Some(Action::StartClient);
     }
     if edit_config {
         app.pending_action = Some(Action::StopSession);
@@ -2440,7 +2588,7 @@ fn log_tab(ui: &mut Ui, app: &mut App) {
     ui.add_space(10.0);
     Frame::none()
         .fill(theme::CARD_BG)
-        .stroke(Stroke::new(1.0, theme::CARD_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::CARD_BORDER))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
@@ -2524,7 +2672,7 @@ enum LogLevel { Info, Warn, Err }
 
 fn log_chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, selected: bool) {
     let border = if selected {
-        Stroke::new(1.0, theme::CARD_BORDER)
+        Stroke::new(1.0_f32, theme::CARD_BORDER)
     } else {
         Stroke::NONE
     };
@@ -2656,7 +2804,7 @@ fn lang_picker(ui: &mut Ui, lang: &mut Lang, s: &Strings) {
             };
             let resp = Frame::none()
                 .fill(bg)
-                .stroke(Stroke::new(1.0, border))
+                .stroke(Stroke::new(1.0_f32, border))
                 .rounding(Rounding::same(6.0))
                 .inner_margin(Margin::symmetric(14.0, 6.0))
                 .show(ui, |ui| {
@@ -2700,7 +2848,7 @@ fn dev_state_switcher_server(ui: &mut Ui, state: &mut ServerState) {
             egui::pos2(r.left(), r.top()),
             egui::pos2(r.right(), r.top()),
         ],
-        Stroke::new(1.0, theme::FIELD_BORDER),
+        Stroke::new(1.0_f32, theme::FIELD_BORDER),
     );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -2741,7 +2889,7 @@ fn dev_state_switcher_client(ui: &mut Ui, state: &mut ClientState) {
             egui::pos2(r.left(), r.top()),
             egui::pos2(r.right(), r.top()),
         ],
-        Stroke::new(1.0, theme::FIELD_BORDER),
+        Stroke::new(1.0_f32, theme::FIELD_BORDER),
     );
     ui.add_space(6.0);
     ui.horizontal(|ui| {

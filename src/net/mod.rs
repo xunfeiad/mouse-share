@@ -1,5 +1,8 @@
-pub mod client;
-pub mod server;
+pub mod devices;
+mod input;
+mod session;
 pub mod state;
+pub(crate) mod transport;
 
-pub use state::SharedState;
+pub use session::{pair, run, SessionCommand, SessionConfig, SessionRole};
+pub use state::{SessionStatus, SharedState};

@@ -47,12 +47,12 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
 echo "==> Building release binary ($BIN_NAME)..."
-cargo build --release --features ui --bin "$BIN_NAME"
+cargo build --locked --release --features ui --bin "$BIN_NAME"
 
 # The CLI binary isn't strictly required inside the bundle, but shipping it
 # alongside means `mouse share.app/Contents/MacOS/mouse-share` is available
 # for users who want headless operation too.
-cargo build --release --bin "$CLI_BIN_NAME"
+cargo build --locked --release --bin "$CLI_BIN_NAME"
 
 echo "==> Assembling $APP_DIR"
 rm -rf "$APP_DIR"
@@ -126,5 +126,5 @@ echo
 echo "Built: $APP_DIR"
 echo "Run:   open \"$APP_DIR\""
 echo
-echo "First launch: macOS will prompt for Accessibility. Grant it in"
+echo "For input sharing, grant mouse share Accessibility access in"
 echo "System Settings → Privacy & Security → Accessibility, then relaunch."
