@@ -23,14 +23,17 @@ use super::simulate::InputSimulator;
 /// once at construction time instead. Calling it per move starves the event
 /// tap at high event rates (gaming mice at 500–1000 Hz) and is the single
 /// biggest contributor to client-side stutter.
-fn warp_cursor(point: CGPoint) {
+fn warp_cursor(point: CGPoint) -> Result<()> {
     if let Err(e) = CGDisplay::warp_mouse_cursor_position(point) {
-        log::error!(
+        anyhow::bail!(
             "CGWarpMouseCursorPosition failed: {:?} at ({:.0},{:.0}) \
              — check Accessibility permission for this binary",
-            e, point.x, point.y
+            e,
+            point.x,
+            point.y
         );
     }
+    Ok(())
 }
 
 pub struct MacOsSimulator {
@@ -98,6 +101,7 @@ impl MacOsSimulator {
 
 impl InputSimulator for MacOsSimulator {
     fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
+        log::debug!("move_to({:.0}, {:.0})", x, y);
         self.current_x = x;
         self.current_y = y;
         // Warp is the authoritative visible-move operation. We deliberately
@@ -118,7 +122,7 @@ impl InputSimulator for MacOsSimulator {
         // specifically need MouseMoved via CGEventTap (rare — input
         // recorders, some accessibility tools) will not see our moves,
         // which is an acceptable tradeoff for smooth cursor tracking.
-        warp_cursor(self.current_point());
+        warp_cursor(self.current_point())?;
         Ok(())
     }
 
@@ -131,7 +135,7 @@ impl InputSimulator for MacOsSimulator {
         // See `move_to` for why we only warp and don't post — this is
         // the hottest path on the client and the extra IPC was the main
         // remaining source of client-side lag.
-        warp_cursor(self.current_point());
+        warp_cursor(self.current_point())?;
         Ok(())
     }
 
@@ -160,10 +164,7 @@ impl InputSimulator for MacOsSimulator {
         let event = CGEvent::new(self.source.clone())
             .map_err(|_| anyhow::anyhow!("failed to create event"))?;
         event.set_type(CGEventType::ScrollWheel);
-        event.set_integer_value_field(
-            EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1,
-            dy as i64,
-        );
+        event.set_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1, dy as i64);
         event.post(core_graphics::event::CGEventTapLocation::HID);
         Ok(())
     }

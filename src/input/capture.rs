@@ -1,7 +1,7 @@
 use crate::protocol::{KeyEvent, MouseEvent};
 use anyhow::Result;
 use crossbeam_channel::Sender;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Saved cursor position captured by `hide_local_cursor` so
@@ -35,8 +35,58 @@ pub enum CapturedInput {
         event: MouseEvent,
         abs_x: f64,
         abs_y: f64,
+        remote: bool,
     },
-    Key(KeyEvent),
+    Key {
+        event: KeyEvent,
+        remote: bool,
+    },
+}
+
+#[derive(Default)]
+pub struct CaptureControl {
+    pub mouse: AtomicBool,
+    pub keyboard: AtomicBool,
+    pub fault: AtomicBool,
+    pub ready: AtomicBool,
+}
+impl CaptureControl {
+    pub fn release(&self) {
+        self.mouse.store(false, Ordering::SeqCst);
+        self.keyboard.store(false, Ordering::SeqCst);
+    }
+    pub fn send(&self, sender: &Sender<CapturedInput>, event: CapturedInput) {
+        if sender.try_send(event).is_err() {
+            self.release();
+            self.fault.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Ownership is latched on down. After disabling forwarding, swallow only
+/// the tail of remote-owned inputs; never send an orphan up to local apps.
+#[derive(Default)]
+pub struct InputRouting {
+    keys: std::collections::HashMap<u32, bool>,
+    buttons: std::collections::HashMap<crate::protocol::MouseButton, bool>,
+}
+impl InputRouting {
+    pub fn key(&mut self, code: u32, down: bool, enabled: bool) -> (bool, bool) {
+        let owned = if down {
+            *self.keys.entry(code).or_insert(enabled)
+        } else {
+            self.keys.remove(&code).unwrap_or(false)
+        };
+        (owned, owned && enabled)
+    }
+    pub fn mouse(&mut self, event: &MouseEvent, enabled: bool) -> (bool, bool) {
+        let owned = match event {
+            MouseEvent::ButtonDown(b) => *self.buttons.entry(*b).or_insert(enabled),
+            MouseEvent::ButtonUp(b) => self.buttons.remove(b).unwrap_or(false),
+            _ => enabled,
+        };
+        (owned, owned && enabled)
+    }
 }
 
 /// Trait for capturing global input events on the server side.
@@ -48,12 +98,33 @@ pub trait InputCapture: Send {
 
     /// Get a handle to toggle event suppression.
     /// When suppressed, events are consumed (not delivered to the local OS).
-    fn suppress_handle(&self) -> Arc<AtomicBool>;
+    fn control_handle(&self) -> Arc<CaptureControl>;
 }
 
 /// Get the current absolute cursor position (x, y).
 pub fn get_cursor_position() -> Result<(f64, f64)> {
     platform_get_cursor_position()
+}
+
+/// Check physical state at entry as well as captured downs. A button/key may
+/// already have been held before the capture hook was installed.
+pub fn physical_input_held() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
+            fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
+        }
+        // Caps Lock's state is latched; it must not prevent crossing.
+        (0..128).any(|key| key != 0x39 && unsafe { CGEventSourceKeyState(1, key) })
+            || (0..32).any(|button| unsafe { CGEventSourceButtonState(1, button) })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        (1..256).any(|key| unsafe { GetAsyncKeyState(key) } < 0)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -79,8 +150,8 @@ fn platform_get_cursor_position() -> Result<(f64, f64)> {
             );
         }
         let source = slot.as_ref().unwrap().clone();
-        let event = CGEvent::new(source)
-            .map_err(|_| anyhow::anyhow!("failed to create CGEvent"))?;
+        let event =
+            CGEvent::new(source).map_err(|_| anyhow::anyhow!("failed to create CGEvent"))?;
         let pos = event.location();
         Ok((pos.x, pos.y))
     })
@@ -88,8 +159,8 @@ fn platform_get_cursor_position() -> Result<(f64, f64)> {
 
 #[cfg(target_os = "windows")]
 fn platform_get_cursor_position() -> Result<(f64, f64)> {
-    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
     let mut point = POINT::default();
     unsafe { GetCursorPos(&mut point)? };
@@ -225,10 +296,14 @@ pub fn show_local_cursor_no_restore() {
 }
 
 fn show_local_cursor_inner(restore_position: bool) {
+    #[cfg(target_os = "windows")]
+    let _ = restore_position;
     #[cfg(target_os = "macos")]
     {
         use core_graphics::display::CGDisplay;
         use core_graphics::geometry::CGPoint;
+
+        log::info!("show_local_cursor_inner(restore={})", restore_position);
 
         let displays = CGDisplay::active_displays().unwrap_or_default();
         if displays.is_empty() {
@@ -251,16 +326,22 @@ fn show_local_cursor_inner(restore_position: bool) {
         let saved = CURSOR_RESTORE_POS.lock().ok().and_then(|mut g| g.take());
         if restore_position {
             if let Some((x, y)) = saved {
+                log::info!("restore warp to ({:.0}, {:.0})", x, y);
                 if let Err(e) = CGDisplay::warp_mouse_cursor_position(CGPoint::new(x, y)) {
                     log::warn!("post-show restore warp failed: {:?}", e);
                 }
             }
+        } else {
+            log::info!("skipping restore warp (no_restore mode)");
         }
 
         // Defensive: restore association in case a previous run left it
         // disabled. Idempotent when already enabled.
         if let Err(e) = CGDisplay::associate_mouse_and_mouse_cursor_position(true) {
-            log::warn!("CGAssociateMouseAndMouseCursorPosition(true) failed: {:?}", e);
+            log::warn!(
+                "CGAssociateMouseAndMouseCursorPosition(true) failed: {:?}",
+                e
+            );
         }
     }
 }
@@ -317,19 +398,15 @@ pub fn promote_to_foreground_app() {
 
         #[link(name = "ApplicationServices", kind = "framework")]
         extern "C" {
-            fn TransformProcessType(
-                psn: *const ProcessSerialNumber,
-                transform_state: u32,
-            ) -> i32;
+            fn TransformProcessType(psn: *const ProcessSerialNumber, transform_state: u32) -> i32;
         }
 
         let psn = ProcessSerialNumber {
             high_long_of_psn: 0,
             low_long_of_psn: K_CURRENT_PROCESS,
         };
-        let status = unsafe {
-            TransformProcessType(&psn, K_PROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION)
-        };
+        let status =
+            unsafe { TransformProcessType(&psn, K_PROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION) };
         if status == 0 {
             log::info!("Promoted to foreground application (for cursor hiding)");
         } else {

@@ -4,8 +4,12 @@
 
 pub mod clipboard;
 pub mod config;
+pub mod desktop;
 pub mod input;
 pub mod log_buffer;
 pub mod net;
 pub mod protocol;
 pub mod screen;
+pub mod settings;
+#[cfg(feature = "ui")]
+pub mod tray;

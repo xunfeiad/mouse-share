@@ -6,12 +6,10 @@
 
 ## 工作原理
 
-```
-┌─────────────────┐              ┌─────────────────┐
-│  Server (控制端)  │── UDP ──────▶│  Client (被控端)  │
-│  捕获鼠标事件     │   鼠标事件    │  模拟鼠标输入     │
-│  边缘检测切换     │◀── UDP ─────│  心跳保活        │
-└─────────────────┘              └─────────────────┘
+```text
+Server (controller) ── UDP P ────────▶ Client (target): absolute cursor
+                    ◀─ TCP P ───────▶ handshake / heartbeat / reliable input
+                    ◀─ TCP P+1 ─────▶ session-bound clipboard
 ```
 
 - **Server 端**：运行在主控电脑上，捕获全局鼠标事件。当鼠标移动到屏幕边缘时，自动切换到 Client 端控制。
@@ -84,6 +82,20 @@ Client options:
   -s, --server <ADDR>  Server 地址，如 192.168.1.100:4242
 ```
 
+## 设置、托盘与登录启动
+
+设置自动保存到版本化 `config.json`（macOS：`~/Library/Application Support/com.xunfei.mouse-share/`；Windows：`%APPDATA%\MouseShare\`）。写入失败回退并显示错误；损坏文件保留 `config.corrupt-*.json` 备份。`MOUSE_SHARE_CONFIG_DIR` 可指定隔离的测试配置目录。
+
+- 键盘、剪贴板、断线自动重连、托盘默认开启；调试日志和开机启动默认关闭。
+- 控制端连接页的键盘、剪贴板开关会实时同步；关闭键盘先释放远端按键，关闭剪贴板取消双向传输。被控端的 CLI 关闭选项也参与协商。
+- 端口和屏幕方向保存后用于下次启动，当前会话不会暗中重启；屏幕方向由控制端决定。
+- 语言即时切换；调试日志动态生效，不记录剪贴板正文。
+- 开启菜单栏／托盘：关窗隐藏并继续共享，菜单提供打开、启动、停止、退出；关闭托盘会先恢复窗口，此后关窗退出。
+- 开机启动须主动开启：macOS 使用当前用户 LaunchAgent，Windows 使用 HKCU Run。`--autostart` 恢复保存的成功运行角色和连接配置，普通启动只显示窗口。
+- GUI 单实例，重复启动唤起原窗口。停止和退出在后台释放输入及回收线程，UI 保持响应。
+
+CLI 另支持 `--no-keyboard`、`--no-clipboard`、`--no-reconnect`、`--debug`。详细设计和验证边界见 [第一轮优化记录](doc/16-session-reliability.md)。
+
 ## 平台权限
 
 ### macOS
@@ -94,7 +106,7 @@ Client options:
 
 ### Windows
 
-以**管理员身份运行**即可（低级鼠标钩子需要管理员权限）。
+输入注入受目标应用完整性级别限制；普通权限进程无法控制更高权限的应用，失败会明确记录。见 [Microsoft SendInput 文档](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)。
 
 ## 架构设计
 
@@ -107,8 +119,10 @@ src/
 ├── config.rs               # 屏幕配置、边缘检测
 ├── screen.rs               # 跨平台屏幕信息获取
 ├── net/
-│   ├── server.rs           # Server 端：事件转发、边缘检测
-│   └── client.rs           # Client 端：事件接收、模拟执行
+│   ├── session.rs          # GUI/CLI 共用配置、命令与句柄
+│   ├── runtime.rs          # 会话、转发、重连、输入清理
+│   ├── transport.rs        # 可取消的 TCP 帧传输
+│   └── state.rs            # 统一状态快照
 └── input/
     ├── capture.rs           # InputCapture trait 定义
     ├── simulate.rs          # InputSimulator trait 定义
@@ -122,18 +136,7 @@ src/
 
 #### 协议层 (`protocol.rs`)
 
-使用 `serde` + `bincode` 二进制序列化，单个鼠标事件约 40 字节。
-
-```rust
-enum Message {
-    Hello(ScreenInfo),          // Client → Server: 注册
-    HelloAck(ScreenInfo),       // Server → Client: 确认
-    Enter { x: f64, y: f64 },  // 鼠标进入 Client 屏幕
-    Leave,                      // 鼠标离开 Client 屏幕
-    Input(MouseEvent),          // 鼠标事件数据
-    Heartbeat,                  // 心跳保活
-}
-```
+协议 v2 使用 `serde` / `bincode`。TCP 控制帧为 4 字节大端长度加消息体；UDP 仅承载带会话标识、控制权代次、移动序号和控制序号的绝对位置。两端必须同步升级，旧协议仅用于识别并提示升级，不参与输入转发。
 
 #### 输入捕获 (`input/capture.rs`)
 
@@ -153,10 +156,11 @@ enum Message {
 
 ### 网络设计
 
-- **传输层**：UDP — 鼠标事件高频(60-120Hz)、每个事件独立、丢包可接受（下一帧覆盖）
-- **连接管理**：Hello/HelloAck 握手，Client 自动重试 10 次
-- **保活**：双向 Heartbeat（1秒间隔）
-- **安全看门狗**：Server 端 5 秒无事件自动释放鼠标抑制，防止鼠标卡死
+- 基础端口 `P` 范围为 `1…65534`，默认 `4242`。服务端需放行 **UDP P、TCP P 和 TCP P+1**。
+- TCP 控制连接启用 `TCP_NODELAY`；点击、滚轮、键盘和设置可靠有序传输。点击前定位，旧 UDP 移动不会覆盖点击位置。
+- 心跳间隔 1 秒，单调时钟计算 5 秒对端失联超时；TCP 关闭立即处理。静止不失联，持续 UDP 输入不能掩盖控制连接失联。
+- 自动重连按 1、2、4、8 秒退避并加入小幅抖动；新连接完整替换旧会话和实际 UDP 地址。主动停止、退出、取消或关闭重连后不再重试。
+- 离开、失联、停止和会话替换统一释放本会话注入的按钮、键及修饰键，并恢复本地输入与可见光标。
 
 ### 屏幕切换逻辑
 
@@ -186,16 +190,16 @@ cargo build --release
 启用详细日志：
 
 ```bash
-RUST_LOG=debug mouse-share server
-RUST_LOG=debug mouse-share client --server 192.168.1.100:4242
+mouse-share --debug server
+mouse-share --debug client --server 192.168.1.100:4242
 ```
 
 ## 已知限制
 
 - 当前仅支持单 Client 连接
-- 不支持键盘共享（仅鼠标）
-- 不支持剪贴板同步
-- UDP 无加密，仅适用于可信局域网
+- 键盘转发仅支持相同操作系统，跨系统禁用并显示原因
+- 本轮不支持多显示器和按住按钮跨屏拖拽
+- 网络连接没有加密或身份认证；会话标识用于隔离旧消息，仅适用于可信局域网
 - 不支持 Linux
 
 ## 技术依赖

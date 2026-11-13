@@ -4,7 +4,7 @@
 //! the channel. The UI thread calls `drain()` to batch-receive all pending
 //! messages into its own `Vec` — no shared Mutex, no ring buffer scanning,
 //! no seq tracking. The channel's bounded capacity (1000) provides natural
-//! back-pressure: if the UI falls behind, the oldest unsent messages are
+//! back-pressure: if the UI falls behind, new messages are
 //! dropped by `try_send` returning `Full`.
 //!
 //! This replaces the previous `Mutex<Ring>` + `drain_since(seq)` design.
@@ -54,7 +54,7 @@ fn create_channel() -> (LogSender, LogReceiver) {
 /// A `log::Log` implementation that writes to both `env_logger` (for
 /// stderr) and a `tokio::mpsc` channel (for the GUI).
 struct TeeLogger {
-    inner: env_logger::Logger,
+    stderr: crossbeam_channel::Sender<LogLine>,
     sender: LogSender,
 }
 
@@ -63,28 +63,29 @@ unsafe impl Sync for TeeLogger {}
 
 impl Log for TeeLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        self.inner.enabled(metadata)
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &Record) {
         if !self.enabled(record.metadata()) {
             return;
         }
-        self.inner.log(record);
+        // Formatting/output belongs to the consumer; capture callbacks never
+        // synchronously write stderr.
         // try_send is non-blocking. If the channel is full (UI not
         // draining fast enough), we silently drop the line — this is
         // the back-pressure policy. No lock, no allocation beyond the
         // String that record.args().to_string() already requires.
-        let _ = self.sender.tx.try_send(LogLine {
+        let line = LogLine {
             ts_ms: now_ms(),
             level: record.level(),
             message: record.args().to_string(),
-        });
+        };
+        let _ = self.stderr.try_send(line.clone());
+        let _ = self.sender.tx.try_send(line);
     }
 
-    fn flush(&self) {
-        self.inner.flush();
-    }
+    fn flush(&self) {}
 }
 
 /// Global singleton for the receiver. The UI takes it once via `take_receiver()`.
@@ -100,14 +101,27 @@ pub fn install() {
         // Stash the receiver for the UI to claim later.
         let _ = RECEIVER.set(std::sync::Mutex::new(Some(receiver)));
 
-        let inner = env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info"),
-        )
-        .format_timestamp_millis()
-        .build();
-        let filter = inner.filter();
+        let inner =
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
+                .format_timestamp_millis()
+                .build();
+        let filter = LevelFilter::Info;
 
-        let tee = TeeLogger { inner, sender };
+        let (stderr, output) = crossbeam_channel::bounded::<LogLine>(1000);
+        let _ = std::thread::Builder::new()
+            .name("log-output".into())
+            .spawn(move || {
+                for line in output {
+                    inner.log(
+                        &Record::builder()
+                            .level(line.level)
+                            .target("mouse_share")
+                            .args(format_args!("{}", line.message))
+                            .build(),
+                    );
+                }
+            });
+        let tee = TeeLogger { stderr, sender };
 
         if log::set_boxed_logger(Box::new(tee)).is_ok() {
             log::set_max_level(filter);

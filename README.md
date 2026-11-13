@@ -6,12 +6,10 @@ Share mouse control between multiple computers over a WiFi LAN. Cross-platform s
 
 ## How it works
 
-```
-┌─────────────────┐              ┌─────────────────┐
-│ Server (control)│── UDP ──────▶│ Client (target) │
-│ Capture input   │  input evts  │ Simulate input  │
-│ Edge detection  │◀── UDP ─────│ Heartbeat       │
-└─────────────────┘              └─────────────────┘
+```text
+Server (controller) ── UDP P ────────▶ Client (target): absolute cursor
+                    ◀─ TCP P ───────▶ handshake / heartbeat / reliable input
+                    ◀─ TCP P+1 ─────▶ session-bound clipboard
 ```
 
 - **Server**: runs on the controlling machine, captures global mouse events. When the cursor hits the configured screen edge, control switches to the client.
@@ -84,6 +82,16 @@ Client options:
   -s, --server <ADDR>  Server address, e.g. 192.168.1.100:4242
 ```
 
+## Settings and desktop lifecycle
+
+Versioned `config.json` is stored in `~/Library/Application Support/com.xunfei.mouse-share/` on macOS and `%APPDATA%\MouseShare\` on Windows. Writes are atomic; failures roll back visible settings. Corrupt configurations are preserved as `config.corrupt-*.json`. Tests can use `MOUSE_SHARE_CONFIG_DIR`.
+
+Keyboard, clipboard, reconnect and tray default on; debug logging and login startup default off. Keyboard/clipboard controls on the server’s connected page apply during the session. Disabling keyboard releases remote keys first; disabling clipboard cancels both directions. Port/edge changes apply on the next start; the server decides the edge. Language and logging level apply immediately.
+
+With the tray enabled, closing the window hides it and sharing continues. The tray provides Open, Start, Stop and Quit. Disabling the tray first restores the window; closing then exits. Login startup is opt-in, uses the current user’s LaunchAgent/HKCU Run entry, and passes `--autostart` to restore the saved successful role/configuration. Ordinary launch shows the window. Duplicate GUI launches wake the existing instance.
+
+CLI options: `--no-keyboard`, `--no-clipboard`, `--no-reconnect`, `--debug`. See the [implementation and validation record](doc/16-session-reliability.md) for details and remaining hardware checks.
+
 ## Platform permissions
 
 ### macOS
@@ -94,7 +102,7 @@ Accessibility permission is required:
 
 ### Windows
 
-**Run as Administrator** — low-level mouse hooks require administrator privileges.
+Input injection is limited by the target application’s integrity level. Failures are reported; see [Microsoft SendInput documentation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput).
 
 ## Architecture
 
@@ -107,8 +115,10 @@ src/
 ├── config.rs               # Screen config, edge detection
 ├── screen.rs               # Cross-platform screen info
 ├── net/
-│   ├── server.rs           # Server: event forwarding, edge detection
-│   └── client.rs           # Client: event receive + simulate
+│   ├── session.rs          # Shared GUI/CLI configuration, commands, handle
+│   ├── runtime.rs          # Session ownership, forwarding, reconnect, cleanup
+│   ├── transport.rs        # Cancellable framed TCP
+│   └── state.rs            # Shared snapshots
 └── input/
     ├── capture.rs           # InputCapture trait
     ├── simulate.rs          # InputSimulator trait
@@ -122,18 +132,7 @@ src/
 
 #### Protocol layer (`protocol.rs`)
 
-`serde` + `bincode` binary serialization. A single mouse event is around 40 bytes on the wire.
-
-```rust
-enum Message {
-    Hello(ScreenInfo),          // Client → Server: register
-    HelloAck(ScreenInfo),       // Server → Client: ack
-    Enter { x: f64, y: f64 },  // Cursor entered client screen
-    Leave,                      // Cursor left client screen
-    Input(MouseEvent),          // Mouse event payload
-    Heartbeat,                  // Keepalive
-}
-```
+Protocol v2 uses `serde` / `bincode`. TCP frames have a 4-byte big-endian length prefix. UDP carries absolute positions with session, control-generation, movement and control sequence numbers. Upgrade both endpoints together; legacy detection only reports the upgrade requirement.
 
 #### Input capture (`input/capture.rs`)
 
@@ -153,10 +152,11 @@ Cross-platform differences are hidden behind a trait:
 
 ### Network design
 
-- **Transport**: UDP — mouse events are high frequency (60–120 Hz), each event is self-contained, and loss is acceptable (the next frame overwrites the state).
-- **Connection management**: Hello/HelloAck handshake, the client retries up to 10 times on startup.
-- **Keepalive**: bidirectional heartbeat (1 s interval).
-- **Safety watchdog**: the server releases input suppression after 5 s of no activity so the mouse can never get permanently stuck.
+- Base port `P`: `1…65534`, default `4242`. Allow **UDP P, TCP P and TCP P+1** on the server.
+- TCP controls use `TCP_NODELAY`. Clicks, wheel, keys and settings are ordered; clicks first apply their associated position and obsolete movement is ignored.
+- Heartbeats run every second. A monotonic 5-second peer timeout and immediate TCP-close detection restore input. Idle time does not disconnect; UDP traffic cannot mask a dead control connection.
+- Reconnect uses 1, 2, 4, 8-second capped backoff plus jitter. Every connection replaces the full session, including the UDP destination. Explicit stop/cancel/quit or disabling reconnect cancels retries.
+- Leaving, disconnecting, stopping and replacing a session release its injected buttons/keys/modifiers and restore local input/cursor visibility.
 
 ### Screen switching logic
 
@@ -186,14 +186,16 @@ cargo build --release
 Enable verbose logs:
 
 ```bash
-RUST_LOG=debug mouse-share server
-RUST_LOG=debug mouse-share client --server 192.168.1.100:4242
+mouse-share --debug server
+mouse-share --debug client --server 192.168.1.100:4242
 ```
 
 ## Known limitations
 
 - Only one client connection is supported.
-- UDP is unencrypted — only use it on a trusted LAN.
+- Connections are unencrypted and unauthenticated; session identifiers isolate stale traffic. Use only on a trusted LAN.
+- Keyboard forwarding requires matching operating systems.
+- Multiple monitors and holding a button across screen boundaries are not supported.
 - Linux is not supported.
 
 ## Dependencies

@@ -16,16 +16,23 @@
 #![allow(dead_code)]
 
 use eframe::egui::{
-    self, Align, Color32, FontId, Frame, Layout, Margin, Rect, Response, RichText, Rounding,
-    Sense, Stroke, TextEdit, Ui, Vec2,
+    self, Align, Color32, FontId, Frame, Layout, Margin, Rect, Response, RichText, Rounding, Sense,
+    Stroke, TextEdit, Ui, Vec2,
 };
 use mouse_share::{
-    config as msc,
+    config as msc, desktop,
     input::capture as input_capture,
     log_buffer::{self, LogLine, LogReceiver},
-    net::{client::Client as BeClient, server::Server as BeServer, SharedState},
+    net::{
+        session::{Role as SessionKind, SessionCommand, SessionConfig, SessionHandle},
+        state::Phase,
+        SharedState,
+    },
+    protocol::Features,
+    settings::{self, Settings},
+    tray::{Tray, TrayAction},
 };
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -35,20 +42,61 @@ use std::time::Duration;
 // ============================================================================
 
 fn main() -> eframe::Result<()> {
-    // Install the tee logger so env_logger output AND the in-memory ring
-    // buffer (for the Log tab) both receive every record. Safe to call more
-    // than once — subsequent calls are no-ops.
     log_buffer::install();
-
-    // Promote to a foreground app so CGDisplayHideCursor takes effect when
-    // the server hides the local cursor. Without this the .app bundle still
-    // works, but bare `cargo run` from a terminal would be a background
-    // process and silently no-op the hide.
+    let directory = match settings::directory() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(());
+        }
+    };
+    let wake = Arc::new(AtomicBool::new(false));
+    let context = Arc::new(std::sync::Mutex::new(None::<egui::Context>));
+    let wake_callback = wake.clone();
+    let context_callback = context.clone();
+    let _instance = match desktop::Instance::acquire(
+        &directory,
+        Arc::new(move || {
+            wake_callback.store(true, Ordering::SeqCst);
+            if let Some(ctx) = context_callback.lock().unwrap().as_ref() {
+                ctx.request_repaint();
+            }
+        }),
+    ) {
+        Ok(desktop::InstanceResult::Primary(instance)) => instance,
+        Ok(desktop::InstanceResult::Existing) => return Ok(()),
+        Err(e) => {
+            eprintln!("{e:#}");
+            return Ok(());
+        }
+    };
+    let path = directory.join("config.json");
+    let terminate = Arc::new(AtomicBool::new(false));
+    let terminate_callback = terminate.clone();
+    let context_callback = context.clone();
+    if let Err(e) = ctrlc::set_handler(move || {
+        terminate_callback.store(true, Ordering::SeqCst);
+        if let Some(ctx) = context_callback.lock().unwrap().as_ref() {
+            ctx.request_repaint();
+        }
+    }) {
+        log::error!("Cannot install termination handler: {e}");
+    }
+    let (mut preferences, mut warning) =
+        settings::load(&path).unwrap_or_else(|e| (Settings::default(), Some(e.to_string())));
+    // The OS registration, not a stale boolean, determines this setting.
+    match desktop::login_enabled() {
+        Ok(enabled) => preferences.start_on_login = enabled,
+        Err(error) => {
+            preferences.start_on_login = false;
+            warning = Some(format!(
+                "{}Cannot read login startup registration: {error}",
+                warning.map(|text| format!("{text}\n")).unwrap_or_default()
+            ));
+        }
+    }
     input_capture::promote_to_foreground_app();
-    // Defensive unstick in case a previous run crashed with the cursor
-    // hidden or mouse/cursor association off. No-op on a healthy system.
     input_capture::restore_cursor_state_on_startup();
-
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 640.0])
@@ -62,10 +110,19 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "mouse share",
         opts,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             install_fonts(&cc.egui_ctx);
             install_style(&cc.egui_ctx);
-            Ok(Box::new(App::default()))
+            *context.lock().unwrap() = Some(cc.egui_ctx.clone());
+            let mut app = App::default();
+            app.config_path = path;
+            app.wake = wake;
+            app.terminate = terminate;
+            app.preference_error = warning;
+            app.apply_preferences(&preferences);
+            app.preferences = preferences;
+            app.autostart = std::env::args().any(|s| s == "--autostart");
+            Ok(Box::new(app))
         }),
     )
 }
@@ -385,7 +442,7 @@ const EN: Strings = Strings {
     section_general: "General",
     set_start_on_login: "Start on login",
     set_start_on_login_sub: "Launch at system startup",
-    set_auto_connect: "Auto-connect",
+    set_auto_connect: "Auto-reconnect",
     set_auto_connect_sub: "Reconnect on disconnect",
     set_show_in_menubar: "Show in menu bar",
     set_show_in_menubar_sub: "Tray icon (macOS/Win)",
@@ -476,7 +533,8 @@ const ZH: Strings = Strings {
 
     pill_connection_lost: "连接断开",
     err_server_unreachable: "服务端不可达",
-    err_unreachable_detail: "无法连接 192.168.1.100:4242。请确认两台设备在同一网络且服务端正在运行。",
+    err_unreachable_detail:
+        "无法连接 192.168.1.100:4242。请确认两台设备在同一网络且服务端正在运行。",
     err_firewall_check: "防火墙检查",
     err_firewall_detail: "请在防火墙中放行 UDP :4242 与 TCP :4243。",
     btn_copy_firewall: "复制防火墙规则",
@@ -505,7 +563,7 @@ const ZH: Strings = Strings {
     section_general: "通用",
     set_start_on_login: "开机启动",
     set_start_on_login_sub: "系统启动时自动运行",
-    set_auto_connect: "自动连接",
+    set_auto_connect: "断线自动重连",
     set_auto_connect_sub: "断线后自动重连",
     set_show_in_menubar: "显示在菜单栏",
     set_show_in_menubar_sub: "托盘图标 (macOS/Win)",
@@ -544,10 +602,9 @@ fn install_fonts(ctx: &egui::Context) {
     for path in candidates {
         if let Ok(bytes) = std::fs::read(path) {
             let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "cjk".to_owned(),
-                egui::FontData::from_owned(bytes),
-            );
+            fonts
+                .font_data
+                .insert("cjk".to_owned(), egui::FontData::from_owned(bytes));
             // Append CJK font AFTER the existing defaults so latin characters
             // still use the default font's kerning/metrics and only CJK
             // codepoints fall back to the system font.
@@ -577,7 +634,7 @@ fn install_style(ctx: &egui::Context) {
     v.extreme_bg_color = theme::FIELD_BG;
     v.faint_bg_color = theme::FIELD_BG;
     v.selection.bg_fill = theme::PRIMARY.linear_multiply(0.3);
-    v.selection.stroke = Stroke::new(1.0, theme::PRIMARY);
+    v.selection.stroke = Stroke::new(1.0_f32, theme::PRIMARY);
 
     // Widgets: form fields / buttons defaults
     for w in [
@@ -587,15 +644,15 @@ fn install_style(ctx: &egui::Context) {
     ] {
         w.bg_fill = theme::FIELD_BG;
         w.weak_bg_fill = theme::FIELD_BG;
-        w.bg_stroke = Stroke::new(1.0, theme::FIELD_BORDER);
+        w.bg_stroke = Stroke::new(1.0_f32, theme::FIELD_BORDER);
         w.rounding = Rounding::same(8.0);
-        w.fg_stroke = Stroke::new(1.0, theme::TEXT);
+        w.fg_stroke = Stroke::new(1.0_f32, theme::TEXT);
         w.expansion = 0.0;
     }
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, theme::PRIMARY);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme::PRIMARY);
     v.widgets.noninteractive.bg_fill = theme::CARD_BG;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, theme::CARD_BORDER);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, theme::TEXT);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, theme::CARD_BORDER);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, theme::TEXT);
 
     style.spacing.item_spacing = Vec2::new(10.0, 10.0);
     style.spacing.button_padding = Vec2::new(14.0, 8.0);
@@ -666,6 +723,14 @@ enum Edge {
 }
 
 impl Edge {
+    fn from_config(edge: msc::Edge) -> Self {
+        match edge {
+            msc::Edge::Left => Self::Left,
+            msc::Edge::Right => Self::Right,
+            msc::Edge::Top => Self::Top,
+            msc::Edge::Bottom => Self::Bottom,
+        }
+    }
     fn label(self, s: &Strings) -> &'static str {
         match self {
             Edge::Left => s.edge_left,
@@ -685,20 +750,6 @@ impl Edge {
     }
 }
 
-/// What kind of session is currently running.
-#[derive(Clone, Copy, PartialEq)]
-enum SessionKind {
-    Server,
-    Client,
-}
-
-/// Handle to a live backend session. Dropping this does NOT stop the
-/// session — use `App::stop_session` which sets `shutdown` and joins.
-struct SessionHandle {
-    kind: SessionKind,
-    thread: Option<JoinHandle<()>>,
-}
-
 /// Button-click intents produced by render functions and processed after
 /// the render pass by `App::apply_pending_action`. This indirection avoids
 /// double-borrowing `self` inside the nested closures egui uses.
@@ -707,6 +758,8 @@ enum Action {
     StartServer,
     StartClient,
     StopSession,
+    RestartClient,
+    Quit,
 }
 
 struct App {
@@ -748,6 +801,21 @@ struct App {
     log_rx: Option<LogReceiver>,
     /// Local log storage, owned exclusively by the UI thread.
     log_cache: Vec<LogLine>,
+    preferences: Settings,
+    config_path: std::path::PathBuf,
+    preference_job: Option<JoinHandle<anyhow::Result<Settings>>>,
+    preference_error: Option<String>,
+    last_role: Option<SessionKind>,
+    tray: Option<Tray>,
+    tray_initialized: bool,
+    wake: Arc<AtomicBool>,
+    hidden: bool,
+    quitting: bool,
+    last_success: Option<SessionConfig>,
+    terminate: Arc<AtomicBool>,
+    restart_client: bool,
+    autostart: bool,
+    initialized: bool,
 }
 
 impl App {
@@ -768,152 +836,351 @@ impl App {
         self.session.as_ref().map(|s| s.kind)
     }
 
-    /// Spawn the backend `Server` on a dedicated thread. Installs a fresh
-    /// `SharedState` so the UI observes only state from this new session.
     fn start_server(&mut self) {
-        if self.is_running() {
-            return;
-        }
-        let port: u16 = self.port.trim().parse().unwrap_or(4242);
-        let edge = self.edge.to_config();
-        self.shared = Arc::new(SharedState::new());
-        let shared = self.shared.clone();
-        log::info!("UI: starting server on port {} edge {:?}", port, edge);
-        let thread = std::thread::Builder::new()
-            .name("mouse-share-server".into())
-            .spawn(move || {
-                let server = BeServer::new(port, edge);
-                if let Err(e) = server.run(shared.clone()) {
-                    log::error!("server exited with error: {}", e);
-                    shared.set_error(format!("{}", e));
-                }
-            })
-            .ok();
-        self.session = Some(SessionHandle {
-            kind: SessionKind::Server,
-            thread,
-        });
+        self.start_session(SessionKind::Server);
     }
-
-    /// Spawn the backend `Client` on a dedicated thread.
     fn start_client(&mut self) {
-        if self.is_running() {
+        self.start_session(SessionKind::Client);
+    }
+    fn start_session(&mut self, kind: SessionKind) {
+        if self.is_running() || self.quitting {
             return;
         }
-        let host = self.server_addr.trim().to_string();
-        let port = self.server_port.trim().to_string();
-        let addr = if port.is_empty() {
-            host
-        } else {
-            format!("{}:{}", host, port)
-        };
-        self.shared = Arc::new(SharedState::new());
-        let shared = self.shared.clone();
-        log::info!("UI: starting client → {}", addr);
-        let thread = std::thread::Builder::new()
-            .name("mouse-share-client".into())
-            .spawn(move || {
-                let client = BeClient::new(addr);
-                if let Err(e) = client.run(shared.clone()) {
-                    log::error!("client exited with error: {}", e);
-                    shared.set_error(format!("{}", e));
-                }
+        let result = (|| -> anyhow::Result<SessionHandle> {
+            let port = self
+                .port
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("Port must be between 1 and 65534"))?;
+            let server = if self.server_port.trim().is_empty() {
+                self.server_addr.trim().into()
+            } else {
+                format!("{}:{}", self.server_addr.trim(), self.server_port.trim())
+            };
+            SessionHandle::start(SessionConfig {
+                role: kind,
+                port,
+                server,
+                edge: self.edge.to_config(),
+                device: self.preferences.device,
+                features: Features {
+                    keyboard: self.keyboard_fwd,
+                    clipboard: self.clipboard_sync,
+                },
+                auto_reconnect: self.auto_connect,
             })
-            .ok();
-        self.session = Some(SessionHandle {
-            kind: SessionKind::Client,
-            thread,
-        });
-    }
-
-    /// Signal the running session to shut down and join its thread. Safe to
-    /// call when nothing is running — it just clears state.
-    fn stop_session(&mut self) {
-        if let Some(mut sess) = self.session.take() {
-            log::info!("UI: stopping session");
-            self.shared.shutdown.store(true, Ordering::SeqCst);
-            if let Some(t) = sess.thread.take() {
-                // Best-effort join — the backend loops poll shutdown every
-                // 100ms or so, and clipboard sockets have 500ms timeouts, so
-                // this should complete quickly. We don't block forever.
-                let _ = t.join();
+        })();
+        match result {
+            Ok(handle) => {
+                self.shared = handle.state.clone();
+                self.session = Some(handle);
+            }
+            Err(e) => {
+                self.shared.set_error(e.to_string());
+                self.shared.phase(Phase::Failed);
             }
         }
-        // Reset observable state for the next session.
-        self.shared = Arc::new(SharedState::new());
     }
-
-    /// Process any action a render function emitted during this frame.
+    fn stop_session(&mut self) {
+        if let Some(session) = &self.session {
+            session.command(SessionCommand::Stop);
+        }
+    }
     fn apply_pending_action(&mut self) {
         if let Some(action) = self.pending_action.take() {
             match action {
                 Action::StartServer => self.start_server(),
                 Action::StartClient => self.start_client(),
-                Action::StopSession => self.stop_session(),
-            }
-        }
-    }
-
-    /// Reconcile the UI state enums with what the backend actually reports.
-    /// Called at the top of every frame before rendering.
-    fn derive_states(&mut self) {
-        // Dev mode bypass — the user is driving the state machine manually
-        // via the dev switcher, so don't overwrite their selection.
-        if self.dev_mode {
-            return;
-        }
-
-        let running = self.is_running();
-        let kind = self.session_kind();
-        let connected = self.shared.connected.load(Ordering::SeqCst);
-        let mouse_on_peer = self.shared.mouse_on_peer.load(Ordering::SeqCst);
-        let has_error = self.shared.last_error.lock().unwrap().is_some();
-
-        // If the session thread has finished on its own (error or normal
-        // exit), reap it so we flip back to the not-running state.
-        let finished = self
-            .session
-            .as_ref()
-            .and_then(|s| s.thread.as_ref())
-            .map(|t| t.is_finished())
-            .unwrap_or(false);
-        if finished {
-            if let Some(mut sess) = self.session.take() {
-                if let Some(t) = sess.thread.take() {
-                    let _ = t.join();
+                Action::StopSession => {
+                    self.restart_client = false;
+                    self.stop_session();
+                }
+                Action::RestartClient => {
+                    self.restart_client = true;
+                    self.stop_session();
+                }
+                Action::Quit => {
+                    self.quitting = true;
+                    self.restart_client = false;
+                    self.stop_session();
                 }
             }
         }
-
-        let running = running && self.session.is_some();
-
-        // Server tab state
-        if matches!(kind, Some(SessionKind::Server)) && running {
-            self.server_state = if connected {
+    }
+    fn derive_states(&mut self) {
+        if self.dev_mode {
+            return;
+        }
+        let snapshot = self.shared.snapshot();
+        if self.session_kind() == Some(SessionKind::Server)
+            && self.clipboard_sync
+            && !self.shared.desired.lock().unwrap().clipboard
+            && snapshot.clipboard_error.is_some()
+        {
+            self.clipboard_sync = false;
+            self.preference_error = snapshot.clipboard_error.clone();
+        }
+        let kind = self.session_kind();
+        if matches!(snapshot.phase, Phase::Listening | Phase::Connected) {
+            self.last_role = kind.or(self.last_role);
+            if let Some(session) = &self.session {
+                self.last_success = Some(session.config.clone());
+            }
+        }
+        if self.session.as_mut().is_some_and(|s| s.reap()) {
+            self.session.take();
+        }
+        self.client_edge = Edge::from_config(snapshot.edge);
+        self.server_state =
+            if kind == Some(SessionKind::Server) && snapshot.phase == Phase::Connected {
                 ServerState::Connected
+            } else if snapshot.phase == Phase::Failed
+                && snapshot
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.contains("Accessibility"))
+            {
+                ServerState::PermissionRequired
             } else {
                 ServerState::Idle
             };
-        } else if !running {
-            // Only override if we're not sitting in a non-run screen the
-            // user reached via dev switcher.
-            self.server_state = ServerState::Idle;
-        }
-
-        // Client tab state
-        if matches!(kind, Some(SessionKind::Client)) && running {
-            self.client_state = if has_error && !connected {
-                ClientState::NetworkError
-            } else if !connected {
+        self.client_state =
+            if kind == Some(SessionKind::Client) && snapshot.phase == Phase::Connected {
+                if snapshot.mouse_on_peer {
+                    ClientState::MouseActive
+                } else {
+                    ClientState::MouseOnServer
+                }
+            } else if matches!(
+                snapshot.phase,
+                Phase::Connecting | Phase::Reconnecting | Phase::Stopping
+            ) && kind == Some(SessionKind::Client)
+            {
                 ClientState::Connecting
-            } else if mouse_on_peer {
-                ClientState::MouseActive
+            } else if snapshot.phase == Phase::Failed {
+                ClientState::NetworkError
             } else {
-                ClientState::MouseOnServer
+                ClientState::Config
             };
-        } else if !running {
-            if !matches!(self.client_state, ClientState::Config) {
-                self.client_state = ClientState::Config;
+        if self.restart_client && self.session.is_none() && !self.quitting {
+            self.restart_client = false;
+            self.start_client();
+        }
+    }
+    fn apply_preferences(&mut self, p: &Settings) {
+        self.clipboard_sync = p.features.clipboard;
+        self.keyboard_fwd = p.features.keyboard;
+        self.auto_connect = p.auto_reconnect;
+        self.debug_logging = p.debug_logging;
+        self.start_on_login = p.start_on_login;
+        self.show_in_menubar = p.show_in_menubar;
+        self.default_port = p.port.to_string();
+        self.default_edge = Edge::from_config(p.edge);
+        if !self.is_running() {
+            self.port = p.port.to_string();
+            self.edge = Edge::from_config(p.edge);
+        }
+        self.server_addr = p.server_host.clone();
+        self.server_port = p.server_port.to_string();
+        self.last_role = p.last_role;
+        self.last_success = p.last_session.clone();
+        self.lang = match p.language.as_str() {
+            "zh" => Lang::Zh,
+            "en" => Lang::En,
+            _ => Lang::from_system(),
+        };
+        log::set_max_level(if self.debug_logging {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        });
+    }
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.hidden = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+    fn sync_preferences(&mut self, ctx: &egui::Context) {
+        if self
+            .preference_job
+            .as_ref()
+            .is_some_and(|t| t.is_finished())
+        {
+            let result = self
+                .preference_job
+                .take()
+                .unwrap()
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Settings worker panicked")));
+            match result {
+                Ok(p) => {
+                    self.preferences = p;
+                    log::set_max_level(if self.preferences.debug_logging {
+                        log::LevelFilter::Debug
+                    } else {
+                        log::LevelFilter::Info
+                    });
+                    if let Some(session) = &self.session {
+                        session.command(SessionCommand::SetAutoReconnect(
+                            self.preferences.auto_reconnect,
+                        ));
+                        session.command(SessionCommand::SetFeatures(self.preferences.features));
+                    }
+                }
+                Err(e) => {
+                    self.preference_error = Some(e.to_string());
+                    let old = self.preferences.clone();
+                    self.apply_preferences(&old);
+                }
+            }
+        }
+        if self.preference_job.is_some() || self.quitting || self.dev_mode {
+            return;
+        }
+        if self.show_in_menubar && self.tray.is_none() {
+            match Tray::new(ctx) {
+                Ok(tray) => self.tray = Some(tray),
+                Err(e) => {
+                    self.show_in_menubar = false;
+                    self.preference_error = Some(format!("Tray unavailable: {e}"));
+                    self.show_window(ctx);
+                }
+            }
+        } else if !self.show_in_menubar && self.tray.is_some() {
+            self.show_window(ctx);
+            self.tray.take();
+        }
+        if !self.is_running() {
+            if self.tab == Tab::Server {
+                self.default_port = self.port.clone();
+                self.default_edge = self.edge;
+            } else {
+                self.port = self.default_port.clone();
+                self.edge = self.default_edge;
+            }
+        }
+        let mut p = self.preferences.clone();
+        let Ok(port) = self.default_port.trim().parse::<u16>() else {
+            self.preference_error =
+                Some("Port must be between 1 and 65534; settings were not saved".into());
+            return;
+        };
+        let Ok(server_port) = self.server_port.trim().parse::<u16>() else {
+            self.preference_error =
+                Some("Server port must be between 1 and 65534; settings were not saved".into());
+            return;
+        };
+        p.port = port;
+        p.edge = self.default_edge.to_config();
+        p.server_host = self.server_addr.clone();
+        p.server_port = server_port;
+        p.features = Features {
+            keyboard: self.keyboard_fwd,
+            clipboard: self.clipboard_sync,
+        };
+        p.auto_reconnect = self.auto_connect;
+        p.debug_logging = self.debug_logging;
+        p.start_on_login = self.start_on_login;
+        p.show_in_menubar = self.show_in_menubar;
+        p.language = if self.lang == Lang::Zh { "zh" } else { "en" }.into();
+        p.last_role = self.last_role;
+        p.last_session = self.last_success.clone();
+        if p == self.preferences {
+            return;
+        }
+        if let Err(e) = p.validate() {
+            self.preference_error = Some(e.to_string());
+            return;
+        }
+        let old = self.preferences.clone();
+        let path = self.config_path.clone();
+        let repaint = ctx.clone();
+        self.preference_error = None;
+        match std::thread::Builder::new()
+            .name("settings".into())
+            .spawn(move || {
+                let result = (|| -> anyhow::Result<Settings> {
+                    if p.start_on_login != old.start_on_login {
+                        desktop::set_login(p.start_on_login)?;
+                    }
+                    if let Err(error) = settings::save(&path, &p) {
+                        if p.start_on_login != old.start_on_login {
+                            let _ = desktop::set_login(old.start_on_login);
+                        }
+                        return Err(error);
+                    }
+                    Ok(p)
+                })();
+                repaint.request_repaint();
+                result
+            }) {
+            Ok(job) => self.preference_job = Some(job),
+            Err(e) => {
+                self.preference_error = Some(e.to_string());
+                let old = self.preferences.clone();
+                self.apply_preferences(&old);
+            }
+        }
+    }
+    fn desktop_events(&mut self, ctx: &egui::Context) {
+        if self.terminate.swap(false, Ordering::SeqCst) {
+            self.pending_action = Some(Action::Quit);
+        }
+        if self.wake.swap(false, Ordering::SeqCst) {
+            self.show_window(ctx);
+        }
+        let actions = self
+            .tray
+            .as_ref()
+            .map(|t| t.events.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for action in actions {
+            self.tray_action(action, ctx);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.show_in_menubar && self.tray.is_some() {
+                self.hidden = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                self.pending_action = Some(Action::Quit);
+            }
+        } else if ctx.input(|i| i.viewport().close_requested())
+            && (self.session.is_some() || self.preference_job.is_some())
+        {
+            // A second close during shutdown must not bypass asynchronous
+            // input release and worker cleanup.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if self.quitting && self.session.is_none() && self.preference_job.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+    fn restore_successful_config(&mut self) -> Option<SessionKind> {
+        if let Some(config) = &self.last_success {
+            self.port = config.port.to_string();
+            self.edge = Edge::from_config(config.edge);
+            if let Ok(addr) = config.server.parse::<std::net::SocketAddr>() {
+                self.server_addr = addr.ip().to_string();
+                self.server_port = addr.port().to_string();
+            }
+            Some(config.role)
+        } else {
+            self.last_role
+        }
+    }
+    fn tray_action(&mut self, action: TrayAction, ctx: &egui::Context) {
+        match action {
+            TrayAction::Open => self.show_window(ctx),
+            TrayAction::Stop => self.pending_action = Some(Action::StopSession),
+            TrayAction::Exit => self.pending_action = Some(Action::Quit),
+            TrayAction::Start => {
+                self.pending_action = Some(if self.last_role == Some(SessionKind::Client) {
+                    Action::StartClient
+                } else {
+                    Action::StartServer
+                })
             }
         }
     }
@@ -936,7 +1203,6 @@ impl App {
         let secs = now.saturating_sub(started) / 1000;
         format_duration(secs)
     }
-
 }
 
 fn format_duration(secs: u64) -> String {
@@ -963,7 +1229,7 @@ impl Default for App {
             server_addr: "192.168.1.100".into(),
             server_port: "4242".into(),
             client_edge: Edge::Right,
-            start_on_login: true,
+            start_on_login: false,
             auto_connect: true,
             show_in_menubar: true,
             default_port: "4242".into(),
@@ -977,22 +1243,71 @@ impl Default for App {
                 .unwrap_or(false),
             log_rx: log_buffer::take_receiver(),
             log_cache: Vec::new(),
+            preferences: Settings::default(),
+            config_path: std::path::PathBuf::new(),
+            preference_job: None,
+            preference_error: None,
+            last_role: None,
+            tray: None,
+            tray_initialized: false,
+            wake: Arc::new(AtomicBool::new(false)),
+            hidden: false,
+            quitting: false,
+            last_success: None,
+            terminate: Arc::new(AtomicBool::new(false)),
+            restart_client: false,
+            autostart: false,
+            initialized: false,
         };
         // Dev hook: start in a specific visual state for screenshotting.
         if let Ok(s) = std::env::var("MOUSE_SHARE_UI_STATE") {
             match s.as_str() {
-                "server_idle" => { app.tab = Tab::Server; app.server_state = ServerState::Idle; }
-                "server_connected" => { app.tab = Tab::Server; app.server_state = ServerState::Connected; }
-                "server_conflict" => { app.tab = Tab::Server; app.server_state = ServerState::PortConflict; }
-                "server_resolved" => { app.tab = Tab::Server; app.server_state = ServerState::PortResolved; }
-                "client_config" => { app.tab = Tab::Client; app.client_state = ClientState::Config; }
-                "client_connecting" => { app.tab = Tab::Client; app.client_state = ClientState::Connecting; }
-                "client_on_server" => { app.tab = Tab::Client; app.client_state = ClientState::MouseOnServer; }
-                "client_active" => { app.tab = Tab::Client; app.client_state = ClientState::MouseActive; }
-                "permission" => { app.tab = Tab::Server; app.server_state = ServerState::PermissionRequired; }
-                "error" => { app.tab = Tab::Client; app.client_state = ClientState::NetworkError; }
-                "log" => { app.tab = Tab::Log; }
-                "settings" => { app.tab = Tab::Settings; }
+                "server_idle" => {
+                    app.tab = Tab::Server;
+                    app.server_state = ServerState::Idle;
+                }
+                "server_connected" => {
+                    app.tab = Tab::Server;
+                    app.server_state = ServerState::Connected;
+                }
+                "server_conflict" => {
+                    app.tab = Tab::Server;
+                    app.server_state = ServerState::PortConflict;
+                }
+                "server_resolved" => {
+                    app.tab = Tab::Server;
+                    app.server_state = ServerState::PortResolved;
+                }
+                "client_config" => {
+                    app.tab = Tab::Client;
+                    app.client_state = ClientState::Config;
+                }
+                "client_connecting" => {
+                    app.tab = Tab::Client;
+                    app.client_state = ClientState::Connecting;
+                }
+                "client_on_server" => {
+                    app.tab = Tab::Client;
+                    app.client_state = ClientState::MouseOnServer;
+                }
+                "client_active" => {
+                    app.tab = Tab::Client;
+                    app.client_state = ClientState::MouseActive;
+                }
+                "permission" => {
+                    app.tab = Tab::Server;
+                    app.server_state = ServerState::PermissionRequired;
+                }
+                "error" => {
+                    app.tab = Tab::Client;
+                    app.client_state = ClientState::NetworkError;
+                }
+                "log" => {
+                    app.tab = Tab::Log;
+                }
+                "settings" => {
+                    app.tab = Tab::Settings;
+                }
                 _ => {}
             }
         }
@@ -1021,15 +1336,67 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Reconcile UI enums with the backend before we render this frame.
         self.derive_states();
+        if !self.initialized {
+            self.initialized = true;
+            self.sync_preferences(ctx);
+            if self.autostart {
+                if self.show_in_menubar && self.tray.is_some() {
+                    self.hidden = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+                if let Some(role) = self.restore_successful_config() {
+                    self.start_session(role);
+                }
+            }
+        }
+        self.desktop_events(ctx);
+        if self.hidden && self.shared.snapshot().phase == Phase::Failed {
+            self.show_window(ctx);
+        }
+        if let Some(rx) = &mut self.log_rx {
+            rx.drain(&mut self.log_cache);
+        }
+        if self.log_cache.len() > 1000 {
+            self.log_cache.drain(..self.log_cache.len() - 1000);
+        }
+        let running = self.is_running();
+        let snapshot = self.shared.snapshot();
+        if let Some(tray) = &mut self.tray {
+            tray.update(snapshot.phase, running, self.lang == Lang::Zh);
+        }
 
         egui::CentralPanel::default()
-            .frame(Frame::none().fill(theme::BG).inner_margin(Margin::same(16.0)))
+            .frame(
+                Frame::none()
+                    .fill(theme::BG)
+                    .inner_margin(Margin::same(16.0)),
+            )
             .show(ctx, |ui| {
                 let s = self.s();
                 card(ui, |ui| {
                     title_bar(ui, "mouse share");
                     tab_bar(ui, &mut self.tab, s);
                     ui.add_space(14.0);
+                    if self.shared.snapshot().phase == Phase::Stopping {
+                        ui.label(if self.lang == Lang::Zh {
+                            "正在停止并释放输入…"
+                        } else {
+                            "Stopping and releasing input…"
+                        });
+                    }
+                    if self.preference_job.is_some() {
+                        ui.label(if self.lang == Lang::Zh {
+                            "正在应用设置…"
+                        } else {
+                            "Applying settings…"
+                        });
+                    }
+                    if let Some(error) = &self.preference_error {
+                        error_banner(ui, error);
+                    }
+                    if let Some(error) = self.shared.snapshot().clipboard_error {
+                        error_banner(ui, &error);
+                    }
                     ui.scope(|ui| {
                         ui.style_mut().spacing.item_spacing.y = 12.0;
                         match self.tab {
@@ -1044,10 +1411,11 @@ impl eframe::App for App {
 
         // Apply any button action collected by the render pass.
         self.apply_pending_action();
+        self.sync_preferences(ctx);
 
         // Keep the UI responsive to backend state changes. We poll atomics,
         // so a steady repaint cadence is what drives uptime/events updates.
-        ctx.request_repaint_after(Duration::from_millis(150));
+        ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
 
@@ -1065,7 +1433,7 @@ impl Drop for App {
 fn card(ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
     Frame::none()
         .fill(theme::CARD_BG)
-        .stroke(Stroke::new(1.0, theme::CARD_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::CARD_BORDER))
         .rounding(Rounding::same(14.0))
         .inner_margin(Margin::symmetric(20.0, 16.0))
         .show(ui, contents);
@@ -1101,20 +1469,14 @@ fn title_bar(ui: &mut Ui, title: &str) {
                         .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
                     _ => {
                         // Toggle maximize. egui tracks this via ViewportInfo.
-                        let is_max = ui
-                            .ctx()
-                            .input(|i| i.viewport().maximized.unwrap_or(false));
+                        let is_max = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
                         ui.ctx()
                             .send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
                     }
                 }
             }
-            ui.painter().circle(
-                center,
-                5.5,
-                *c,
-                Stroke::new(1.0, theme::TL_STROKE),
-            );
+            ui.painter()
+                .circle(center, 5.5, *c, Stroke::new(1.0_f32, theme::TL_STROKE));
             // On hover, overlay the macOS-style glyph: × / − / +
             if any_hover {
                 let glyph_color = Color32::from_rgba_unmultiplied(0, 0, 0, 180);
@@ -1125,29 +1487,29 @@ fn title_bar(ui: &mut Ui, title: &str) {
                         let d = 2.5;
                         p.line_segment(
                             [egui::pos2(x - d, y - d), egui::pos2(x + d, y + d)],
-                            Stroke::new(1.2, glyph_color),
+                            Stroke::new(1.2_f32, glyph_color),
                         );
                         p.line_segment(
                             [egui::pos2(x - d, y + d), egui::pos2(x + d, y - d)],
-                            Stroke::new(1.2, glyph_color),
+                            Stroke::new(1.2_f32, glyph_color),
                         );
                     }
                     1 => {
                         // −
                         p.line_segment(
                             [egui::pos2(x - 3.0, y), egui::pos2(x + 3.0, y)],
-                            Stroke::new(1.4, glyph_color),
+                            Stroke::new(1.4_f32, glyph_color),
                         );
                     }
                     _ => {
                         // + (simple zoom indicator)
                         p.line_segment(
                             [egui::pos2(x - 2.8, y), egui::pos2(x + 2.8, y)],
-                            Stroke::new(1.2, glyph_color),
+                            Stroke::new(1.2_f32, glyph_color),
                         );
                         p.line_segment(
                             [egui::pos2(x, y - 2.8), egui::pos2(x, y + 2.8)],
-                            Stroke::new(1.2, glyph_color),
+                            Stroke::new(1.2_f32, glyph_color),
                         );
                     }
                 }
@@ -1173,16 +1535,11 @@ fn title_bar(ui: &mut Ui, title: &str) {
         // primary green. Directly communicates "mouse" which is in the
         // product name and scales cleanly at small sizes because it's
         // a single filled polygon rather than multiple tiny strokes.
-        let (icon_rect, _) =
-            ui.allocate_exact_size(Vec2::new(ICON_W, 16.0), Sense::hover());
+        let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(ICON_W, 16.0), Sense::hover());
         draw_app_icon(ui.painter(), icon_rect);
         ui.add_space(GAP - ui.spacing().item_spacing.x);
 
-        ui.label(
-            RichText::new(title)
-                .size(13.0)
-                .color(theme::TEXT_MUTED),
-        );
+        ui.label(RichText::new(title).size(13.0).color(theme::TEXT_MUTED));
     });
     ui.add_space(12.0);
 }
@@ -1209,13 +1566,13 @@ fn draw_app_icon(painter: &eframe::egui::Painter, rect: Rect) {
     // must form a simple (non-self-intersecting) polygon for fills to
     // render correctly.
     let norm: [(f32, f32); 7] = [
-        (0.0, 0.0),   // tip
-        (0.0, 10.5),  // bottom of left edge
-        (2.8, 8.0),   // inward notch (heel of the arrow)
-        (5.0, 12.5),  // tail bottom-left
-        (6.5, 11.8),  // tail bottom-right
-        (4.3, 7.3),   // inward notch on the right
-        (8.0, 6.5),   // rightmost point of the arrowhead
+        (0.0, 0.0),  // tip
+        (0.0, 10.5), // bottom of left edge
+        (2.8, 8.0),  // inward notch (heel of the arrow)
+        (5.0, 12.5), // tail bottom-left
+        (6.5, 11.8), // tail bottom-right
+        (4.3, 7.3),  // inward notch on the right
+        (8.0, 6.5),  // rightmost point of the arrowhead
     ];
 
     // Fit the normalized shape into `rect` while preserving aspect ratio.
@@ -1263,7 +1620,7 @@ fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
                 let y = rect.bottom() + 4.0;
                 ui.painter().line_segment(
                     [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                    Stroke::new(2.0, theme::PRIMARY),
+                    Stroke::new(2.0_f32, theme::PRIMARY),
                 );
             }
         }
@@ -1276,7 +1633,7 @@ fn tab_bar(ui: &mut Ui, tab: &mut Tab, s: &Strings) {
             egui::pos2(r.left() - 20.0, r.top() + 2.0),
             egui::pos2(r.right() + 20.0, r.top() + 2.0),
         ],
-        Stroke::new(1.0, theme::CARD_BORDER),
+        Stroke::new(1.0_f32, theme::CARD_BORDER),
     );
     ui.add_space(4.0);
 }
@@ -1288,8 +1645,7 @@ fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> Response {
         .inner_margin(Margin::symmetric(12.0, 6.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let (dot_rect, _) =
-                    ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
+                let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
                 ui.painter().circle_filled(dot_rect.center(), 3.5, fg);
                 ui.label(RichText::new(text).size(12.0).color(fg).strong());
             });
@@ -1300,7 +1656,7 @@ fn pill(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) -> Response {
 fn field(ui: &mut Ui, label: &str, value: &str) {
     Frame::none()
         .fill(theme::FIELD_BG)
-        .stroke(Stroke::new(1.0, theme::FIELD_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::FIELD_BORDER))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(14.0, 10.0))
         .show(ui, |ui| {
@@ -1365,7 +1721,13 @@ fn paint_button(
     // the rasterizer antialiasing thickens the strokes.
     let font = FontId::new(13.0, FontFamily::Proportional);
     let center = rect.center();
-    painter.text(center, Align2::CENTER_CENTER, text, font.clone(), text_color);
+    painter.text(
+        center,
+        Align2::CENTER_CENTER,
+        text,
+        font.clone(),
+        text_color,
+    );
     if strong {
         painter.text(
             center + Vec2::new(0.5, 0.0),
@@ -1398,7 +1760,7 @@ fn danger_button(ui: &mut Ui, text: &str) -> Response {
         theme::CARD_BG,
         theme::DANGER_SOFT,
         Color32::from_rgb(250, 220, 222),
-        Stroke::new(1.0, theme::DANGER_SOFT_BORDER),
+        Stroke::new(1.0_f32, theme::DANGER_SOFT_BORDER),
         theme::DANGER,
         true,
     )
@@ -1411,7 +1773,7 @@ fn ghost_button(ui: &mut Ui, text: &str) -> Response {
         theme::CARD_BG,
         theme::FIELD_BG,
         theme::FIELD_BORDER,
-        Stroke::new(1.0, theme::CARD_BORDER),
+        Stroke::new(1.0_f32, theme::CARD_BORDER),
         theme::TEXT,
         false,
     )
@@ -1456,7 +1818,7 @@ fn stop_running_button(ui: &mut Ui, text: &str) -> Response {
         rect,
         Rounding::same(10.0),
         base_fill,
-        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
     );
 
     // Pulsing dot on the left. Radius breathes between 3.5 and 5.5 px;
@@ -1474,7 +1836,7 @@ fn stop_running_button(ui: &mut Ui, text: &str) -> Response {
             dot_center,
             dot_radius + 2.0 + pulse * 2.5,
             Stroke::new(
-                1.0,
+                1.0_f32,
                 Color32::from_rgba_unmultiplied(255, 255, 255, ring_alpha),
             ),
         );
@@ -1514,7 +1876,7 @@ fn screen_box(
         rect,
         Rounding::same(8.0),
         fill,
-        Stroke::new(if highlighted { 2.0 } else { 1.0 }, stroke_color),
+        Stroke::new(if highlighted { 2.0_f32 } else { 1.0_f32 }, stroke_color),
     );
     p.text(
         rect.center(),
@@ -1573,7 +1935,7 @@ fn topology(
                     let next = (x + dash).min(gap_end);
                     p.line_segment(
                         [egui::pos2(x, y), egui::pos2(next, y)],
-                        Stroke::new(1.5, theme::PRIMARY),
+                        Stroke::new(1.5_f32, theme::PRIMARY),
                     );
                     x = next + gap;
                 }
@@ -1616,7 +1978,11 @@ fn toggle_switch(ui: &mut Ui, on: &mut bool) -> Response {
         *on = !*on;
         resp.mark_changed();
     }
-    let bg = if *on { theme::PRIMARY } else { theme::FIELD_BORDER };
+    let bg = if *on {
+        theme::PRIMARY
+    } else {
+        theme::FIELD_BORDER
+    };
     let p = ui.painter();
     p.rect_filled(rect, Rounding::same(10.0), bg);
     let knob_x = if *on {
@@ -1663,16 +2029,11 @@ fn server_tab(ui: &mut Ui, app: &mut App) {
 fn error_banner(ui: &mut Ui, msg: &str) {
     Frame::none()
         .fill(theme::DANGER_SOFT)
-        .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::DANGER_SOFT_BORDER))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(12.0, 8.0))
         .show(ui, |ui| {
-            ui.label(
-                RichText::new(msg)
-                    .size(12.0)
-                    .color(theme::DANGER)
-                    .strong(),
-            );
+            ui.label(RichText::new(msg).size(12.0).color(theme::DANGER).strong());
         });
     ui.add_space(6.0);
 }
@@ -1684,10 +2045,9 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
     // Icon + "Waiting for client" / "Not running"
     ui.vertical_centered(|ui| {
         ui.add_space(8.0);
-        let (icon_rect, _) =
-            ui.allocate_exact_size(Vec2::new(48.0, 44.0), Sense::hover());
+        let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(48.0, 44.0), Sense::hover());
         let p = ui.painter();
-        let stroke = Stroke::new(1.6, theme::TEXT_MUTED);
+        let stroke = Stroke::new(1.6_f32, theme::TEXT_MUTED);
         let screen = Rect::from_min_size(
             egui::pos2(icon_rect.left() + 6.0, icon_rect.top() + 4.0),
             Vec2::new(36.0, 26.0),
@@ -1697,19 +2057,38 @@ fn server_idle(ui: &mut Ui, app: &mut App) {
         let stand_bot = stand_top + 6.0;
         let cx = icon_rect.center().x;
         p.line_segment(
-            [egui::pos2(cx - 4.0, stand_top), egui::pos2(cx - 6.0, stand_bot)],
+            [
+                egui::pos2(cx - 4.0, stand_top),
+                egui::pos2(cx - 6.0, stand_bot),
+            ],
             stroke,
         );
         p.line_segment(
-            [egui::pos2(cx + 4.0, stand_top), egui::pos2(cx + 6.0, stand_bot)],
+            [
+                egui::pos2(cx + 4.0, stand_top),
+                egui::pos2(cx + 6.0, stand_bot),
+            ],
             stroke,
         );
         p.line_segment(
-            [egui::pos2(cx - 9.0, stand_bot), egui::pos2(cx + 9.0, stand_bot)],
+            [
+                egui::pos2(cx - 9.0, stand_bot),
+                egui::pos2(cx + 9.0, stand_bot),
+            ],
             stroke,
         );
         ui.add_space(10.0);
-        ui.label(RichText::new(s.waiting_for_client).size(15.0).strong());
+        ui.label(
+            RichText::new(if running {
+                s.waiting_for_client
+            } else if app.lang == Lang::Zh {
+                "尚未启动"
+            } else {
+                "Not running"
+            })
+            .size(15.0)
+            .strong(),
+        );
         ui.add_space(4.0);
         ui.label(
             RichText::new(s.start_client_hint_l1)
@@ -1774,11 +2153,7 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
     ui.horizontal(|ui| {
         pill(ui, s.pill_connected, theme::PRIMARY, theme::PRIMARY_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(&peer)
-                    .size(12.0)
-                    .color(theme::TEXT_MUTED),
-            );
+            ui.label(RichText::new(&peer).size(12.0).color(theme::TEXT_MUTED));
         });
     });
     ui.add_space(8.0);
@@ -1806,7 +2181,32 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
     );
     ui.add_space(6.0);
     toggle(ui, s.toggle_clipboard_sync, &mut app.clipboard_sync);
-    toggle(ui, s.toggle_keyboard_fwd, &mut app.keyboard_fwd);
+    ui.add_enabled_ui(app.shared.snapshot().keyboard_available, |ui| {
+        toggle(ui, s.toggle_keyboard_fwd, &mut app.keyboard_fwd);
+    });
+    if !app.shared.snapshot().keyboard_available {
+        ui.label(if app.lang == Lang::Zh {
+            "跨系统键码不兼容：键盘转发不可用"
+        } else {
+            "Keyboard forwarding requires matching operating systems"
+        });
+    }
+    let actual = app.shared.snapshot().features;
+    if app.shared.snapshot().settings_pending {
+        ui.label(if app.lang == Lang::Zh {
+            "等待对端确认设置…"
+        } else {
+            "Waiting for peer to apply settings…"
+        });
+    } else if actual.keyboard != app.keyboard_fwd && app.shared.snapshot().keyboard_available
+        || actual.clipboard != app.clipboard_sync
+    {
+        ui.label(if app.lang == Lang::Zh {
+            "对端已关闭相关功能，当前以协商结果为准"
+        } else {
+            "The peer has disabled these features"
+        });
+    }
     ui.add_space(4.0);
     if stop_running_button(ui, s.btn_stop_server).clicked() {
         app.pending_action = Some(Action::StopSession);
@@ -1816,7 +2216,12 @@ fn server_connected(ui: &mut Ui, app: &mut App) {
 fn server_port_conflict(ui: &mut Ui, app: &mut App) {
     let s = app.s();
     ui.horizontal(|ui| {
-        pill(ui, s.pill_port_unavailable, theme::DANGER, theme::DANGER_SOFT);
+        pill(
+            ui,
+            s.pill_port_unavailable,
+            theme::DANGER,
+            theme::DANGER_SOFT,
+        );
     });
     ui.add_space(10.0);
     ui.label(
@@ -1827,7 +2232,7 @@ fn server_port_conflict(ui: &mut Ui, app: &mut App) {
     ui.horizontal(|ui| {
         Frame::none()
             .fill(theme::CARD_BG)
-            .stroke(Stroke::new(1.5, theme::DANGER))
+            .stroke(Stroke::new(1.5_f32, theme::DANGER))
             .rounding(Rounding::same(10.0))
             .inner_margin(Margin::symmetric(14.0, 10.0))
             .show(ui, |ui| {
@@ -1843,7 +2248,7 @@ fn server_port_conflict(ui: &mut Ui, app: &mut App) {
     ui.add_space(10.0);
     Frame::none()
         .fill(theme::DANGER_SOFT)
-        .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::DANGER_SOFT_BORDER))
         .rounding(Rounding::same(12.0))
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
@@ -1856,7 +2261,7 @@ fn server_port_conflict(ui: &mut Ui, app: &mut App) {
             ui.add_space(8.0);
             Frame::none()
                 .fill(theme::CARD_BG)
-                .stroke(Stroke::new(1.0, theme::CARD_BORDER))
+                .stroke(Stroke::new(1.0_f32, theme::CARD_BORDER))
                 .rounding(Rounding::same(8.0))
                 .inner_margin(Margin::symmetric(12.0, 8.0))
                 .show(ui, |ui| {
@@ -1873,7 +2278,10 @@ fn server_port_conflict(ui: &mut Ui, app: &mut App) {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let btn = egui::Button::new(
-                    RichText::new(s.btn_use_next).size(12.0).color(Color32::WHITE).strong(),
+                    RichText::new(s.btn_use_next)
+                        .size(12.0)
+                        .color(Color32::WHITE)
+                        .strong(),
                 )
                 .fill(theme::PRIMARY)
                 .rounding(Rounding::same(8.0))
@@ -1881,15 +2289,18 @@ fn server_port_conflict(ui: &mut Ui, app: &mut App) {
                 ui.add(btn);
                 let btn = egui::Button::new(RichText::new(s.btn_retry).size(12.0))
                     .fill(theme::CARD_BG)
-                    .stroke(Stroke::new(1.0, theme::CARD_BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::CARD_BORDER))
                     .rounding(Rounding::same(8.0))
                     .min_size(Vec2::new(70.0, 30.0));
                 ui.add(btn);
                 let btn = egui::Button::new(
-                    RichText::new(s.btn_kill).size(12.0).color(theme::DANGER).strong(),
+                    RichText::new(s.btn_kill)
+                        .size(12.0)
+                        .color(theme::DANGER)
+                        .strong(),
                 )
                 .fill(theme::CARD_BG)
-                .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
+                .stroke(Stroke::new(1.0_f32, theme::DANGER_SOFT_BORDER))
                 .rounding(Rounding::same(8.0))
                 .min_size(Vec2::new(70.0, 30.0));
                 ui.add(btn);
@@ -1941,7 +2352,7 @@ fn server_port_resolved(ui: &mut Ui, app: &mut App) {
     ui.horizontal(|ui| {
         Frame::none()
             .fill(theme::CARD_BG)
-            .stroke(Stroke::new(1.5, theme::PRIMARY))
+            .stroke(Stroke::new(1.5_f32, theme::PRIMARY))
             .rounding(Rounding::same(10.0))
             .inner_margin(Margin::symmetric(14.0, 10.0))
             .show(ui, |ui| {
@@ -1967,7 +2378,13 @@ fn server_port_resolved(ui: &mut Ui, app: &mut App) {
             );
         });
     ui.add_space(10.0);
-    field_pair(ui, s.label_udp_input, ":4244", s.label_tcp_clipboard, ":4245");
+    field_pair(
+        ui,
+        s.label_udp_input,
+        ":4244",
+        s.label_tcp_clipboard,
+        ":4245",
+    );
     ui.add_space(4.0);
     ui.label(
         RichText::new(s.text_consecutive_ports)
@@ -1983,20 +2400,15 @@ fn server_permission_required(ui: &mut Ui, app: &mut App) {
     // Large orange warning icon
     ui.vertical_centered(|ui| {
         ui.add_space(14.0);
-        let (icon_rect, _) =
-            ui.allocate_exact_size(Vec2::new(54.0, 54.0), Sense::hover());
+        let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(54.0, 54.0), Sense::hover());
         let p = ui.painter();
-        p.circle_stroke(
-            icon_rect.center(),
-            25.0,
-            Stroke::new(1.8, theme::WARN),
-        );
+        p.circle_stroke(icon_rect.center(), 25.0, Stroke::new(1.8_f32, theme::WARN));
         // Exclamation mark
         let cx = icon_rect.center().x;
         let top = icon_rect.center().y - 10.0;
         p.line_segment(
             [egui::pos2(cx, top), egui::pos2(cx, top + 14.0)],
-            Stroke::new(2.4, theme::WARN),
+            Stroke::new(2.4_f32, theme::WARN),
         );
         p.circle_filled(egui::pos2(cx, top + 20.0), 1.8, theme::WARN);
         ui.add_space(12.0);
@@ -2017,7 +2429,7 @@ fn server_permission_required(ui: &mut Ui, app: &mut App) {
     // "How to enable" card (warm/yellow)
     Frame::none()
         .fill(theme::WARN_SOFT)
-        .stroke(Stroke::new(1.0, theme::WARN.linear_multiply(0.35)))
+        .stroke(Stroke::new(1.0_f32, theme::WARN.linear_multiply(0.35)))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
@@ -2038,10 +2450,13 @@ fn server_permission_required(ui: &mut Ui, app: &mut App) {
     ui.add_space(10.0);
     ui.columns(2, |cols| {
         cols[0].vertical_centered_justified(|ui| {
-            primary_button(ui, s.btn_open_settings);
+            if primary_button(ui, s.btn_open_settings).clicked() {
+                #[cfg(target_os="macos")]
+                if let Err(e)=std::process::Command::new("open").arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility").spawn(){app.preference_error=Some(e.to_string());}
+            }
         });
         cols[1].vertical_centered_justified(|ui| {
-            ghost_button(ui, s.btn_retry);
+            if ghost_button(ui, s.btn_retry).clicked(){app.pending_action=Some(Action::StartServer);}
         });
     });
 }
@@ -2051,6 +2466,14 @@ fn server_permission_required(ui: &mut Ui, app: &mut App) {
 // ============================================================================
 
 fn client_tab(ui: &mut Ui, app: &mut App) {
+    if app.shared.snapshot().phase == Phase::Connected && !app.shared.snapshot().keyboard_available
+    {
+        ui.label(if app.lang == Lang::Zh {
+            "跨系统键码不兼容：键盘转发不可用"
+        } else {
+            "Keyboard forwarding requires matching operating systems"
+        });
+    }
     if let Some(err) = app.shared.last_error.lock().unwrap().clone() {
         // Only display the banner if the session isn't already routing to
         // NetworkError — otherwise the error is duplicated.
@@ -2098,7 +2521,11 @@ fn client_config(ui: &mut Ui, app: &mut App) {
             .size(11.0)
             .color(theme::TEXT_MUTED),
     );
-    edge_picker(ui, &mut app.client_edge, s);
+    ui.label(if app.lang == Lang::Zh {
+        "屏幕方向由控制端设置，连接后同步"
+    } else {
+        "Screen position is configured by the controller"
+    });
     ui.add_space(6.0);
     field_pair(ui, s.label_local_screen, "—", s.label_status, s.status_idle);
     ui.add_space(4.0);
@@ -2122,17 +2549,15 @@ fn edge_picker(ui: &mut Ui, edge: &mut Edge, s: &Strings) {
             };
             let resp = Frame::none()
                 .fill(fill)
-                .stroke(Stroke::new(if selected { 1.5 } else { 1.0 }, stroke_c))
+                .stroke(Stroke::new(
+                    if selected { 1.5_f32 } else { 1.0_f32 },
+                    stroke_c,
+                ))
                 .rounding(Rounding::same(10.0))
                 .inner_margin(Margin::symmetric(0.0, 10.0))
                 .show(col, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new(e.label(s))
-                                .size(13.0)
-                                .color(text_c)
-                                .strong(),
-                        );
+                        ui.label(RichText::new(e.label(s)).size(13.0).color(text_c).strong());
                     });
                 })
                 .response;
@@ -2152,11 +2577,7 @@ fn client_connecting(ui: &mut Ui, app: &mut App) {
     ui.horizontal(|ui| {
         pill(ui, s.pill_connecting, theme::WARN, theme::WARN_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(&peer)
-                    .size(12.0)
-                    .color(theme::TEXT_MUTED),
-            );
+            ui.label(RichText::new(&peer).size(12.0).color(theme::TEXT_MUTED));
         });
     });
     ui.add_space(10.0);
@@ -2196,11 +2617,7 @@ fn client_mouse_on_server(ui: &mut Ui, app: &mut App) {
     ui.horizontal(|ui| {
         pill(ui, s.pill_connected, theme::PRIMARY, theme::PRIMARY_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(&peer)
-                    .size(12.0)
-                    .color(theme::TEXT_MUTED),
-            );
+            ui.label(RichText::new(&peer).size(12.0).color(theme::TEXT_MUTED));
         });
     });
     ui.add_space(8.0);
@@ -2248,11 +2665,7 @@ fn client_mouse_active(ui: &mut Ui, app: &mut App) {
     ui.horizontal(|ui| {
         pill(ui, s.pill_receiving_input, theme::INFO, theme::INFO_SOFT);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(&peer)
-                    .size(12.0)
-                    .color(theme::TEXT_MUTED),
-            );
+            ui.label(RichText::new(&peer).size(12.0).color(theme::TEXT_MUTED));
         });
     });
     ui.add_space(8.0);
@@ -2295,13 +2708,21 @@ fn client_mouse_active(ui: &mut Ui, app: &mut App) {
 
 fn client_network_error(ui: &mut Ui, app: &mut App) {
     let s = app.s();
+    if let Some(error) = app.shared.snapshot().error {
+        error_banner(ui, &error);
+    }
     ui.horizontal(|ui| {
-        pill(ui, s.pill_connection_lost, theme::DANGER, theme::DANGER_SOFT);
+        pill(
+            ui,
+            s.pill_connection_lost,
+            theme::DANGER,
+            theme::DANGER_SOFT,
+        );
     });
     ui.add_space(12.0);
     Frame::none()
         .fill(theme::DANGER_SOFT)
-        .stroke(Stroke::new(1.0, theme::DANGER_SOFT_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::DANGER_SOFT_BORDER))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
@@ -2321,7 +2742,7 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
     ui.add_space(10.0);
     Frame::none()
         .fill(theme::INFO_SOFT)
-        .stroke(Stroke::new(1.0, theme::INFO.linear_multiply(0.3)))
+        .stroke(Stroke::new(1.0_f32, theme::INFO.linear_multiply(0.3)))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(14.0, 12.0))
         .show(ui, |ui| {
@@ -2344,7 +2765,7 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
                     .color(theme::INFO),
             )
             .fill(theme::CARD_BG)
-            .stroke(Stroke::new(1.0, theme::INFO.linear_multiply(0.3)))
+            .stroke(Stroke::new(1.0_f32, theme::INFO.linear_multiply(0.3)))
             .rounding(Rounding::same(8.0));
             ui.add(btn);
         });
@@ -2365,7 +2786,7 @@ fn client_network_error(ui: &mut Ui, app: &mut App) {
     });
     if reconnect {
         // Tear down the failed session then immediately start a new one.
-        app.pending_action = Some(Action::StopSession);
+        app.pending_action = Some(Action::RestartClient);
         // Chain StartClient via a follow-up frame: set a flag on shared so
         // the next derive picks it up. Simpler: just stop, and the user
         // presses Connect again from Config.
@@ -2410,28 +2831,48 @@ fn log_tab(ui: &mut Ui, app: &mut App) {
     ui.horizontal(|ui| {
         log_chip(
             ui,
-            &format!("{} {}", s.filter_all.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '), total),
+            &format!(
+                "{} {}",
+                s.filter_all
+                    .trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '),
+                total
+            ),
             theme::TEXT,
             theme::FIELD_BG,
             true,
         );
         log_chip(
             ui,
-            &format!("{} {}", s.filter_info.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '), info_count),
+            &format!(
+                "{} {}",
+                s.filter_info
+                    .trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '),
+                info_count
+            ),
             theme::PRIMARY,
             theme::PRIMARY_SOFT,
             false,
         );
         log_chip(
             ui,
-            &format!("{} {}", s.filter_warn.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '), warn_count),
+            &format!(
+                "{} {}",
+                s.filter_warn
+                    .trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '),
+                warn_count
+            ),
             theme::WARN,
             theme::WARN_SOFT,
             false,
         );
         log_chip(
             ui,
-            &format!("{} {}", s.filter_err.trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '), err_count),
+            &format!(
+                "{} {}",
+                s.filter_err
+                    .trim_end_matches(|c: char| c.is_ascii_digit() || c == ' '),
+                err_count
+            ),
             theme::DANGER,
             theme::DANGER_SOFT,
             false,
@@ -2440,16 +2881,12 @@ fn log_tab(ui: &mut Ui, app: &mut App) {
     ui.add_space(10.0);
     Frame::none()
         .fill(theme::CARD_BG)
-        .stroke(Stroke::new(1.0, theme::CARD_BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::CARD_BORDER))
         .rounding(Rounding::same(10.0))
         .inner_margin(Margin::symmetric(12.0, 10.0))
         .show(ui, |ui| {
             if lines.is_empty() {
-                ui.label(
-                    RichText::new("—")
-                        .size(12.0)
-                        .color(theme::TEXT_SUBTLE),
-                );
+                ui.label(RichText::new("—").size(12.0).color(theme::TEXT_SUBTLE));
             } else {
                 // Compute row height from the actual text style +
                 // spacing so virtual scrolling aligns correctly.
@@ -2457,8 +2894,7 @@ fn log_tab(ui: &mut Ui, app: &mut App) {
                 // badge adds 2×1px inner margin. show_rows adds
                 // item_spacing.y between rows automatically, so we
                 // pass the height WITHOUT spacing.
-                let row_height = ui.text_style_height(&egui::TextStyle::Body)
-                    .max(14.0); // floor at 14px in case body font is tiny
+                let row_height = ui.text_style_height(&egui::TextStyle::Body).max(14.0); // floor at 14px in case body font is tiny
 
                 // Virtual scrolling: egui only calls the closure with
                 // the visible row range, allocating placeholder space
@@ -2520,11 +2956,15 @@ fn format_ts(ms: u64) -> String {
 }
 
 #[derive(Clone, Copy)]
-enum LogLevel { Info, Warn, Err }
+enum LogLevel {
+    Info,
+    Warn,
+    Err,
+}
 
 fn log_chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, selected: bool) {
     let border = if selected {
-        Stroke::new(1.0, theme::CARD_BORDER)
+        Stroke::new(1.0_f32, theme::CARD_BORDER)
     } else {
         Stroke::NONE
     };
@@ -2536,8 +2976,7 @@ fn log_chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, selected: bool) {
         .show(ui, |ui| {
             if !selected && text.contains(' ') {
                 ui.horizontal(|ui| {
-                    let (dot_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
+                    let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(8.0, 8.0), Sense::hover());
                     ui.painter().circle_filled(dot_rect.center(), 3.5, fg);
                     ui.label(RichText::new(text).size(11.0).color(fg).strong());
                 });
@@ -2644,10 +3083,7 @@ fn settings_tab(ui: &mut Ui, app: &mut App) {
 
 fn lang_picker(ui: &mut Ui, lang: &mut Lang, s: &Strings) {
     ui.horizontal(|ui| {
-        for (l, label) in [
-            (Lang::En, s.lang_english),
-            (Lang::Zh, s.lang_chinese),
-        ] {
+        for (l, label) in [(Lang::En, s.lang_english), (Lang::Zh, s.lang_chinese)] {
             let selected = *lang == l;
             let (bg, fg, border) = if selected {
                 (theme::PRIMARY_SOFT, theme::PRIMARY, theme::PRIMARY)
@@ -2656,7 +3092,7 @@ fn lang_picker(ui: &mut Ui, lang: &mut Lang, s: &Strings) {
             };
             let resp = Frame::none()
                 .fill(bg)
-                .stroke(Stroke::new(1.0, border))
+                .stroke(Stroke::new(1.0_f32, border))
                 .rounding(Rounding::same(6.0))
                 .inner_margin(Margin::symmetric(14.0, 6.0))
                 .show(ui, |ui| {
@@ -2675,11 +3111,7 @@ fn setting_row(ui: &mut Ui, label: &str, sub: &str, value: &mut bool) {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.label(RichText::new(label).size(13.0).color(theme::TEXT).strong());
-            ui.label(
-                RichText::new(sub)
-                    .size(11.0)
-                    .color(theme::TEXT_MUTED),
-            );
+            ui.label(RichText::new(sub).size(11.0).color(theme::TEXT_MUTED));
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             toggle_switch(ui, value);
@@ -2700,7 +3132,7 @@ fn dev_state_switcher_server(ui: &mut Ui, state: &mut ServerState) {
             egui::pos2(r.left(), r.top()),
             egui::pos2(r.right(), r.top()),
         ],
-        Stroke::new(1.0, theme::FIELD_BORDER),
+        Stroke::new(1.0_f32, theme::FIELD_BORDER),
     );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -2741,7 +3173,7 @@ fn dev_state_switcher_client(ui: &mut Ui, state: &mut ClientState) {
             egui::pos2(r.left(), r.top()),
             egui::pos2(r.right(), r.top()),
         ],
-        Stroke::new(1.0, theme::FIELD_BORDER),
+        Stroke::new(1.0_f32, theme::FIELD_BORDER),
     );
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -2772,4 +3204,129 @@ fn dev_state_switcher_client(ui: &mut Ui, state: &mut ClientState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn login_restores_successful_connection_without_reusing_unsuccessful_edits() {
+        let mut app = App::default();
+        app.last_success = Some(SessionConfig {
+            role: SessionKind::Client,
+            port: 5000,
+            server: "127.0.0.1:6000".into(),
+            edge: msc::Edge::Left,
+            device: app.preferences.device,
+            features: Features::default(),
+            auto_reconnect: true,
+        });
+        app.server_addr = "127.0.0.2".into();
+        app.server_port = "7000".into();
+        assert_eq!(app.restore_successful_config(), Some(SessionKind::Client));
+        assert_eq!(app.server_addr, "127.0.0.1");
+        assert_eq!(app.server_port, "6000");
+        assert_eq!(app.port, "5000");
+        assert!(app.edge == Edge::Left);
+    }
+
+    #[test]
+    fn tray_stop_and_exit_keep_ui_responsive_during_stalled_handshake() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut app = App::default();
+        app.show_in_menubar = false;
+        app.server_addr = "127.0.0.1".into();
+        app.server_port = listener.local_addr().unwrap().port().to_string();
+        let ctx = egui::Context::default();
+        app.start_client();
+        let (_stalled, _) = listener.accept().unwrap();
+        app.hidden = true;
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            app.tray_action(TrayAction::Open, ctx);
+        });
+        assert!(!app.hidden);
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Visible(true))));
+        let start = Instant::now();
+        app.tray_action(TrayAction::Stop, &ctx);
+        app.apply_pending_action();
+        assert_eq!(app.shared.snapshot().phase, Phase::Stopping);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        app.tray_action(TrayAction::Exit, &ctx);
+        app.apply_pending_action();
+        while app.session.is_some() {
+            app.derive_states();
+            assert!(start.elapsed() < Duration::from_secs(1));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let output = ctx.run(egui::RawInput::default(), |ctx| app.desktop_events(ctx));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Close)));
+    }
+
+    #[test]
+    fn failed_settings_write_restores_switches_and_language() {
+        let root = std::env::temp_dir().join(format!(
+            "mouse-share-ui-{:x?}",
+            mouse_share::protocol::new_id()
+        ));
+        std::fs::write(&root, b"not a directory").unwrap();
+        let mut app = App::default();
+        app.preferences.show_in_menubar = false;
+        app.preferences.language = "en".into();
+        let old = app.preferences.clone();
+        app.apply_preferences(&old);
+        app.config_path = root.join("config.json");
+        app.lang = Lang::Zh;
+        app.debug_logging = true;
+        app.auto_connect = false;
+        let ctx = egui::Context::default();
+        app.sync_preferences(&ctx);
+        let start = Instant::now();
+        while app.preference_job.is_some() {
+            app.sync_preferences(&ctx);
+            assert!(start.elapsed() < Duration::from_secs(1));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.preference_error.is_some());
+        assert!(app.lang == Lang::En && !app.debug_logging && app.auto_connect);
+        assert_eq!(app.preferences, old);
+        std::fs::remove_file(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_close_waits_for_pending_cleanup() {
+        let mut app = App::default();
+        app.quitting = true;
+        let (send, recv) = std::sync::mpsc::channel();
+        app.preference_job = Some(std::thread::spawn(move || {
+            recv.recv().unwrap();
+            Ok(Settings::default())
+        }));
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .events
+            .push(egui::ViewportEvent::Close);
+        let ctx = egui::Context::default();
+        let output = ctx.run(input, |ctx| app.desktop_events(ctx));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::CancelClose)));
+        assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Close)));
+        send.send(()).unwrap();
+        app.preference_job.take().unwrap().join().unwrap().unwrap();
+    }
 }

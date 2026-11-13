@@ -4,7 +4,7 @@ use crossbeam_channel::Sender;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::capture::{CapturedInput, InputCapture};
+use super::capture::{CaptureControl, CapturedInput, InputCapture, InputRouting};
 
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -26,21 +26,22 @@ const LLMHF_INJECTED: u32 = 0x00000001;
 const LLKHF_EXTENDED: u32 = 0x00000001;
 
 pub struct WinCapture {
-    suppressing: Arc<AtomicBool>,
+    suppressing: Arc<CaptureControl>,
 }
 
 impl WinCapture {
     pub fn new() -> Self {
         Self {
-            suppressing: Arc::new(AtomicBool::new(false)),
+            suppressing: Arc::new(CaptureControl::default()),
         }
     }
 }
 
 // Thread-local storage for the hook callback context
 thread_local! {
+    static ROUTING: std::cell::RefCell<InputRouting> = std::cell::RefCell::new(InputRouting::default());
     static HOOK_SENDER: std::cell::RefCell<Option<Sender<CapturedInput>>> = std::cell::RefCell::new(None);
-    static HOOK_SUPPRESS: std::cell::RefCell<Option<Arc<AtomicBool>>> = std::cell::RefCell::new(None);
+    static HOOK_SUPPRESS: std::cell::RefCell<Option<Arc<CaptureControl>>> = std::cell::RefCell::new(None);
     // None until we see the first mouse event, then tracks the last observed
     // cursor position for delta computation. Lazy-init avoids a huge spurious
     // dx/dy spike on the first event.
@@ -57,21 +58,16 @@ impl InputCapture for WinCapture {
         HOOK_SUPPRESS.with(|s| *s.borrow_mut() = Some(self.suppressing.clone()));
 
         // Cache primary screen dimensions for cursor recentering.
-        let (sw, sh) = unsafe {
-            (
-                GetSystemMetrics(SM_CXSCREEN),
-                GetSystemMetrics(SM_CYSCREEN),
-            )
-        };
+        let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
         SCREEN_SIZE.with(|s| s.set((sw, sh)));
 
-        let mouse_hook = unsafe {
-            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)?
-        };
-        let kbd_hook = unsafe {
-            SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_hook_proc), None, 0)?
-        };
+        let mouse_hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0)? };
+        let mouse_guard = HookGuard(mouse_hook);
+        let kbd_hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_hook_proc), None, 0)? };
 
+        let _mouse_guard = mouse_guard;
+        let _kbd_guard = HookGuard(kbd_hook);
+        self.suppressing.ready.store(true, Ordering::SeqCst);
         log::info!("Windows mouse + keyboard hooks installed, entering message loop");
 
         // Non-blocking message pump: drain pending messages, then sleep
@@ -93,8 +89,7 @@ impl InputCapture for WinCapture {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        unsafe { UnhookWindowsHookEx(mouse_hook)? };
-        unsafe { UnhookWindowsHookEx(kbd_hook)? };
+        self.suppressing.release();
         // Clean up thread-locals so a later session on the same thread
         // doesn't see stale refs.
         HOOK_SENDER.with(|s| *s.borrow_mut() = None);
@@ -103,16 +98,12 @@ impl InputCapture for WinCapture {
         Ok(())
     }
 
-    fn suppress_handle(&self) -> Arc<AtomicBool> {
+    fn control_handle(&self) -> Arc<CaptureControl> {
         self.suppressing.clone()
     }
 }
 
-unsafe extern "system" fn mouse_hook_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
         return CallNextHookEx(None, code, wparam, lparam);
     }
@@ -167,26 +158,34 @@ unsafe extern "system" fn mouse_hook_proc(
         _ => None,
     };
 
-    if let Some(evt) = mouse_event {
-        let abs_x = info.pt.x as f64;
-        let abs_y = info.pt.y as f64;
-        HOOK_SENDER.with(|s| {
-            if let Some(sender) = s.borrow().as_ref() {
-                let _ = sender.try_send(CapturedInput::Mouse {
-                    event: evt,
-                    abs_x,
-                    abs_y,
-                });
-            }
-        });
-    }
-
-    let should_suppress = HOOK_SUPPRESS.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|b| b.load(Ordering::Relaxed))
-            .unwrap_or(false)
-    });
+    let should_suppress = if let Some(evt) = mouse_event {
+        HOOK_SUPPRESS.with(|c| {
+            let control = c.borrow();
+            let Some(control) = control.as_ref() else {
+                return false;
+            };
+            let (swallow, remote) = ROUTING.with(|r| {
+                r.borrow_mut()
+                    .mouse(&evt, control.mouse.load(Ordering::SeqCst))
+            });
+            HOOK_SENDER.with(|s| {
+                if let Some(sender) = s.borrow().as_ref() {
+                    control.send(
+                        sender,
+                        CapturedInput::Mouse {
+                            event: evt,
+                            abs_x: info.pt.x as f64,
+                            abs_y: info.pt.y as f64,
+                            remote,
+                        },
+                    );
+                }
+            });
+            swallow
+        })
+    } else {
+        false
+    };
 
     if should_suppress {
         // Recenter the real cursor so subsequent events carry a usable delta
@@ -206,11 +205,7 @@ unsafe extern "system" fn mouse_hook_proc(
     }
 }
 
-unsafe extern "system" fn kbd_hook_proc(
-    code: i32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn kbd_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
         return CallNextHookEx(None, code, wparam, lparam);
     }
@@ -220,40 +215,54 @@ unsafe extern "system" fn kbd_hook_proc(
     let down = w == WM_KEYDOWN || w == WM_SYSKEYDOWN;
     let up = w == WM_KEYUP || w == WM_SYSKEYUP;
 
-    if down || up {
-        // Encode the extended-key bit in the low bit of `flags`. The Windows
-        // simulator on the other side uses this to set KEYEVENTF_EXTENDEDKEY
-        // so arrow keys, right-Ctrl/Alt, Insert, Delete, etc. simulate
-        // correctly. Note: `info.flags` is a KBDLLHOOKSTRUCT_FLAGS newtype,
-        // so we access the inner u32 via `.0`.
-        let extended = (info.flags.0 & LLKHF_EXTENDED) != 0;
-        let out_flags: u64 = if extended { 1 } else { 0 };
-        log::info!(
-            "key captured: vk={} down={} extended={}",
-            info.vkCode, down, extended
-        );
-        let key_event = KeyEvent {
-            keycode: info.vkCode,
-            down,
-            flags: out_flags,
+    let should_suppress = if down || up {
+        let flags = if (info.flags.0 & LLKHF_EXTENDED) != 0 {
+            1
+        } else {
+            0
         };
-        HOOK_SENDER.with(|s| {
-            if let Some(sender) = s.borrow().as_ref() {
-                let _ = sender.try_send(CapturedInput::Key(key_event));
-            }
-        });
-    }
-
-    let should_suppress = HOOK_SUPPRESS.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|b| b.load(Ordering::Relaxed))
-            .unwrap_or(false)
-    });
+        HOOK_SUPPRESS.with(|c| {
+            let control = c.borrow();
+            let Some(control) = control.as_ref() else {
+                return false;
+            };
+            let (swallow, remote) = ROUTING.with(|r| {
+                r.borrow_mut()
+                    .key(info.vkCode, down, control.keyboard.load(Ordering::SeqCst))
+            });
+            HOOK_SENDER.with(|s| {
+                if let Some(sender) = s.borrow().as_ref() {
+                    control.send(
+                        sender,
+                        CapturedInput::Key {
+                            event: KeyEvent {
+                                keycode: info.vkCode,
+                                down,
+                                flags,
+                            },
+                            remote,
+                        },
+                    );
+                }
+            });
+            swallow
+        })
+    } else {
+        false
+    };
 
     if should_suppress {
         LRESULT(1) // Swallow the event from local apps
     } else {
         CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+struct HookGuard(HHOOK);
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = UnhookWindowsHookEx(self.0);
+        }
     }
 }
